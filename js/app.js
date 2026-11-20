@@ -10,7 +10,7 @@ import { renderLng } from './views/lng-view.js';
 import { renderText } from './views/text-view.js';
 import { renderMedia } from './views/media-view.js';
 import { renderHex } from './views/hex-view.js';
-import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor } from './browser.js';
+import { buildTree, renderSidebar, renderFolder, findFile } from './browser.js';
 import { loadHandle, saveHandle, readDirectory } from './data-folder.js';
 
 const $ = (id) => document.getElementById(id);
