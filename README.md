@@ -26,7 +26,7 @@ py serve.py
 
 Then open http://localhost:8000/. `serve.py` binds to 127.0.0.1 only and sends correct MIME types (plain `py -m http.server` can serve `.js` as `text/plain` on Windows, which breaks the page).
 
-To host it, copy this folder to any static host that serves HTTPS. There is no build step and no server code.
+It's online at https://www.happywars.org/tools/happytool/. To host another copy, put this folder (without `serve.py`) on any static host that serves HTTPS. There is no build step and no server code.
 
 ## Layout
 
