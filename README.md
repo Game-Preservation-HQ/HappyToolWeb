@@ -31,8 +31,8 @@ It's online at https://www.happywars.org/tools/happytool/. To host another copy,
 ## Layout
 
 - `index.html`, `css/app.css`, `js/app.js`: the page, styles and app shell (file list, navigation, save).
-- `js/formats/`: format code ported from HappyTool's C# (`bres.js`, `lng.js`, `wrappers.js`, `blowfish.js`, `dds.js`, `zip.js`, `sniff.js`), plus `json.js` for comment-tolerant JSON.
-- `js/views/`: one view per content type (bundle table, text table, text editor, image preview, hex).
+- `js/formats/`: format code ported from HappyTool's C# (`bres.js`, `lng.js`, `wrappers.js`, `blowfish.js`, `dds.js`, `zip.js`, `sniff.js`, `rrm.js` and `steam-stage.js` for Steam stage models), plus `json.js` for comment-tolerant JSON.
+- `js/views/`: one view per content type (bundle table, text table, text editor, image preview, hex), plus `stage-view.js`, the WebGL2 map viewer.
 
 ## Checks
 

@@ -6,6 +6,7 @@ import { parseLng, writeLng, validateLng } from './formats/lng.js';
 import { sniff, KIND_LABELS, describeMagic } from './formats/sniff.js';
 import { decodeText, encodeText, bytesEqual, formatSize, baseName, downloadBytes } from './util.js';
 import { renderBres } from './views/bres-view.js';
+import { renderStage } from './views/stage-view.js';
 import { renderLng } from './views/lng-view.js';
 import { renderText } from './views/text-view.js';
 import { renderMedia } from './views/media-view.js';
@@ -403,6 +404,7 @@ function pickView(node, ctx) {
   }
   switch (node.kind) {
     case 'bres':
+      if (node.showMap) return renderStage(node, { ...ctx, back: () => ((node.showMap = false), ctx.rerender()) });
       return renderBres(node, ctx);
     case 'lng':
       return renderLng(node, ctx);

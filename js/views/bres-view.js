@@ -3,6 +3,7 @@ import { el, button, toast, ask, confirmBox, pickFiles, downloadBlob } from '../
 import { sniff, KIND_LABELS } from '../formats/sniff.js';
 import { SHELLS } from '../formats/wrappers.js';
 import { makeZip } from '../formats/zip.js';
+import { looksLikeStage } from './stage-view.js';
 import { ascii4, formatSize, baseName } from '../util.js';
 
 const kindCache = new WeakMap();
@@ -209,6 +210,7 @@ export function renderBres(node, ctx) {
     el(
       'div',
       { class: 'toolbar' },
+      looksLikeStage(arc) ? button('View map', () => ((node.showMap = true), ctx.rerender()), { title: 'Draw this stage in 3D' }) : null,
       btn.open,
       btn.extract,
       btn.replace,
