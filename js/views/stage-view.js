@@ -2,8 +2,11 @@
 // textures on UV0 and baked lightmaps on UV1 — with an orbit/fly camera, layer toggles and click to inspect (slice 1),
 // and moves, turns, scales and hides objects with a gizmo, keys and a placement panel (slice 2, see stage-edit.js).
 // Lighting, lightmap modes and sky placement follow HappyTool/GUI/StageViewerForm.cs (InitGl, DrawMesh, sky pass).
+// The sky can be swapped for another stage's, a picture or a colour preset (slice 3, see stage-sky.js).
 import { el, button, toast, downloadBlob, pickFiles, confirmBox, debounce } from '../ui.js';
-import { decodeLayers } from '../formats/wrappers.js';
+import { decodeLayers, encodeLayers, writableLayers } from '../formats/wrappers.js';
+import { writeBres } from '../formats/bres.js';
+import { downloadBytes } from '../util.js';
 import { decodeDds } from '../formats/dds.js';
 import { buildSteamStage } from '../formats/steam-stage.js';
 import { stripTextureExtension } from '../formats/rrm.js';
@@ -12,6 +15,10 @@ import {
   shortObjectName, editsFile, readEditsFile, loadStored, store, stageKey, ringPoint, distanceToSegment,
   closestParamOnAxis, screenAngle, screenTurnSign, turnAbout,
 } from './stage-edit.js';
+import {
+  SKY_PRESETS, cloneSky, sameSky, skyLabel, presetSky, pictureSky, textureRoles, readSkyPack, bakeSky, encodeDxt1Dds,
+  storePicture, loadPicture,
+} from './stage-sky.js';
 
 const FOV = Math.PI / 4;
 const SKY_RADIUS = 920; // ClipFar 1000 * 0.92 when StageCameraParam.json isn't read (ComputeSkyRenderRadius)
@@ -31,6 +38,8 @@ const GROUPS = [
 /** bres model → {promise, report, camera}: the built scene survives re-renders of the view. */
 const jobs = new WeakMap();
 const pause = () => new Promise((r) => setTimeout(r, 0));
+/** Preset name → its dome picture, made once. */
+const presetDomes = new Map();
 const lower = (s) => (s ? s.toLowerCase() : s);
 const shortName = (n) => n.replace(/\\/g, '/').split('/').slice(-2).join('/');
 
@@ -349,7 +358,15 @@ function setUpEdits(scene, model) {
     if (!(m.positions instanceof Float32Array)) m.positions = Float32Array.from(m.positions);
     if (!(m.normals instanceof Float32Array)) m.normals = Float32Array.from(m.normals);
   }
-  const edit = { objects: collectObjects(scene.meshes), history: new History(), stage: stageKey(model.name), restored: 0 };
+  const edit = {
+    objects: collectObjects(scene.meshes),
+    history: new History(),
+    stage: stageKey(model.name),
+    restored: 0,
+    sky: null, // the sky setting (SkyEdit), null = the stage's own
+    skyPicture: null, // {name, width, height, rgba, canvas}: the dome picture in picture mode
+    storedPicture: null, // the picture kept in this browser
+  };
   const stored = loadStored(edit.stage);
   if (stored) {
     try {
@@ -362,6 +379,12 @@ function setUpEdits(scene, model) {
     } catch (e) {
       console.warn(`Map editor: the edits kept for ${edit.stage} could not be read: ${e.message}`);
     }
+    edit.sky = cloneSky(stored.Sky);
+    if (edit.sky?.Mode === 'picture')
+      edit.pictureJob = loadPicture(edit.stage).then((pic) => {
+        edit.storedPicture = pic;
+        if (pic && pic.name === edit.sky?.Picture && !edit.skyPicture) edit.skyPicture = pic;
+      });
   }
   return edit;
 }
@@ -383,6 +406,7 @@ export function renderStage(node, ctx) {
   const layersBox = el('div', { class: 'stage-layers' });
   const placeBox = el('div', { class: 'stage-place' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const inspectBox = el('div', { class: 'stage-inspect' }, el('p', { class: 'muted' }, 'Click the map to select an object.'));
+  const skyBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const canvas = el('canvas', { class: 'stage-canvas', tabindex: '0', 'aria-label': 'Stage map' });
   const overlay = el('canvas', { class: 'stage-overlay', 'aria-hidden': 'true' });
   const hint = el(
@@ -412,7 +436,7 @@ export function renderStage(node, ctx) {
     el(
       'div',
       { class: 'stage-body' },
-      el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Layers'), layersBox),
+      el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Layers'), layersBox),
       host,
     ),
   );
@@ -465,7 +489,7 @@ export function renderStage(node, ctx) {
     let vp = null, viewW = 1, viewH = 1;
     const keys = new Set();
     let last = performance.now();
-    const saveSoon = debounce(() => store(edit.stage, edit.objects), 250);
+    const saveSoon = debounce(() => store(edit.stage, edit.objects, edit.sky), 250);
 
     function framed(b, from) {
       return { yaw: from.yaw, pitch: from.pitch, target: centre(b), dist: (radius(b) / Math.sin(FOV / 2)) * 1.05 };
@@ -492,7 +516,8 @@ export function renderStage(node, ctx) {
       const { f, r, u, eye } = basis();
       const toCentre = Math.hypot(eye[0] - sceneCentre[0], eye[1] - sceneCentre[1], eye[2] - sceneCentre[2]);
       const near = Math.max(0.05, sceneRadius * 0.001);
-      const hasSky = scene.meshes.some((m) => m.sky && m.visible);
+      const skyList = skyMeshes();
+      const hasSky = skyList.length > 0;
       let far = toCentre + sceneRadius * 4 + 10;
       if (hasSky) far = Math.max(far, SKY_RADIUS * 1.05);
       vp = mul(perspective(FOV, w / h, near, far), lookAt(eye, f, r, u));
@@ -524,13 +549,13 @@ export function renderStage(node, ctx) {
           gl.depthMask(true);
         }
         gl.uniform1f(U.uSkyRadius, skyPass ? SKY_RADIUS : 0);
-        for (const m of scene.meshes) {
+        for (const m of skyPass ? skyList : scene.meshes) {
           if (!m.visible || m.sky !== skyPass) continue;
-          gl.bindVertexArray(gpu.get(m).vao);
+          gl.bindVertexArray(meshGpu(m).vao);
           const useTex = (skyPass || texturesOn) && !!m.uvs;
           const s0 = selection?.mesh === m ? selection.first : 0, s1 = selection?.mesh === m ? selection.first + selection.count : 0;
           for (const b of m.batches) {
-            const colour = useTex && b.texture ? glTex.get(lower(b.texture)) : null;
+            const colour = useTex && b.texture ? (skyPass ? skyTexture(b.texture) : glTex.get(lower(b.texture))) : null;
             const light = useTex && m.uvs2 && b.lightmap ? glTex.get(lower(b.lightmap)) : null;
             const useLight = !!light && lmOn;
             let mode = 0;
@@ -800,6 +825,7 @@ export function renderStage(node, ctx) {
       const step = edit.history.undo.pop();
       if (!step) return;
       for (const c of [...step.changes].reverse()) apply(c.obj, c.before);
+      step.action?.undo();
       edit.history.redo.push(step);
       edit.history.breakMerge();
       edited();
@@ -809,6 +835,7 @@ export function renderStage(node, ctx) {
       const step = edit.history.redo.pop();
       if (!step) return;
       for (const c of step.changes) apply(c.obj, c.after);
+      step.action?.redo();
       edit.history.undo.push(step);
       edit.history.breakMerge();
       edited();
@@ -938,8 +965,8 @@ export function renderStage(node, ctx) {
     }
 
     function saveFile() {
-      const file = editsFile(edit.stage, edit.objects);
-      if (!Object.keys(file.Objects).length) return toast('There are no edits to save yet.');
+      const file = editsFile(edit.stage, edit.objects, edit.sky);
+      if (!Object.keys(file.Objects).length && !file.Sky) return toast('There are no edits to save yet.');
       downloadBlob(new Blob([JSON.stringify(file, null, 2)], { type: 'application/json' }), `${edit.stage}.json`);
     }
     async function loadFile() {
@@ -957,12 +984,23 @@ export function renderStage(node, ctx) {
         apply(c.obj, c.after);
         changes.push({ obj: c.obj, before: c.before, after: c.after });
       }
-      edit.history.push(changes, 'Load edits file');
+      // The file's sky, when it has one (a picture by name only: the one held here if the names match).
+      let action = null, skyNote = '';
+      const sky = cloneSky(res.sky);
+      if (res.sky && !sameSky(sky, edit.sky)) {
+        const picture = sky?.Mode === 'picture' ? (edit.skyPicture?.name === sky.Picture ? edit.skyPicture : null) : edit.skyPicture;
+        const before = skyState(), after = { sky, picture };
+        applySky(after);
+        action = { undo: () => applySky(before), redo: () => applySky(after) };
+        skyNote = ` Sky: ${skyLabel(sky)}.`;
+        if (sky?.Mode === 'picture' && !picture) skyNote += ' Choose the picture again in the Sky panel to see it.';
+      }
+      edit.history.push(changes, 'Load edits file', null, action);
       edit.history.breakMerge();
       edited();
       renderPanel();
       const missed = res.unmatched.length ? `; ${res.unmatched.length} not on this stage` : '';
-      toast(`${f.name}: ${changes.length} object${changes.length === 1 ? '' : 's'} placed${missed}.`);
+      toast(`${f.name}: ${changes.length} object${changes.length === 1 ? '' : 's'} placed${missed}.${skyNote}`);
       if (res.unmatched.length) console.info('Map editor: names in the edits file not on this stage:', res.unmatched);
     }
     async function clearAll() {
@@ -989,7 +1027,7 @@ export function renderStage(node, ctx) {
     function stop() {
       stopped = true;
       resize.disconnect();
-      store(edit.stage, edit.objects);
+      store(edit.stage, edit.objects, edit.sky);
       gl.getExtension('WEBGL_lose_context')?.loseContext();
     }
     const resize = new ResizeObserver(() => (dirty = true));
@@ -1012,6 +1050,200 @@ export function renderStage(node, ctx) {
       cam.target = cam.target.map((x, k) => x + mv[k] * speed);
       return true;
     }
+
+    // ----- sky (StageViewerForm.Sky.cs) -----
+    const ownSky = scene.meshes.filter((m) => m.sky);
+    const imgTex = new Map(); // decoded picture → its GL texture, uploaded when first drawn
+    const skyOver = new Map(); // lower texture name → GL texture drawn in its place (the dome picture, clear clouds)
+    let skyShown = ownSky, skyPackTextures = null, skyProblem = '', skyToken = 0, clearTex = null;
+    const texOf = (img) => imgTex.get(img) || imgTex.set(img, uploadTexture(gl, img, aniso)).get(img);
+    const meshGpu = (m) => gpu.get(m) || gpu.set(m, uploadMesh(gl, m)).get(m);
+    /** The sky meshes to draw: another stage's while this stage's Sky layer is on, else this stage's visible ones. */
+    function skyMeshes() {
+      if (skyShown === ownSky) return ownSky.filter((m) => m.visible);
+      return !ownSky.length || ownSky.some((m) => m.visible) ? skyShown : [];
+    }
+    function skyTexture(name) {
+      const k = lower(name);
+      const img = skyPackTextures?.get(k);
+      return skyOver.get(k) || (img ? texOf(img) : glTex.get(k)) || null;
+    }
+    /** Another stage's sky, read once per scene from its bundle among the open files. */
+    function skyPack(id) {
+      const packs = scene.skyPacks || (scene.skyPacks = new Map());
+      const key = id.toLowerCase();
+      let job = packs.get(key);
+      if (!job) {
+        const src = ctx.stageBundles?.().find((b) => b.id.toLowerCase() === key);
+        if (!src) return Promise.reject(new Error(`stage ${id} isn't among the open files (open the Data folder to use another stage's sky)`));
+        job = src
+          .read()
+          .then((bytes) => readSkyPack(src.id, bytes))
+          .then((pack) => {
+            for (const m of pack.meshes) Object.assign(m, { sky: true, kind: 'sky', visible: true, positions: unitDirections(m.positions) });
+            return pack;
+          });
+        job.catch(() => packs.delete(key));
+        packs.set(key, job);
+      }
+      return job;
+    }
+    /** The dome's picture for the setting: a preset's, or your picture when it is here. */
+    function domeImage(s) {
+      if (s?.Mode === 'preset') {
+        const p = SKY_PRESETS.find((x) => x.name === s.Preset);
+        if (!p) return null;
+        if (!presetDomes.has(p.name)) presetDomes.set(p.name, presetSky(p));
+        return presetDomes.get(p.name);
+      }
+      if (s?.Mode === 'picture') return edit.skyPicture?.name === s.Picture ? edit.skyPicture : null;
+      return null;
+    }
+    /** Shows the sky setting in the view: another stage's meshes and textures, the dome picture, clear clouds (ApplySkyPreview). */
+    async function showSky() {
+      const token = ++skyToken;
+      const s = edit.sky;
+      let pack = null, problem = '';
+      if (s?.Mode === 'stage') {
+        try {
+          pack = await skyPack(s.Stage);
+        } catch (e) {
+          problem = `Stage ${s.Stage}'s sky can't be shown: ${e.message}.`;
+        }
+        if (token !== skyToken || stopped) return;
+      } else if (s?.Mode === 'dungeon') problem = 'Happy Dungeons skies need the desktop HappyTool (they come from the Happy Dungeons game folder).';
+      const shown = pack ? pack.meshes : ownSky;
+      const roles = textureRoles(shown);
+      skyOver.clear();
+      const dome = domeImage(s);
+      if (s?.Mode === 'picture' && !dome) problem = `The picture ${s.Picture} isn't here: choose it again to see it.`;
+      if (dome && roles.dome) skyOver.set(lower(roles.dome), texOf(dome));
+      if (s?.HideClouds) {
+        clearTex ||= uploadTexture(gl, { width: 4, height: 4, rgba: new Uint8Array(64) }, null);
+        for (const c of roles.clouds) skyOver.set(lower(c), clearTex);
+      }
+      skyShown = shown;
+      skyPackTextures = pack?.textures ?? null;
+      skyProblem = problem;
+      dirty = true;
+      renderSky();
+    }
+    const skyState = () => ({ sky: cloneSky(edit.sky), picture: edit.skyPicture });
+    /** Puts a sky state in place (set, undo, redo): keeps it in this browser and shows it. */
+    function applySky(st) {
+      edit.sky = cloneSky(st.sky);
+      edit.skyPicture = st.picture;
+      const keep = edit.sky?.Mode === 'picture' ? edit.skyPicture : null;
+      if (keep !== edit.storedPicture) {
+        if (!storePicture(edit.stage, keep)) toast('The sky picture is too big to keep in this browser; it stays until you close the map.', 'error');
+        edit.storedPicture = keep;
+      }
+      saveSoon();
+      showSky();
+    }
+    /** Changes the sky as one undo step (SetSky). */
+    function setSky(next, label, picture = edit.skyPicture) {
+      const before = skyState(), after = { sky: cloneSky(next), picture };
+      if (sameSky(before.sky, after.sky) && before.picture === after.picture) return renderSky();
+      applySky(after);
+      edit.history.push([], label, null, { undo: () => applySky(before), redo: () => applySky(after) });
+      syncPanel();
+    }
+    /** Keeps the clouds setting when the sky changes, hiding them by default for a picture (WithMode). */
+    const withMode = (mode, fields) => ({ Mode: mode, ...fields, HideClouds: edit.sky ? !!edit.sky.HideClouds : mode === 'picture' });
+
+    const skySelect = el('select', { class: 'input input-sm', 'aria-label': 'Sky' });
+    const cloudsBox = el('input', { type: 'checkbox' });
+    const skyLine = el('p', { class: 'muted stage-count' });
+    const skyNote = el('p', { class: 'muted stage-count' });
+    const bakeBtn = button('Download bundle with this sky', bakeSkyBundle, {
+      title: "Write this sky into a copy of the stage bundle, as the desktop export does (object placement isn't written yet)",
+    });
+    skySelect.addEventListener('change', async () => {
+      const v = skySelect.value;
+      if (v === 'own') return setSky(edit.sky?.HideClouds ? { HideClouds: true } : null, "Sky: this stage's own");
+      if (v.startsWith('preset:')) return setSky(withMode('preset', { Preset: v.slice(7) }), `Sky: ${v.slice(7)}`);
+      if (v.startsWith('stage:')) return setSky(withMode('stage', { Stage: v.slice(6) }), `Sky: stage ${v.slice(6)}`);
+      if (v === 'picture' && edit.skyPicture) return setSky(withMode('picture', { Picture: edit.skyPicture.name }), `Sky picture: ${edit.skyPicture.name}`);
+      // A new picture (ChooseSkyPicture): clouds hidden, as the desktop does.
+      const [f] = await pickFiles({ accept: 'image/*' });
+      if (!f) return renderSky();
+      try {
+        const pic = { name: f.name, ...(await pictureSky(f)) };
+        setSky({ ...withMode('picture', { Picture: f.name }), HideClouds: true }, `Sky picture: ${f.name}`, pic);
+      } catch (e) {
+        toast(`That picture can't be read: ${e.message}`, 'error');
+        renderSky();
+      }
+    });
+    cloudsBox.addEventListener('change', () => {
+      const s = cloneSky(edit.sky) || {};
+      s.HideClouds = cloudsBox.checked;
+      setSky(!s.Mode && !s.HideClouds ? null : s, cloudsBox.checked ? 'Hide clouds' : 'Show clouds');
+    });
+    function renderSky() {
+      const s = edit.sky;
+      const opt = (value, label) => el('option', { value }, label);
+      const others = (ctx.stageBundles?.() ?? []).map((b) => b.id).filter((id) => id.toLowerCase() !== edit.stage.toLowerCase());
+      if (s?.Mode === 'stage' && !others.some((id) => id.toLowerCase() === s.Stage.toLowerCase())) others.push(s.Stage);
+      others.sort((a, b) => a.localeCompare(b));
+      skySelect.replaceChildren(
+        opt('own', "This stage's own"),
+        el('optgroup', { label: 'Colours' }, SKY_PRESETS.map((p) => opt(`preset:${p.name}`, p.name))),
+        el(
+          'optgroup',
+          { label: 'Your picture' },
+          edit.skyPicture ? opt('picture', `Picture: ${edit.skyPicture.name}`) : null,
+          opt('picture:new', edit.skyPicture ? 'Another picture…' : 'Choose a picture…'),
+        ),
+        others.length
+          ? el('optgroup', { label: "Another stage's sky" }, others.map((id) => opt(`stage:${id}`, id)))
+          : el('optgroup', { label: "Another stage's sky: open the Data folder" }),
+      );
+      skySelect.value =
+        s?.Mode === 'preset' ? `preset:${s.Preset}` : s?.Mode === 'stage' ? `stage:${s.Stage}` : s?.Mode === 'picture' && edit.skyPicture?.name === s.Picture ? 'picture' : 'own';
+      if (skySelect.selectedIndex < 0) skySelect.value = 'own';
+      cloudsBox.checked = !!s?.HideClouds;
+      skyLine.textContent = skyLabel(s);
+      skyNote.textContent = skyProblem;
+      skyNote.hidden = !skyProblem;
+      bakeBtn.disabled = !s || s.Mode === 'dungeon';
+      if (!skyBox.contains(skySelect))
+        skyBox.replaceChildren(
+          skyLine,
+          skySelect,
+          el('label', { class: 'check', title: 'Make the cloud textures clear (the download writes them clear)' }, cloudsBox, ' Hide clouds'),
+          skyNote,
+          el('div', { class: 'toolbar' }, bakeBtn),
+        );
+    }
+    /** Downloads a copy of the bundle with the sky written in (ApplySkyToBundle). */
+    async function bakeSkyBundle() {
+      const s = edit.sky;
+      if (!s) return toast("The sky is this stage's own: choose another one first.");
+      bakeBtn.disabled = true;
+      const was = status.textContent;
+      try {
+        const pack = s.Mode === 'stage' ? await skyPack(s.Stage) : null;
+        const dome = domeImage(s);
+        if (s.Mode === 'picture' && !dome) throw new Error(`the sky picture ${s.Picture} isn't here; choose it again`);
+        status.textContent = 'Writing the bundle with this sky…';
+        await pause();
+        const domeDds = dome ? encodeDxt1Dds(dome.width, dome.height, dome.rgba) : null;
+        const { archive, summary } = await bakeSky(model, s, pack, textureRoles(pack ? pack.meshes : ownSky), domeDds);
+        const bytes = await encodeLayers(writeBres(archive), writableLayers(node.layers || []));
+        downloadBytes(bytes, `${edit.stage}.bres`);
+        toast(`${edit.stage}.bres downloaded. ${summary} Object placement isn't written into it yet: keep it with Save edits.`, 'ok', 10000);
+      } catch (e) {
+        toast(`The bundle could not be written: ${e.message}`, 'error', 10000);
+      } finally {
+        status.textContent = was;
+        bakeBtn.disabled = false;
+      }
+    }
+    renderSky();
+    if (edit.sky) showSky();
+    edit.pictureJob?.then(() => !stopped && showSky());
 
     // ----- layers -----
     function renderLayers() {

@@ -396,6 +396,11 @@ function renderView() {
     rerender: () => (renderInfo(), renderView()),
     openChild,
     showHex: () => ((node.showHex = true), renderInfo(), renderView()),
+    /** The stage bundles among the open files (the map editor's "another stage's sky"), read from disk when asked. */
+    stageBundles: () =>
+      files
+        .filter((r) => stageIdFor(r.path))
+        .map((r) => ({ id: stageIdFor(r.path), path: r.path, read: async () => new Uint8Array(await r.file.arrayBuffer()) })),
   };
   let view;
   try {
