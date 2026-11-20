@@ -13,7 +13,7 @@
     <div class="brand"><span class="brand-mark" aria-hidden="true">HT</span><span>HappyTool <span class="muted">web</span></span></div>
     <div class="topbar-actions">
       <button type="button" class="btn" id="btn-open">Open files…</button>
-      <button type="button" class="btn" id="btn-open-folder">Open folder…</button>
+      <button type="button" class="btn" id="btn-open-folder" title="Pick the game's Data folder (or any folder) to browse it">Open Data folder…</button>
       <button type="button" class="btn btn-primary" id="btn-save" disabled title="Download the edited file (Ctrl+S)">Save</button>
       <button type="button" class="btn btn-icon" id="btn-theme" aria-label="Switch theme">☾</button>
     </div>
@@ -23,6 +23,7 @@
     <aside class="sidebar" aria-label="Open files">
       <input type="search" id="file-filter" class="input input-sm" placeholder="Filter files" aria-label="Filter files">
       <ul id="file-list" class="file-list"></ul>
+      <div id="side-tree" class="side-tree" hidden></div>
       <p id="file-count" class="muted small"></p>
     </aside>
 

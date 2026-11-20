@@ -10,10 +10,13 @@ import { renderLng } from './views/lng-view.js';
 import { renderText } from './views/text-view.js';
 import { renderMedia } from './views/media-view.js';
 import { renderHex } from './views/hex-view.js';
+import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor } from './browser.js';
+import { loadHandle, saveHandle, readDirectory } from './data-folder.js';
 
 const $ = (id) => document.getElementById(id);
 const dom = {
   list: $('file-list'),
+  tree: $('side-tree'),
   filter: $('file-filter'),
   count: $('file-count'),
   crumbs: $('crumbs'),
@@ -28,6 +31,92 @@ let files = [];
 let current = null;
 const stack = () => current?.stack ?? [];
 const top = () => stack().at(-1);
+
+// ---------- folder browser state ----------
+
+let tree = buildTree([]);
+/** The folder shown when no file is open ('' = the top level), or null before anything is loaded. */
+let browse = null;
+const expanded = new Set();
+let savedHandle = null;
+const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
+const usesTree = () => tree.root.dirs.size > 0;
+
+function readPref(key, fallback) {
+  try {
+    const v = JSON.parse(localStorage.getItem(key));
+    return v ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+function writePref(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* private mode: preferences last for this visit only */
+  }
+}
+const prefs = {
+  mode: readPref('happytool-web-view', 'icons') === 'details' ? 'details' : 'icons',
+  pins: [].concat(readPref('happytool-web-pins', [])).filter((p) => typeof p === 'string'),
+  recent: [].concat(readPref('happytool-web-recent', [])).filter((p) => typeof p === 'string'),
+};
+
+function expandTo(path) {
+  for (let d = path; d; d = dirOf(d)) expanded.add(d);
+}
+
+function browseTo(path) {
+  browse = path;
+  current = null;
+  expandTo(path);
+  render();
+}
+
+function noteRecent(path) {
+  prefs.recent = [path, ...prefs.recent.filter((p) => p !== path)].slice(0, 20);
+  writePref('happytool-web-recent', prefs.recent);
+}
+
+function togglePin(path) {
+  prefs.pins = prefs.pins.includes(path) ? prefs.pins.filter((p) => p !== path) : [...prefs.pins, path];
+  writePref('happytool-web-pins', prefs.pins);
+  render();
+}
+
+async function openStage(rec) {
+  await openFile(rec);
+  const root = current === rec ? rec.stack?.[0] : null;
+  if (root && root.kind === 'bres' && !root.showHex) {
+    root.showMap = true;
+    render();
+  }
+}
+
+const sidebarActions = {
+  browse: browseTo,
+  open: (path) => {
+    const rec = findFile(tree, path);
+    if (rec) openFile(rec);
+  },
+  toggle: (path) => {
+    if (expanded.has(path)) expanded.delete(path);
+    else expanded.add(path);
+    renderFileList();
+  },
+};
+const folderActions = {
+  browse: browseTo,
+  openRec: (rec) => openFile(rec),
+  openStage,
+  setMode: (m) => {
+    prefs.mode = m;
+    writePref('happytool-web-view', m);
+    renderView();
+  },
+  togglePin,
+};
 
 // ---------- nodes: one decoded level (a file, or an entry inside a bundle) ----------
 
@@ -100,7 +189,10 @@ async function commit(node) {
 // ---------- navigation ----------
 
 async function openFile(rec) {
-  if (current === rec && rec.stack) return;
+  browse = dirOf(rec.path);
+  expandTo(browse);
+  noteRecent(rec.path);
+  if (current === rec && rec.stack) return render();
   current = rec;
   if (!rec.stack) {
     setBusy(`Opening ${rec.path}…`);
@@ -195,6 +287,14 @@ function markDirty() {
 
 function renderFileList() {
   const f = dom.filter.value.trim().toLowerCase();
+  const asTree = usesTree() && !f;
+  dom.tree.hidden = !asTree;
+  dom.list.hidden = asTree;
+  if (asTree) {
+    dom.tree.replaceChildren(...renderSidebar({ tree, browse: current ? null : browse, currentPath: current?.path ?? null, expanded, pins: prefs.pins, recent: prefs.recent }, sidebarActions));
+    dom.count.textContent = `${files.length} file${files.length === 1 ? '' : 's'}`;
+    return;
+  }
   const shown = files.filter((r) => !f || r.path.toLowerCase().includes(f));
   dom.list.replaceChildren(
     ...shown.map((r) => {
@@ -218,14 +318,22 @@ function renderFileList() {
 
 function renderCrumbs() {
   const s = stack();
-  dom.crumbs.hidden = !s.length;
-  dom.crumbs.replaceChildren(
-    ...s.flatMap((n, i) => {
-      const label = i === 0 ? baseName(n.name) : n.name;
-      const item = i === s.length - 1 ? el('span', { class: 'crumb current', 'aria-current': 'page' }, label) : button(label, () => popTo(i), { class: 'crumb' });
-      return i ? [el('span', { class: 'crumb-sep', 'aria-hidden': 'true' }, '›'), item] : [item];
-    }),
-  );
+  // Folder segments first (each one shows that folder), then the open file and the bundle entries opened inside it.
+  const folder = current ? dirOf(current.path) : browse;
+  const items = [];
+  if (usesTree() && folder) {
+    const parts = folder.split('/');
+    parts.forEach((p, i) => {
+      const path = parts.slice(0, i + 1).join('/');
+      items.push(!s.length && i === parts.length - 1 ? el('span', { class: 'crumb current', 'aria-current': 'page' }, p) : button(p, () => browseTo(path), { class: 'crumb', title: `Show ${path}` }));
+    });
+  }
+  s.forEach((n, i) => {
+    const label = i === 0 ? baseName(n.name) : n.name;
+    items.push(i === s.length - 1 ? el('span', { class: 'crumb current', 'aria-current': 'page' }, label) : button(label, () => popTo(i), { class: 'crumb' }));
+  });
+  dom.crumbs.hidden = !items.length;
+  dom.crumbs.replaceChildren(...items.flatMap((item, i) => (i ? [el('span', { class: 'crumb-sep', 'aria-hidden': 'true' }, '›'), item] : [item])));
 }
 
 function renderInfo() {
@@ -242,6 +350,10 @@ function renderInfo() {
   if (node.layers.length)
     parts.push(button('Download unwrapped', downloadUnwrapped, { title: 'Save the contents without the BFBR / ZRES shells' }));
   if (node.parent) parts.push(button('Replace…', replaceNode, { title: 'Replace this entry with a file from disk' }));
+  else if (usesTree()) {
+    const pinned = prefs.pins.includes(current.path);
+    parts.push(button(pinned ? 'Unpin' : 'Pin to Places', () => togglePin(current.path), { title: pinned ? 'Remove this file from Pinned' : 'Keep this file under Pinned' }));
+  }
   const banners = [];
   if (node.layers.includes('BSRS'))
     banners.push(el('p', { class: 'banner banner-warn' }, 'BSRS encryption can be read but not written (HappyTool works the same way). If you save, this part is stored without it.'));
@@ -258,7 +370,7 @@ const LAYER_HELP = {
 function renderView() {
   const node = top();
   if (!node) {
-    dom.view.replaceChildren(emptyState());
+    dom.view.replaceChildren(files.length && browse !== null ? renderFolder({ tree, browse, mode: prefs.mode, pins: prefs.pins }, folderActions) : emptyState());
     return;
   }
   const ctx = {
@@ -312,8 +424,15 @@ function emptyState() {
     'div',
     { class: 'empty' },
     el('h1', {}, 'Open Happy Wars data files'),
-    el('p', {}, 'Drop files or a folder anywhere on this page, or use the buttons below. Bundles (.bres), text tables (.lng), JSON, scripts and DDS textures are unwrapped from BFBR, BSRS and ZRES automatically.'),
-    el('div', { class: 'empty-actions' }, button('Open files…', openFilesPicker, { class: 'btn btn-primary' }), button('Open folder…', openFolderPicker)),
+    el('p', {}, 'Point it at the game’s Data folder to browse it like HappyTool, or drop files or a folder anywhere on this page. Bundles (.bres), text tables (.lng), JSON, scripts and DDS textures are unwrapped from BFBR, BSRS and ZRES automatically, and stage bundles open as maps.'),
+    el(
+      'div',
+      { class: 'empty-actions' },
+      button('Open Data folder…', openDataFolder, { class: 'btn btn-primary' }),
+      savedHandle ? button(`Reopen ${savedHandle.name}`, reopenDataFolder, { title: 'Open the folder you used last time (the browser asks to allow it again)' }) : null,
+      button('Open files…', openFilesPicker),
+    ),
+    el('p', { class: 'muted small' }, 'On Steam the Data folder is usually C:\\Program Files (x86)\\Steam\\steamapps\\common\\Happy Wars\\Data.'),
     el('p', { class: 'muted small' }, 'Everything runs in this browser tab. Files are not uploaded anywhere; saving downloads a copy.'),
   );
 }
@@ -368,14 +487,66 @@ function addFiles(list) {
     added++;
   }
   files.sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true, sensitivity: 'base' }));
+  tree = buildTree(files);
   if (skipped) toast(`${skipped} file${skipped === 1 ? ' has' : 's have'} unsaved edits and ${skipped === 1 ? 'was' : 'were'} not reloaded`, 'warn');
   if (current && !current.stack) current = null;
   if (added === 1 || (!current && files.length === 1)) {
     const rec = files.find((r) => r.path === list[0].path.replace(/\\/g, '/').replace(/^\/+/, ''));
     if (rec) return openFile(rec);
   }
-  if (added > 1) toast(`Added ${added} files. Pick one from the list.`, 'ok');
+  if (added > 1) {
+    // Show the folder that holds what was just added (the picked folder itself for a folder pick).
+    const paths = list.map((x) => x.path.replace(/\\/g, '/').replace(/^\/+/, ''));
+    let common = dirOf(paths[0]);
+    for (const p of paths) while (common && !p.startsWith(`${common}/`)) common = dirOf(common);
+    current = null;
+    browse = common;
+    expandTo(common);
+    toast(`Added ${added} files.`, 'ok');
+  }
   render();
+}
+
+async function openDataFolder() {
+  if (!window.showDirectoryPicker) return openFolderPicker();
+  let handle;
+  try {
+    handle = await window.showDirectoryPicker({ id: 'happywars-data', mode: 'read' });
+  } catch (e) {
+    if (e.name !== 'AbortError') toast(`Could not open the folder: ${e.message}`, 'error');
+    return;
+  }
+  await loadDataFolder(handle);
+}
+
+async function reopenDataFolder() {
+  try {
+    if ((await savedHandle.queryPermission({ mode: 'read' })) !== 'granted' && (await savedHandle.requestPermission({ mode: 'read' })) !== 'granted')
+      return toast('The browser did not allow reading that folder. Use Open Data folder… instead.', 'warn');
+  } catch (e) {
+    return toast(`Could not reopen ${savedHandle.name}: ${e.message}`, 'error');
+  }
+  await loadDataFolder(savedHandle);
+}
+
+async function loadDataFolder(handle) {
+  setBusy(`Reading ${handle.name}…`);
+  let list;
+  try {
+    list = await readDirectory(handle, (n) => setBusy(`Reading ${handle.name}… ${n} files`));
+  } catch (e) {
+    toast(`Could not read ${handle.name}: ${e.message}`, 'error');
+    return render();
+  }
+  savedHandle = handle;
+  saveHandle(handle);
+  if (!list.length) {
+    toast(`${handle.name} has no files.`, 'warn');
+    return render();
+  }
+  addFiles(list);
+  if (list.length === 1) return;
+  browseTo(handle.name);
 }
 
 async function openFilesPicker() {
@@ -411,7 +582,7 @@ async function filesFromDrop(dt) {
 // ---------- wiring ----------
 
 $('btn-open').addEventListener('click', openFilesPicker);
-$('btn-open-folder').addEventListener('click', openFolderPicker);
+$('btn-open-folder').addEventListener('click', openDataFolder);
 dom.save.addEventListener('click', save);
 dom.filter.addEventListener('input', renderFileList);
 
@@ -487,3 +658,9 @@ if (typeof DecompressionStream === 'undefined')
 if (problems.length) $('env-warning').replaceChildren(...problems.map((p) => el('p', { class: 'banner banner-error' }, p)));
 
 render();
+loadHandle().then((h) => {
+  if (h && !files.length) {
+    savedHandle = h;
+    render();
+  }
+});
