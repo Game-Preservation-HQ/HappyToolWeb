@@ -37,3 +37,14 @@ It's online at https://www.happywars.org/tools/happytool/. To host another copy,
 ## Checks
 
 The format code was checked against all 1356 files in the Steam release's `Data` folder, comparing the results with HappyTool's own C# classes. All 341 bundles and 64 text tables rebuild byte-for-byte identical to their unwrapped originals, every entry's name, size, command and SHA-256 match the C# results, and all 4788 DDS textures decode.
+
+## License
+
+Copyright (C) 2026 Serenity, Game Preservation HQ.
+
+HappyTool web is free software under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-only). You may use, change and share it, on these conditions:
+
+- **Credit:** every copy, and every changed version, must keep the copyright notice above and the credit to Serenity, together with the license.
+- **Share the code:** if you give anyone a copy, or a changed version, you must also give them its full source code under this same license. This also applies when you run a changed version on a website or server that other people use: you must offer those people the source of your version.
+
+The license comes with no warranty. The full terms are in [LICENSE](LICENSE).
