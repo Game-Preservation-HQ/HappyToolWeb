@@ -22,6 +22,7 @@ import {
 import {
   makeFog, sameFog, fogHex, withHex, metres, fogFromFeature, readFog, readFogFromFile, bakeFog, fogPreviewOn, setFogPreview, fogRgb,
 } from './stage-fog.js';
+import { readCollision } from './stage-collision.js';
 
 const FOV = Math.PI / 4;
 const SKY_RADIUS = 920; // ClipFar 1000 * 0.92 when StageCameraParam.json isn't read (ComputeSkyRenderRadius)
@@ -266,7 +267,22 @@ void main() {
   outColor = vec4(mix(c, uTint.rgb, uTint.a), 1.0);
 }`;
 
-function compile(gl) {
+// The collision overlay's lines: one flat colour, pulled 0.3% of the way toward the eye so they show over the surface
+// they lie on (the desktop draws them with a polygon offset, which WebGL doesn't apply to lines).
+const LINE_VS = `#version 300 es
+layout(location=0) in vec3 aPos;
+uniform mat4 uViewProj;
+uniform vec3 uEye;
+void main() { gl_Position = uViewProj * vec4(uEye + (aPos - uEye) * 0.997, 1.0); }`;
+const LINE_FS = `#version 300 es
+precision mediump float;
+uniform vec4 uColor;
+out vec4 outColor;
+void main() { outColor = uColor; }`;
+
+const MAP_UNIFORMS = ['uViewProj', 'uEye', 'uSkyRadius', 'uTex0', 'uTex1', 'uMode', 'uLit', 'uLmScale', 'uTint', 'uFogOn', 'uFogColor', 'uFogRange', 'uFwd'];
+
+function compile(gl, vs = VS, fs = FS, names = MAP_UNIFORMS) {
   const sh = (type, src) => {
     const s = gl.createShader(type);
     gl.shaderSource(s, src);
@@ -275,12 +291,12 @@ function compile(gl) {
     return s;
   };
   const p = gl.createProgram();
-  gl.attachShader(p, sh(gl.VERTEX_SHADER, VS));
-  gl.attachShader(p, sh(gl.FRAGMENT_SHADER, FS));
+  gl.attachShader(p, sh(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
   gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
   const u = {};
-  for (const name of ['uViewProj', 'uEye', 'uSkyRadius', 'uTex0', 'uTex1', 'uMode', 'uLit', 'uLmScale', 'uTint', 'uFogOn', 'uFogColor', 'uFogRange', 'uFwd']) u[name] = gl.getUniformLocation(p, name);
+  for (const name of names) u[name] = gl.getUniformLocation(p, name);
   return { program: p, u };
 }
 
@@ -444,12 +460,14 @@ export function renderStage(node, ctx) {
   const hint = el(
     'div',
     { class: 'stage-hint' },
-    'Drag: orbit · Right-drag: pan · Wheel: zoom · WASD/QE: fly · Click: select · 1/2/3: move/rotate/scale · Arrows, PgUp/PgDn: nudge (Ctrl: rotate, Shift: ×5) · [ ]: scale · Del: hide · Ctrl+Z/Y: undo/redo · F: frame · R: reset view',
+    'Drag: orbit · Right-drag: pan · Wheel: zoom · WASD/QE: fly · Click: select · 1/2/3: move/rotate/scale · Arrows, PgUp/PgDn: nudge (Ctrl: rotate, Shift: ×5) · [ ]: scale · Del: hide · Ctrl+Z/Y: undo/redo · F: frame · R: reset view · H: collision',
   );
   const host = el('div', { class: 'stage-canvas-host' }, canvas, overlay, hint);
   const lmSelect = el('select', { class: 'input input-sm', 'aria-label': 'Lightmap mode' }, LM_MODES.map(([v, label]) => el('option', { value: v }, label)));
   lmSelect.value = localStorage.getItem(LM_KEY) || 'normal';
   const texBox = el('input', { type: 'checkbox', checked: true });
+  const colBox = el('input', { type: 'checkbox', disabled: true });
+  const colLabel = el('label', { class: 'check muted', title: 'Reading the collision…' }, colBox, ' Collision');
   const resetBtn = button('Reset view', null, { title: 'Frame the whole stage (R)' });
   const view = el(
     'div',
@@ -461,6 +479,7 @@ export function renderStage(node, ctx) {
       el('strong', {}, model.name),
       lmSelect,
       el('label', { class: 'check' }, texBox, ' Textures'),
+      colLabel,
       resetBtn,
       el('span', { class: 'spacer' }),
       status,
@@ -614,6 +633,21 @@ export function renderStage(node, ctx) {
             }
           }
         }
+      }
+      if (colBox.checked && colGpu.length && lineProg) {
+        // The collision layers as green lines over the map (DrawCollisionOverlay), depth-tested against it.
+        gl.useProgram(lineProg.program);
+        gl.uniformMatrix4fv(lineProg.u.uViewProj, false, vp);
+        gl.uniform3fv(lineProg.u.uEye, eye);
+        gl.uniform4f(lineProg.u.uColor, 0.15, 1, 0.35, 1);
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthMask(false);
+        for (const g of colGpu) {
+          gl.bindVertexArray(g.vao);
+          gl.drawElements(gl.LINES, g.count, gl.UNSIGNED_INT, 0);
+        }
+        gl.depthMask(true);
+        gl.useProgram(prog.program);
       }
       gl.bindVertexArray(null);
       overlayDirty = true;
@@ -1454,6 +1488,72 @@ export function renderStage(node, ctx) {
     }
     renderFog();
     renderDownload();
+
+    // ----- collision (CcpCollisionParser: every .ccp layer, drawn as lines; key H) -----
+    let lineProg = null;
+    try {
+      lineProg = compile(gl, LINE_VS, LINE_FS, ['uViewProj', 'uEye', 'uColor']);
+    } catch (e) {
+      console.warn(`Map editor: the collision lines can't be drawn: ${e.message}`);
+    }
+    const colGpu = [];
+    let colRead = null; // {layers, unread} once read
+    colBox.checked = !!job.showCollision;
+    /** Uploads each layer's vertices and edge list once read (UploadCollision). */
+    function uploadCollision(col) {
+      for (const l of col.layers) {
+        const vao = gl.createVertexArray();
+        gl.bindVertexArray(vao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+        gl.bufferData(gl.ARRAY_BUFFER, l.positions, gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, l.edges, gl.STATIC_DRAW);
+        gl.bindVertexArray(null);
+        colGpu.push({ vao, count: l.edges.length });
+      }
+    }
+    function renderCollision() {
+      const col = colRead, n = col?.layers.length ?? 0;
+      const tris = n ? col.layers.reduce((s, l) => s + l.triangles, 0) : 0;
+      const notRead = col?.unread.length ? ` Not read: ${col.unread.join(', ')}.` : '';
+      colBox.disabled = !n || !lineProg;
+      colLabel.classList.toggle('muted', colBox.disabled);
+      if (!col) colLabel.title = 'Reading the collision…';
+      else if (!n) colLabel.title = `No collision (.ccp) in this stage.${notRead}`;
+      else if (!lineProg) colLabel.title = "This browser couldn't set up the collision lines.";
+      else
+        colLabel.title =
+          `Show the stage's collision as green lines (H): ${n} layer${n === 1 ? '' : 's'}, ${tris.toLocaleString()} triangles ` +
+          `(${col.layers.map((l) => l.name).join(', ')}).${notRead}`;
+    }
+    function showCollision() {
+      job.showCollision = colBox.checked;
+      dirty = true;
+    }
+    function toggleCollision() {
+      if (colBox.disabled) return toast(colLabel.title);
+      colBox.checked = !colBox.checked;
+      showCollision();
+    }
+    colBox.addEventListener('change', showCollision);
+    (job.collision || (job.collision = readCollision(model))).then(
+      (col) => {
+        if (stopped) return;
+        colRead = col;
+        uploadCollision(col);
+        renderCollision();
+        dirty = true;
+      },
+      (e) => {
+        if (stopped) return;
+        colRead = { layers: [], unread: [] };
+        console.warn(`Map editor: the collision of ${edit.stage} could not be read: ${e.message}`);
+        renderCollision();
+      },
+    );
+    renderCollision();
     renderSky();
     if (edit.sky) showSky();
     edit.pictureJob?.then(() => !stopped && showSky());
@@ -1666,6 +1766,7 @@ export function renderStage(node, ctx) {
         keys.add(k);
         e.preventDefault();
       } else if (k === 'f') frameSelection();
+      else if (k === 'h') toggleCollision();
       else if (k === 'r' || k === 'home') {
         Object.assign(cam, framed(scene.bounds, { yaw: 0.6, pitch: -0.55 }));
         dirty = true;
