@@ -10,6 +10,7 @@ A browser version of HappyTool's Game Data editor. It runs entirely in the page:
 - `.lng` text tables: edit per language with the other languages beside each key, add and delete keys, export and import CSV.
 - JSON and text: edit, with Format and Minify for JSON. The game's JSON files contain `//` and `/* */` comments, which are accepted as in HappyTool; Format and Minify keep every string and number exactly as written and ask before dropping comments. The original encoding (UTF-8, UTF-8 with BOM, UTF-16) and each line's CRLF or LF ending are kept.
 - DDS textures (DXT1/3/5, ATI1/ATI2, DX10 BC1–BC5, uncompressed RGB) and PNG/JPEG/GIF/BMP: preview with zoom, export to PNG.
+- Steam stage bundles: a 3D map with the stage's textures and baked light, layers and click to inspect. Its objects can be moved, turned, sized and hidden with a gizmo, keys or the placement panel, with undo; edits are kept in the browser and saved or loaded as the map editor's edits file. The rest of the map editor is being ported one tool at a time.
 - Everything else: a paged hex view.
 
 The desktop app's other tools are not part of this version.
@@ -32,7 +33,7 @@ It's online at https://www.happywars.org/tools/happytool/. To host another copy,
 
 - `index.html`, `css/app.css`, `js/app.js`: the page, styles and app shell (file list, navigation, save).
 - `js/formats/`: format code ported from HappyTool's C# (`bres.js`, `lng.js`, `wrappers.js`, `blowfish.js`, `dds.js`, `zip.js`, `sniff.js`, `rrm.js` and `steam-stage.js` for Steam stage models, `stage-pictures.js` for the stage-select pictures), plus `json.js` for comment-tolerant JSON.
-- `js/views/`: one view per content type (bundle table, text table, text editor, image preview, hex), plus `stage-view.js`, the WebGL2 map viewer.
+- `js/views/`: one view per content type (bundle table, text table, text editor, image preview, hex), plus `stage-view.js`, the WebGL2 map viewer and editor, and `stage-edit.js`, its object placement, undo history, edits file and gizmo maths.
 
 ## Checks
 
