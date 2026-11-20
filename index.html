@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HappyTool web</title>
+  <meta name="description" content="Open, browse and edit Happy Wars data files in the browser: BRES bundles, .lng text tables, JSON, scripts and DDS textures.">
+  <link rel="stylesheet" href="css/app.css">
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">HT</span><span>HappyTool <span class="muted">web</span></span></div>
+    <div class="topbar-actions">
+      <button type="button" class="btn" id="btn-open">Open files…</button>
+      <button type="button" class="btn" id="btn-open-folder">Open folder…</button>
+      <button type="button" class="btn btn-primary" id="btn-save" disabled title="Download the edited file (Ctrl+S)">Save</button>
+      <button type="button" class="btn btn-icon" id="btn-theme" aria-label="Switch theme">☾</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar" aria-label="Open files">
+      <input type="search" id="file-filter" class="input input-sm" placeholder="Filter files" aria-label="Filter files">
+      <ul id="file-list" class="file-list"></ul>
+      <p id="file-count" class="muted small"></p>
+    </aside>
+
+    <main class="main">
+      <div id="env-warning">
+        <noscript><p class="banner banner-error">HappyTool web needs JavaScript.</p></noscript>
+        <p class="banner banner-error" id="file-warning" hidden>This page was opened straight from disk (file://), where browsers block its scripts. Serve the folder over http://localhost as the README describes.</p>
+      </div>
+      <nav id="crumbs" class="crumbs" aria-label="Location" hidden></nav>
+      <div id="infobar" class="infobar" hidden></div>
+      <div id="view" class="view-host"></div>
+    </main>
+  </div>
+
+  <div id="drop-overlay" class="drop-overlay" hidden><div>Drop files or folders to open them</div></div>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <script>
+    if (location.protocol === 'file:') document.getElementById('file-warning').hidden = false;
+  </script>
+</body>
+</html>
