@@ -5,7 +5,9 @@
 // its pivot. The bounds of every batch an edit touched are refitted, so the game doesn't cull what moved.
 // The collision follows (PatchCollision, BuildGroup, TileGroups, ClipToTiles, DropStaleCollisionCopies): a moved
 // object's triangles leave their group for new groups cut to the game's 1000-unit tiles, placed like the object; a
-// hidden object's triangles are dropped; everything else stays where it is.
+// hidden object's triangles are dropped; everything else stays where it is. Solid objects get collision generated from
+// their own shapes (SolidCollision, CollisionSized, SolidTriangles, FlatTriangles, AppendCollisionGroups), appended to the
+// character and environment layers.
 
 import { isIdentityTransform, rotation } from '../views/stage-edit.js';
 import { parseCollisionGroups } from '../views/stage-collision.js';
@@ -575,7 +577,7 @@ export function clipToTiles(tris) {
  * Collision groups for free triangles (9 numbers each): cut to tiles, one group per tile (≤ 20000 triangles), corners
  * at the same float spot shared, with the CCH node words of node (TileGroups).
  */
-function tileGroups(node, tris) {
+function tileGroups(node, tris, count) {
   const groups = [];
   for (const [, , pieces] of clipToTiles(tris))
     for (let k = 0; k < pieces.length; k += TILE_MAX_TRIANGLES) {
@@ -598,7 +600,9 @@ function tileGroups(node, tris) {
         keep.push(idx.length / 3);
         idx.push(...c);
       }
-      if (keep.length) groups.push(buildGroup({ node, vertices: verts, triangles: idx }, keep, null, null));
+      if (!keep.length) continue;
+      groups.push(buildGroup({ node, vertices: verts, triangles: idx }, keep, null, null));
+      if (count) count.written += keep.length;
     }
   return groups;
 }
@@ -737,4 +741,170 @@ export function dropStaleCollisionCopies(entries, changedNames) {
     return !gone;
   });
   return { entries: dropped.length ? kept : entries, dropped };
+}
+
+// ===================== Solid objects: collision generated from their own shapes =====================
+
+/** Layers a Solid object's generated triangles go into (SolidLayers): characters (_Chit) and the environment (_Ehit). */
+export const SOLID_LAYERS = ['_chit.ccp', '_ehit.ccp'];
+/** Longest collision edge written (MaxCollisionEdge): shipped stages have none over 1714, and characters fall through
+ * a long one. */
+const MAX_COLLISION_EDGE = 1500;
+
+const placeAt = (world, p, at) => (world ? Affine.point(world, p[at], p[at + 1], p[at + 2]) : [p[at], p[at + 1], p[at + 2]]);
+const dist = (x, y) => Math.sqrt((x[0] - y[0]) * (x[0] - y[0]) + (x[1] - y[1]) * (x[1] - y[1]) + (x[2] - y[2]) * (x[2] - y[2]));
+const longest = (a, b, c) => Math.max(dist(a, b), Math.max(dist(b, c), dist(c, a)));
+/** A solid's triangle list; null means its positions are a triangle soup (3 corners per triangle, in order). */
+const trianglesOf = (so) => so.triangles ?? Uint32Array.from({ length: so.positions.length / 3 }, (_, i) => i);
+
+/**
+ * A solid ({name, positions, triangles?, world}) with every triangle longer than 1500 cut into a k×k grid of smaller
+ * ones, placed, so the object's scale counts (CollisionSized); zero-area triangles are dropped. The solid itself when no
+ * triangle is too long.
+ */
+function collisionSized(so) {
+  const p = so?.positions;
+  if (!p) return so;
+  const tri = trianglesOf(so);
+  const ok = (a, b, c) => a >= 0 && b >= 0 && c >= 0 && a + 2 < p.length && b + 2 < p.length && c + 2 < p.length;
+  let cut = false;
+  for (let t = 0; t + 2 < tri.length && !cut; t += 3) {
+    const a = tri[t] * 3, b = tri[t + 1] * 3, c = tri[t + 2] * 3;
+    if (!ok(a, b, c)) continue;
+    cut = longest(placeAt(so.world, p, a), placeAt(so.world, p, b), placeAt(so.world, p, c)) > MAX_COLLISION_EDGE;
+  }
+  if (!cut) return so;
+  const pos = [], idx = [];
+  for (let t = 0; t + 2 < tri.length; t += 3) {
+    const a = tri[t] * 3, b = tri[t + 1] * 3, c = tri[t + 2] * 3;
+    if (!ok(a, b, c)) continue;
+    const pa = placeAt(so.world, p, a), pb = placeAt(so.world, p, b), pc = placeAt(so.world, p, c);
+    const ux = pb[0] - pa[0], uy = pb[1] - pa[1], uz = pb[2] - pa[2], vx = pc[0] - pa[0], vy = pc[1] - pa[1], vz = pc[2] - pa[2];
+    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    if (nx * nx + ny * ny + nz * nz < 1e-6 || Number.isNaN(nx + ny + nz)) continue;
+    const k = Math.max(1, Math.ceil(longest(pa, pb, pc) / MAX_COLLISION_EDGE));
+    // Grid point (i, j) = a + u·i/k + v·j/k for i + j <= k; triangles keep the source winding.
+    const first = pos.length / 3;
+    const at = (i, j) => first + i * (k + 1) - (i * (i - 1)) / 2 + j;
+    for (let i = 0; i <= k; i++)
+      for (let j = 0; j <= k - i; j++)
+        pos.push(
+          Math.fround(pa[0] + (ux * i + vx * j) / k),
+          Math.fround(pa[1] + (uy * i + vy * j) / k),
+          Math.fround(pa[2] + (uz * i + vz * j) / k),
+        );
+    for (let i = 0; i < k; i++)
+      for (let j = 0; j < k - i; j++) {
+        idx.push(at(i, j), at(i + 1, j), at(i, j + 1));
+        if (j < k - i - 1) idx.push(at(i + 1, j), at(i + 1, j + 1), at(i, j + 1));
+      }
+  }
+  return { name: so.name, world: null, positions: Float32Array.from(pos), triangles: Int32Array.from(idx) };
+}
+
+/** A solid's usable triangles, placed (9 numbers each); zero-area ones carry no surface (SolidTriangles). */
+function solidTriangles(so) {
+  const tris = [], p = so?.positions;
+  if (!p) return tris;
+  const tri = trianglesOf(so);
+  for (let t = 0; t + 2 < tri.length; t += 3) {
+    const a = tri[t] * 3, b = tri[t + 1] * 3, c = tri[t + 2] * 3;
+    if (a < 0 || b < 0 || c < 0 || a + 2 >= p.length || b + 2 >= p.length || c + 2 >= p.length) continue;
+    const f = [...placeAt(so.world, p, a), ...placeAt(so.world, p, b), ...placeAt(so.world, p, c)];
+    if (hasArea(f, 0)) tris.push(f);
+  }
+  return tris;
+}
+
+/** Placed triangles moved flat to their median corner height; ones left with no ground area dropped (FlatTriangles). */
+function flatTriangles(tris) {
+  if (!tris.length) return tris;
+  const ys = [];
+  for (const f of tris) ys.push(f[1], f[4], f[7]);
+  ys.sort((a, b) => a - b);
+  const y = ys[ys.length >> 1];
+  const flat = [];
+  for (const f of tris) {
+    const g = f.slice();
+    g[1] = g[4] = g[7] = y;
+    const ax = g[3] - g[0], az = g[5] - g[2], bx = g[6] - g[0], bz = g[8] - g[2];
+    if (Math.abs(ax * bz - az * bx) > 1e-3) flat.push(g);
+  }
+  return flat;
+}
+
+/**
+ * Generated collision for Solid objects (SolidCollision): each solid's own triangles placed like it, cut to edges of at
+ * most 1500 and split into 1000-unit tiles like the authored groups. layers: [{name, data}] (the stage's .ccp payloads;
+ * only _Chit and _Ehit are used). A solid is {name, positions, triangles? (null: a triangle soup), world (3×4 or null),
+ * attribute? (CCH +4: 0 plain, 200 water that drowns, 300 magma), onlyLayer?, flatten?}. Each group copies the CCH node
+ * words of an attribute-0 group of its file. Returns Map layer name → [group bytes]; report gains warnings, a log line,
+ * collisionTrianglesGenerated (per layer) and solidObjects.
+ */
+export function solidCollision(layers, solids, report) {
+  report.warnings ??= [];
+  report.log ??= [];
+  const result = new Map();
+  if (!solids?.length) return result;
+  const targets = [];
+  for (const l of layers) {
+    const lower = l.name.toLowerCase();
+    if (!SOLID_LAYERS.some((x) => lower.endsWith(x))) continue;
+    const groups = parseCollisionGroups(l.data);
+    if (!groups?.length) {
+      report.warnings.push(`${l.name} has an unfamiliar layout, so Solid objects add no collision to it.`);
+      continue;
+    }
+    const node = (groups.find((g) => g.attribute === 0) ?? groups[0]).node.slice();
+    node[1] = 0; // plain surface
+    targets.push({ name: l.name, node });
+  }
+  if (!targets.length) {
+    report.warnings.push('This stage has no character / environment collision layer, so Solid objects add no collision.');
+    return result;
+  }
+  let objects = 0, triangles = 0, special = 0;
+  for (const solid of solids) {
+    let tris = solidTriangles(collisionSized(solid));
+    if (solid.flatten) tris = flatTriangles(tris);
+    if (!tris.length) continue;
+    objects++;
+    if (solid.attribute) special++;
+    const count = { written: 0 };
+    for (const t of targets) {
+      if (solid.onlyLayer && !t.name.toLowerCase().endsWith(solid.onlyLayer.toLowerCase())) continue;
+      let node = t.node;
+      if (solid.attribute) {
+        node = node.slice();
+        node[1] = solid.attribute >>> 0;
+      }
+      if (!result.has(t.name)) result.set(t.name, []);
+      count.written = 0; // per layer, as the desktop counts it
+      for (const g of tileGroups(node, tris, count)) result.get(t.name).push(g);
+    }
+    triangles += count.written;
+  }
+  report.collisionTrianglesGenerated = (report.collisionTrianglesGenerated || 0) + triangles;
+  report.solidObjects = (report.solidObjects || 0) + objects;
+  report.log.push(
+    `solid: ${objects} object(s) (${special} water / magma), ${triangles} generated triangle(s) per layer into ${targets.length} layer(s)`,
+  );
+  return result;
+}
+
+/** A .ccp with groups appended after its own, its size and group count updated (AppendCollisionGroups). */
+export function appendCollisionGroups(d, groups) {
+  let total = d.length;
+  for (const g of groups) total += g.length;
+  const o = new Uint8Array(total);
+  o.set(d, 0);
+  let at = d.length;
+  for (const g of groups) {
+    o.set(g, at);
+    at += g.length;
+  }
+  const dv = view(o);
+  dv.setUint32(8, total, true);
+  dv.setUint32(12, (u32(view(d), 12) + groups.length) >>> 0, true);
+  return o;
 }

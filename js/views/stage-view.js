@@ -6,7 +6,15 @@
 import { el, button, toast, downloadBlob, pickFiles, confirmBox, debounce } from '../ui.js';
 import { decodeLayers, encodeLayers, writableLayers } from '../formats/wrappers.js';
 import { writeBres } from '../formats/bres.js';
-import { collectExportEdits, bakeEdits, patchCollision, dropStaleCollisionCopies } from '../formats/stage-bake.js';
+import {
+  collectExportEdits,
+  bakeEdits,
+  patchCollision,
+  dropStaleCollisionCopies,
+  solidCollision,
+  appendCollisionGroups,
+  placementMatrix,
+} from '../formats/stage-bake.js';
 import { downloadBytes } from '../util.js';
 import { decodeDds } from '../formats/dds.js';
 import { buildSteamStage } from '../formats/steam-stage.js';
@@ -1474,11 +1482,11 @@ export function renderStage(node, ctx) {
     // ----- download (objects, sky and fog written into a copy of the bundle, as the desktop export does) -----
     const downloadNote = el('p', { class: 'muted stage-count' });
     const bakeBtn = button('Download bundle', bakeBundle, {
-      title: 'Write the moved and hidden objects, the sky and the fog into a copy of the stage bundle, as the desktop export does',
+      title: 'Write the moved, hidden and Solid objects, the sky and the fog into a copy of the stage bundle, as the desktop export does',
     });
     function bakeParts() {
       const parts = [];
-      if (edit.objects.some((o) => !isEmpty({ ...o.state, solid: false }))) parts.push('objects');
+      if (edit.objects.some((o) => !isEmpty(o.state))) parts.push('objects');
       if (edit.sky && edit.sky.Mode !== 'dungeon') parts.push('sky');
       if (fogChanged(edit)) parts.push('fog');
       return parts;
@@ -1488,53 +1496,84 @@ export function renderStage(node, ctx) {
       const parts = bakeParts();
       downloadNote.textContent = parts.length
         ? `Writes the ${listOf(parts)} into a copy of ${edit.stage}.bres.`
-        : 'Move or hide objects, or change the sky or fog, to write them into a copy of the bundle.';
+        : 'Move, hide or make objects Solid, or change the sky or fog, to write them into a copy of the bundle.';
       bakeBtn.disabled = !parts.length;
       if (!downloadBox.contains(bakeBtn)) downloadBox.replaceChildren(downloadNote, el('div', { class: 'toolbar' }, bakeBtn));
     }
+    /** Solid objects for export (CollectExportSolids): each one's collision shape, placed like the object. */
+    function exportSolids() {
+      const list = [];
+      for (const o of edit.objects) {
+        const st = o.state;
+        if (!st.solid || st.hidden) continue;
+        const world = isIdentityTransform(st) ? null : placementMatrix(st, o.pivot.map(Math.fround));
+        list.push({ name: o.name, positions: solidOf(o), triangles: null, world });
+      }
+      return list;
+    }
     /**
-     * The edited objects' collision moved along in every .ccp layer (PatchCollision), once the collision is matched to
-     * the objects, and the changed layers' stale .mtf copies dropped. Returns {entries, line}; the entries are replaced in
-     * place (at: lower-case name -> index).
+     * The collision written as the desktop export does: the edited objects' triangles moved along in every .ccp layer
+     * (PatchCollision, once the collision is matched to the objects), Solid objects' generated collision appended to the
+     * _Chit and _Ehit layers (SolidCollision), and the changed layers' stale .mtf copies dropped. Returns {entries, line}
+     * or null when there's nothing to do; the entries are replaced in place (at: lower-case name -> index).
      */
-    async function bakeCollision(edits, entries, at) {
-      if (!entries.some((e) => /\.ccp$/i.test(e.name || ''))) return null;
-      status.textContent = 'Reading the collision…';
-      let col;
-      try {
-        col = await (job.collision || (job.collision = readCollision(model)));
-      } catch (e) {
-        return { entries, line: `Collision: left as it was (it couldn't be read: ${e.message}).` };
+    async function bakeCollision(edits, solids, entries, at) {
+      const ccp = [];
+      entries.forEach((e, i) => /\.ccp$/i.test(e.name || '') && !e.pointer && e.data?.length && ccp.push(i));
+      if (!ccp.length && !solids.length) return null;
+      const notes = [];
+      let col = null, owners = null;
+      if (edits.length && ccp.length) {
+        status.textContent = 'Reading the collision…';
+        try {
+          col = await (job.collision || (job.collision = readCollision(model)));
+        } catch (e) {
+          notes.push(`The collision couldn't be read (${e.message}), so it doesn't follow the moved objects.`);
+        }
+        if (col && !col.live) notes.push("The collision has an unfamiliar layout, so it doesn't follow the moved objects.");
+        else if (col) {
+          if (!edit.colMatch) startMatching(col);
+          for (let m = edit.colMatch; m && !m.owners && !m.error; m = edit.colMatch) {
+            status.textContent = `Matching the collision to the objects… ${m.pct ?? 0}%`;
+            await new Promise((ok) => setTimeout(ok, 250));
+          }
+          const m = edit.colMatch;
+          if (m?.owners) owners = m.owners;
+          else notes.push(`The collision couldn't be matched to objects${m?.error ? ` (${m.error})` : ''}, so it doesn't follow the moved objects.`);
+        }
       }
-      if (!col.live) return { entries, line: "Collision: left as it was (an unfamiliar layout), so it doesn't follow the moved objects." };
-      if (!edit.colMatch) startMatching(col);
-      for (let m = edit.colMatch; m && !m.owners && !m.error; m = edit.colMatch) {
-        status.textContent = `Matching the collision to the objects… ${m.pct ?? 0}%`;
-        await new Promise((ok) => setTimeout(ok, 250));
-      }
-      const m = edit.colMatch;
-      if (!m?.owners) return { entries, line: `Collision: left as it was (it couldn't be matched to objects${m?.error ? `: ${m.error}` : ''}).` };
       status.textContent = 'Writing the collision…';
       await pause();
-      const rep = {}, changed = [];
-      for (let li = 0; li < col.layers.length; li++) {
-        const name = col.layers[li].name, i = at.get(name.toLowerCase());
-        const e = entries[i];
-        if (i == null || e.pointer || !e.data?.length) continue;
-        const data = patchCollision((await decodeLayers(e.data)).payload, name, edits, edit.objects, m.owners[li], rep);
-        if (!data) continue;
-        entries[i] = { ...e, pointer: false, size: data.length, data };
+      const rep = { log: [], warnings: [] }, changed = [], payloads = [];
+      for (const i of ccp) payloads.push([i, (await decodeLayers(entries[i].data)).payload]);
+      const extra = solids.length ? solidCollision(payloads.map(([i, data]) => ({ name: entries[i].name, data })), solids, rep) : new Map();
+      for (const [i, data] of payloads) {
+        const name = entries[i].name;
+        const li = owners ? col.layers.findIndex((l) => l.name.toLowerCase() === name.toLowerCase()) : -1;
+        let out = li >= 0 ? patchCollision(data, name, edits, edit.objects, owners[li], rep) : null;
+        const add = extra.get(name);
+        if (add?.length) {
+          out = appendCollisionGroups(out ?? data, add);
+          rep.log.push(`${name}: +${add.length} group(s) from Solid objects`);
+        }
+        if (!out) continue;
+        entries[i] = { ...entries[i], pointer: false, size: out.length, data: out };
         changed.push(name);
       }
-      for (const l of rep.log || []) console.info(`Map editor export: ${l}`);
+      for (const l of rep.log) console.info(`Map editor export: ${l}`);
       const { entries: kept, dropped } = dropStaleCollisionCopies(entries, changed);
-      const moved = rep.trianglesMoved || 0, removed = rep.trianglesRemoved || 0;
+      const what = [];
+      if (owners) what.push(`${(rep.trianglesMoved || 0).toLocaleString()} triangles moved, ${(rep.trianglesRemoved || 0).toLocaleString()} removed`);
+      if (rep.collisionTrianglesGenerated) {
+        const k = rep.solidObjects;
+        what.push(`${rep.collisionTrianglesGenerated.toLocaleString()} generated for ${k.toLocaleString()} Solid object${k === 1 ? '' : 's'}`);
+      }
       const line =
         (changed.length
-          ? `Collision: ${moved.toLocaleString()} triangles moved, ${removed.toLocaleString()} removed in ${listOf(changed)}` +
+          ? `Collision: ${what.join('; ')} in ${listOf(changed)}` +
             (dropped.length ? `; dropped ${listOf(dropped)} (the old collision copies).` : '.')
-          : 'Collision: none of it belongs to the edited objects, so it was left as it was.') +
-        (rep.warnings?.length ? ` ${rep.warnings.join(' ')}` : '');
+          : `Collision: left as it was${owners ? ' (none of it belongs to the edited objects)' : ''}.`) +
+        [...notes, ...rep.warnings].map((x) => ` ${x}`).join('');
       return { entries: kept, line };
     }
     /** Downloads a copy of the bundle with the objects (and their collision), sky (ApplySkyToBundle) and fog (FogExport) written in. */
@@ -1550,6 +1589,7 @@ export function renderStage(node, ctx) {
           status.textContent = 'Writing the objects…';
           await pause();
           const { edits, skipped } = collectExportEdits(edit.objects);
+          const solids = exportSolids();
           const at = new Map();
           archive.entries.forEach((e, i) => at.has(e.name.toLowerCase()) || at.set(e.name.toLowerCase(), i));
           const entryOf = (name) => archive.entries[at.get(name.toLowerCase())];
@@ -1563,12 +1603,13 @@ export function renderStage(node, ctx) {
             entries[i] = { ...entries[i], pointer: false, size: data.length, data };
           }
           const n = r.report;
-          lines.push(
-            `Objects: ${n.objectsWritten.toLocaleString()} written${n.objectsHidden ? ` (${n.objectsHidden.toLocaleString()} hidden)` : ''}, ` +
-              `${n.verticesWritten.toLocaleString()} vertices, ${n.batchesRebounded.toLocaleString()} batch bounds refitted.` +
-              (skipped ? ` ${skipped.toLocaleString()} moved object(s) can't be written back (no Steam record).` : ''),
-          );
-          const c = edits.length ? await bakeCollision(edits, entries, at) : null;
+          if (edits.length || skipped)
+            lines.push(
+              `Objects: ${n.objectsWritten.toLocaleString()} written${n.objectsHidden ? ` (${n.objectsHidden.toLocaleString()} hidden)` : ''}, ` +
+                `${n.verticesWritten.toLocaleString()} vertices, ${n.batchesRebounded.toLocaleString()} batch bounds refitted.` +
+                (skipped ? ` ${skipped.toLocaleString()} moved object(s) can't be written back (no Steam record).` : ''),
+            );
+          const c = edits.length || solids.length ? await bakeCollision(edits, solids, entries, at) : null;
           if (c) lines.push(c.line);
           archive = { ...archive, entries: c ? c.entries : entries };
         }
