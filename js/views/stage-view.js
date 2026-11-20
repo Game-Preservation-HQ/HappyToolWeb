@@ -33,6 +33,7 @@ import {
   makeFog, sameFog, fogHex, withHex, metres, fogFromFeature, readFog, readFogFromFile, bakeFog, fogPreviewOn, setFogPreview, fogRgb,
 } from './stage-fog.js';
 import { readCollision, edgesOf } from './stage-collision.js';
+import { readNav, navLines } from '../formats/stage-nav.js';
 import {
   COLNAV_KEY, CN_SHAPES, CN_SIZES, CN_MIN_BRUSH, CN_MAX_BRUSH, readColNav, cloneColNav, colNavFeature, removedFlags,
   setRemovedFlags, volumeTriangles, rayLayer, rayTris, eraseAt,
@@ -483,7 +484,7 @@ export function renderStage(node, ctx) {
   const hint = el(
     'div',
     { class: 'stage-hint' },
-    'Drag: orbit · Right-drag: pan · Wheel: zoom · WASD/QE: fly · Click: select · 1/2/3: move/rotate/scale · Arrows, PgUp/PgDn: nudge (Ctrl: rotate, Shift: ×5) · [ ]: scale · Del: hide · Ctrl+Z/Y: undo/redo · F: frame · R: reset view · H: collision · F3: edit collision',
+    'Drag: orbit · Right-drag: pan · Wheel: zoom · WASD/QE: fly · Click: select · 1/2/3: move/rotate/scale · Arrows, PgUp/PgDn: nudge (Ctrl: rotate, Shift: ×5) · [ ]: scale · Del: hide · Ctrl+Z/Y: undo/redo · F: frame · R: reset view · H: collision · P: nav · F3: edit collision',
   );
   const host = el('div', { class: 'stage-canvas-host' }, canvas, overlay, hint);
   const lmSelect = el('select', { class: 'input input-sm', 'aria-label': 'Lightmap mode' }, LM_MODES.map(([v, label]) => el('option', { value: v }, label)));
@@ -491,6 +492,8 @@ export function renderStage(node, ctx) {
   const texBox = el('input', { type: 'checkbox', checked: true });
   const colBox = el('input', { type: 'checkbox', disabled: true });
   const colLabel = el('label', { class: 'check muted', title: 'Reading the collision…' }, colBox, ' Collision');
+  const navBox = el('input', { type: 'checkbox', disabled: true });
+  const navLabel = el('label', { class: 'check muted', title: 'Reading the nav mesh…' }, navBox, ' Nav');
   const resetBtn = button('Reset view', null, { title: 'Frame the whole stage (R)' });
   const view = el(
     'div',
@@ -503,6 +506,7 @@ export function renderStage(node, ctx) {
       lmSelect,
       el('label', { class: 'check' }, texBox, ' Textures'),
       colLabel,
+      navLabel,
       resetBtn,
       el('span', { class: 'spacer' }),
       status,
@@ -683,6 +687,7 @@ export function renderStage(node, ctx) {
         }
       }
       if (lineProg) drawCollision(vp, eye);
+      if (lineProg) drawNav(vp, eye);
       gl.bindVertexArray(null);
       overlayDirty = true;
     }
@@ -2074,6 +2079,107 @@ export function renderStage(node, ctx) {
     );
     renderCollision();
 
+    // ----- nav mesh and waypoints (StageViewerForm.Nav.cs DrawLiveNav; key P) -----
+    // Colours as on the desktop: nav cells cyan and depth-tested; drops, waypoint links and waypoints on top.
+    const NAV_CELL = [0.15, 0.85, 1], NAV_DROP = [1, 0.3, 0.9], NAV_LINK = [1, 0.75, 0.3], NAV_NODE = [1, 0.55, 0.1];
+    const navGpu = { vao: null, buf: null, parts: [], drops: 0 }; // parts: {first, count, colour, depth}
+    let navRead = null; // {nav, navName, path, pathName, unread} once read
+    navBox.checked = !!job.showNav;
+    /** Uploads the nav cells, drop links, waypoint links and waypoint rings as one line list. */
+    function uploadNav(r) {
+      const l = navLines(r.nav, r.path);
+      const lists = [
+        [l.cells, NAV_CELL, true],
+        [l.drops, NAV_DROP, false],
+        [l.links, NAV_LINK, false],
+        [l.nodes, NAV_NODE, false],
+      ];
+      navGpu.drops = l.drops.length / 6;
+      const data = new Float32Array(lists.reduce((s, [a]) => s + a.length, 0));
+      let at = 0;
+      navGpu.parts = [];
+      for (const [a, colour, depth] of lists) {
+        data.set(a, at);
+        if (a.length) navGpu.parts.push({ first: at / 3, count: a.length / 3, colour, depth });
+        at += a.length;
+      }
+      if (!navGpu.parts.length) return;
+      navGpu.vao = gl.createVertexArray();
+      navGpu.buf = gl.createBuffer();
+      gl.bindVertexArray(navGpu.vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, navGpu.buf);
+      gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+      gl.bindVertexArray(null);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    }
+    function drawNav(vp, eye) {
+      if (!navBox.checked || !navGpu.vao) return;
+      gl.useProgram(lineProg.program);
+      gl.uniformMatrix4fv(lineProg.u.uViewProj, false, vp);
+      gl.uniform3fv(lineProg.u.uEye, eye);
+      gl.depthMask(false);
+      gl.bindVertexArray(navGpu.vao);
+      for (const p of navGpu.parts) {
+        if (p.depth) gl.enable(gl.DEPTH_TEST);
+        else gl.disable(gl.DEPTH_TEST);
+        gl.uniform4f(lineProg.u.uColor, p.colour[0], p.colour[1], p.colour[2], 1);
+        gl.drawArrays(gl.LINES, p.first, p.count);
+      }
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthMask(true);
+      gl.useProgram(prog.program);
+    }
+    function renderNav() {
+      const r = navRead, nav = r?.nav, path = r?.path;
+      const notRead = r?.unread.length ? ` Not read: ${r.unread.join(', ')}.` : '';
+      navBox.disabled = !navGpu.vao || !lineProg;
+      navLabel.classList.toggle('muted', navBox.disabled);
+      if (!r) navLabel.title = 'Reading the nav mesh…';
+      else if (!nav && !path) navLabel.title = `No nav mesh or waypoints (navi/path .spd) in this stage.${notRead}`;
+      else if (!lineProg) navLabel.title = "This browser couldn't set up the nav lines.";
+      else {
+        const parts = [];
+        if (nav) parts.push(`${nav.cells.length.toLocaleString()} nav cells, ${navGpu.drops.toLocaleString()} drops (${r.navName})`);
+        if (path) {
+          parts.push(
+            `${path.nodes.length.toLocaleString()} waypoints, ${path.links.length.toLocaleString()} links, ` +
+              `${path.regions.length.toLocaleString()} regions (${r.pathName})`,
+          );
+        }
+        navLabel.title =
+          `Show where the bots walk (P): ${parts.join('; ')}. Cyan: nav cells; magenta: one-way drops; ` +
+          `orange: waypoints and their links. View-only for now: it doesn't follow moved objects yet.${notRead}`;
+      }
+    }
+    function showNav() {
+      job.showNav = navBox.checked;
+      dirty = true;
+    }
+    function toggleNav() {
+      if (navBox.disabled) return toast(navLabel.title);
+      navBox.checked = !navBox.checked;
+      showNav();
+    }
+    navBox.addEventListener('change', showNav);
+    (job.nav || (job.nav = readNav(model))).then(
+      (r) => {
+        if (stopped) return;
+        navRead = r;
+        if (lineProg) uploadNav(r);
+        renderNav();
+        dirty = true;
+      },
+      (e) => {
+        if (stopped) return;
+        navRead = { nav: null, path: null, unread: [] };
+        console.warn(`Map editor: the nav mesh of ${edit.stage} could not be read: ${e.message}`);
+        renderNav();
+      },
+    );
+    renderNav();
+
     // ----- collision edits: erase collision by hand, add pieces (StageViewerForm.ColNav.cs) -----
     let cnMode = 0; // 0 off, 1 erase collision, 2 add collision
     let cnBrush = 300, cnShape = 'Wall', cnYaw = 0, cnSel = -1, cnStroke = null, cnAim = null, cnShift = false;
@@ -2799,6 +2905,7 @@ export function renderStage(node, ctx) {
         e.preventDefault();
       } else if (k === 'f') frameSelection();
       else if (k === 'h') toggleCollision();
+      else if (k === 'p') toggleNav();
       else if (k === 'r' || k === 'home') {
         Object.assign(cam, framed(scene.bounds, { yaw: 0.6, pitch: -0.55 }));
         dirty = true;
