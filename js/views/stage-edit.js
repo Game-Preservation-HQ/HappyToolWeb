@@ -93,40 +93,93 @@ export function boundsOf(pos, firstVertex, count) {
 
 // ---------- objects ----------
 
+/** The mesh's object ranges sorted and checked (in bounds, not overlapping); one whole-mesh range otherwise (ValidObjectRanges). */
+function validObjectRanges(m, vc) {
+  const whole = [{ name: m.name, firstVertex: 0, vertexCount: vc }];
+  if (!m.objects?.length) return whole;
+  const sorted = [...m.objects].sort((x, y) => x.firstVertex - y.firstVertex);
+  let end = 0;
+  for (const r of sorted) {
+    if (!r || r.firstVertex < end || !(r.vertexCount > 0) || r.firstVertex + r.vertexCount > vc) return whole;
+    end = r.firstVertex + r.vertexCount;
+  }
+  return sorted;
+}
+
 /**
- * The movable objects of the scene (CollectObjects): each record of an object pack, and every other non-sky mesh
- * whole. Each object: {index, mesh, name, label, recordOffset, firstVertex, vertexCount, firstIndex, indexCount,
- * pivot, state}. The mesh gets editObjects (sorted by firstIndex) for picking.
+ * The movable objects of the scene (CollectObjects): each object range of a mesh (an object pack's records, a split
+ * terrain's pieces) or a whole non-sky mesh. A triangle belongs to the range holding its first vertex. Each object:
+ * {index, mesh, name, label, recordOffset, firstVertex, vertexCount, triangles (its vertex indices, three per
+ * triangle), triCount, spans (batch, start, count in triangles' units, for drawing it per material), pivot, bounds,
+ * state}. Ranges without a triangle aren't objects. The mesh gets editObjects and triObject (each triangle's object
+ * in editObjects, or -1) for picking.
  */
 export function collectObjects(meshes) {
   const out = [];
-  for (const m of meshes) {
-    if (m.sky) continue;
-    const vc = m.positions.length / 3;
-    const ranges = m.objects?.length ? m.objects : [{ name: m.name, firstVertex: 0, vertexCount: vc, firstIndex: 0, indexCount: m.indices.length }];
+  meshes.forEach((m, mi) => {
     m.editObjects = [];
-    for (const r of ranges) {
-      if (!r.vertexCount || !r.indexCount || r.firstVertex + r.vertexCount > vc) continue;
-      const b = boundsOf(m.positions, r.firstVertex, r.vertexCount);
+    m.triObject = null;
+    if (m.sky || !m.positions || m.positions.length < 9 || !m.indices || m.indices.length < 3) return;
+    const I = m.indices, vc = Math.trunc(m.positions.length / 3), batches = m.batches || [];
+    const ranges = validObjectRanges(m, vc), starts = ranges.map((r) => r.firstVertex);
+    const lists = new Array(ranges.length).fill(null), spans = new Array(ranges.length).fill(null), firstTexture = new Array(ranges.length).fill(null);
+    const triRange = new Int32Array(Math.trunc(I.length / 3)).fill(-1);
+    let batch = 0;
+    for (let t = 0; t + 2 < I.length; t += 3) {
+      const a = I[t], b = I[t + 1], c = I[t + 2];
+      if ((a === b && b === c) || a >= vc) continue;
+      // The range whose start is the last at or before a (Array.BinarySearch).
+      let lo = 0, hi = starts.length - 1, r = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (starts[mid] <= a) {
+          r = mid;
+          lo = mid + 1;
+        } else hi = mid - 1;
+      }
+      if (r < 0 || a >= starts[r] + ranges[r].vertexCount) continue;
+      while (batch < batches.length && t >= batches[batch].firstIndex + batches[batch].indexCount) batch++;
+      const inBatch = batch < batches.length && t >= batches[batch].firstIndex ? batch : -1;
+      let list = lists[r];
+      if (!list) {
+        lists[r] = list = [];
+        spans[r] = [];
+        if (inBatch >= 0) firstTexture[r] = batches[inBatch].texture ?? batches[inBatch].lightmap ?? null;
+      }
+      const sp = spans[r];
+      if (inBatch >= 0) {
+        if (sp.length && sp[sp.length - 3] === inBatch && sp[sp.length - 2] + sp[sp.length - 1] === list.length) sp[sp.length - 1] += 3;
+        else sp.push(inBatch, list.length, 3);
+      }
+      list.push(a, b, c);
+      triRange[t / 3] = r;
+    }
+    const objectOf = new Int32Array(ranges.length).fill(-1);
+    ranges.forEach((r, k) => {
+      if (!lists[k]) return;
+      const bounds = boundsOf(m.positions, r.firstVertex, r.vertexCount);
       const o = {
         index: out.length,
         mesh: m,
-        name: r.name,
-        label: r.label || null,
+        name: r.name || m.name || `mesh${mi}`,
+        label: r.label || firstTexture[k],
         recordOffset: r.recordOffset ?? null,
         firstVertex: r.firstVertex,
         vertexCount: r.vertexCount,
-        firstIndex: r.firstIndex,
-        indexCount: r.indexCount,
-        pivot: b.min.map((x, k) => (x + b.max[k]) / 2),
-        bounds: b,
+        triangles: Uint32Array.from(lists[k]),
+        triCount: lists[k].length / 3,
+        spans: Int32Array.from(spans[k]),
+        pivot: bounds.min.map((x, j) => (x + bounds.max[j]) / 2),
+        bounds,
         state: IDENTITY,
       };
+      objectOf[k] = m.editObjects.length;
       out.push(o);
       m.editObjects.push(o);
-    }
-    m.editObjects.sort((a, b) => a.firstIndex - b.firstIndex);
-  }
+    });
+    for (let t = 0; t < triRange.length; t++) if (triRange[t] >= 0) triRange[t] = objectOf[triRange[t]];
+    m.triObject = triRange;
+  });
   return out;
 }
 

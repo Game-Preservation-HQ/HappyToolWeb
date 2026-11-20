@@ -321,7 +321,7 @@ function uploadMesh(gl, m) {
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
   gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, m.indices, gl.STATIC_DRAW);
   gl.bindVertexArray(null);
-  return { vao, pos, nrm };
+  return { vao, pos, nrm, ebo };
 }
 
 function uploadTexture(gl, img, aniso) {
@@ -380,7 +380,8 @@ function pick(scene, o, d) {
   best.point = [o[0] + d[0] * best.dist, o[1] + d[1] * best.dist, o[2] + d[2] * best.dist];
   const first = best.tri * 3;
   best.batch = best.mesh.batches.find((b) => first >= b.firstIndex && first < b.firstIndex + b.indexCount) || null;
-  best.object = best.mesh.editObjects?.find((ob) => first >= ob.firstIndex && first < ob.firstIndex + ob.indexCount) || null;
+  const k = best.mesh.triObject ? best.mesh.triObject[best.tri] : -1;
+  best.object = k >= 0 ? best.mesh.editObjects[k] : null;
   return best;
 }
 
@@ -532,7 +533,18 @@ export function renderStage(node, ctx) {
     const sceneCentre = centre(scene.bounds), sceneRadius = radius(scene.bounds);
     const nudgeStep = niceStep(Math.max(1, sceneRadius * 0.01)); // NudgeStep
     const cam = job.camera || (job.camera = framed(scene.bounds, { yaw: 0.6, pitch: -0.55 }));
-    let selection = null; // {mesh, first, count, object, hit}
+    let selection = null; // {mesh, object, hit}
+    // The selected object's triangles as an index buffer, for its tinted copy (made when the object is first drawn).
+    let selEbo = null;
+    const selectionEbo = (o) => {
+      if (selEbo?.object === o) return selEbo.buffer;
+      if (selEbo) gl.deleteBuffer(selEbo.buffer);
+      const buffer = gl.createBuffer();
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffer);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, o.triangles, gl.STATIC_DRAW);
+      selEbo = { object: o, buffer };
+      return buffer;
+    };
     let tool = 0; // 0 move, 1 rotate, 2 scale
     let hover = -1; // gizmo handle under the pointer
     let gdrag = null; // gizmo drag in progress
@@ -611,8 +623,7 @@ export function renderStage(node, ctx) {
           if (!m.visible || m.sky !== skyPass) continue;
           gl.bindVertexArray(meshGpu(m).vao);
           const useTex = (skyPass || texturesOn) && !!m.uvs;
-          const s0 = selection?.mesh === m ? selection.first : 0, s1 = selection?.mesh === m ? selection.first + selection.count : 0;
-          for (const b of m.batches) {
+          const useBatch = (b) => {
             const colour = useTex && b.texture ? (skyPass ? skyTexture(b.texture) : glTex.get(lower(b.texture))) : null;
             const light = useTex && m.uvs2 && b.lightmap ? glTex.get(lower(b.lightmap)) : null;
             const useLight = !!light && lmOn;
@@ -624,13 +635,28 @@ export function renderStage(node, ctx) {
             gl.bindTexture(gl.TEXTURE_2D, mode === 3 ? light : null);
             gl.uniform1i(U.uMode, mode);
             gl.uniform1i(U.uLit, skyPass || useLight ? 0 : 1);
-            const b0 = b.firstIndex, b1 = b.firstIndex + b.indexCount, lo = Math.max(b0, s0), hi = Math.min(b1, s1);
-            if (lo >= hi) range(b0, b1, false);
-            else {
-              range(b0, lo, false);
-              range(lo, hi, true);
-              range(hi, b1, false);
+          };
+          // A selection without an object (a mesh that has none) tints the whole mesh.
+          const whole = selection?.mesh === m && !selection.object;
+          for (const b of m.batches) {
+            useBatch(b);
+            range(b.firstIndex, b.firstIndex + b.indexCount, whole);
+          }
+          // The selected object's triangles (spread through the mesh's batches) drawn again tinted, from its own
+          // index buffer, per batch span, pulled just in front of the untinted copy.
+          const so = selection?.mesh === m ? selection.object : null;
+          if (so?.spans.length) {
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, selectionEbo(so));
+            gl.depthFunc(gl.LEQUAL);
+            gl.enable(gl.POLYGON_OFFSET_FILL);
+            gl.polygonOffset(-1, -1);
+            for (let k = 0; k + 2 < so.spans.length; k += 3) {
+              useBatch(m.batches[so.spans[k]]);
+              range(so.spans[k + 1], so.spans[k + 1] + so.spans[k + 2], true);
             }
+            gl.disable(gl.POLYGON_OFFSET_FILL);
+            gl.depthFunc(gl.LESS);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, meshGpu(m).ebo);
           }
         }
       }
@@ -996,7 +1022,7 @@ export function renderStage(node, ctx) {
         el(
           'p',
           { class: 'muted stage-place-info' },
-          `${o.vertexCount.toLocaleString()} vertices · ${Math.round(o.indexCount / 3).toLocaleString()} triangles · pivot ${o.pivot.map((x) => x.toFixed(1)).join(', ')}`,
+          `${o.vertexCount.toLocaleString()} vertices · ${o.triCount.toLocaleString()} triangles · pivot ${o.pivot.map((x) => x.toFixed(1)).join(', ')}`,
         ),
         el('p', { class: 'muted stage-col-info' }),
         el('div', { class: 'toolbar stage-tools' }, toolBtns),
@@ -1010,7 +1036,7 @@ export function renderStage(node, ctx) {
     }
     /** The selected object's collision, as the desktop's placement panel says it (CollisionSummary). */
     function collisionSummary(o) {
-      const col = edit.colRead, m = edit.colMatch, st = o.state, shapeTris = Math.trunc(o.indexCount / 3);
+      const col = edit.colRead, m = edit.colMatch, st = o.state, shapeTris = o.triCount;
       const lines = [];
       if (st.solid)
         lines.push(shapeTris > 100 ? 'Solid: collides as its bounding box' : `Solid: ${shapeTris.toLocaleString()} triangles generated from its shape`);
@@ -1600,11 +1626,11 @@ export function renderStage(node, ctx) {
     function solidOf(o) {
       let tris = solidCache.get(o);
       if (tris) return tris;
-      const P = o.mesh.baked?.positions ?? o.mesh.positions, I = o.mesh.indices, n = Math.trunc(o.indexCount / 3);
+      const P = o.mesh.baked?.positions ?? o.mesh.positions, T = o.triangles, n = o.triCount;
       if (n <= SOLID_BOX_THRESHOLD) {
         tris = new Float32Array(n * 9);
         for (let i = 0; i < n * 3; i++) {
-          const v = I[o.firstIndex + i] * 3;
+          const v = T[i] * 3;
           tris[i * 3] = P[v];
           tris[i * 3 + 1] = P[v + 1];
           tris[i * 3 + 2] = P[v + 2];
@@ -1757,15 +1783,14 @@ export function renderStage(node, ctx) {
       let m = edit.colMatch;
       if (!m) {
         m = edit.colMatch = { pct: 0, owners: null, objTris: null, ownerList: null, owned: 0, total: 0, ms: 0, error: null, worker: null, onChange: null };
-        const meshes = [], at = new Map(), objects = new Int32Array(edit.objects.length * 3);
+        const meshes = [], at = new Map(), objects = new Int32Array(edit.objects.length), triangles = [];
         edit.objects.forEach((o, i) => {
           if (!at.has(o.mesh)) {
             at.set(o.mesh, meshes.length);
-            meshes.push({ positions: o.mesh.baked?.positions ?? o.mesh.positions, indices: o.mesh.indices });
+            meshes.push({ positions: o.mesh.baked?.positions ?? o.mesh.positions });
           }
-          objects[i * 3] = at.get(o.mesh);
-          objects[i * 3 + 1] = o.firstIndex;
-          objects[i * 3 + 2] = o.indexCount;
+          objects[i] = at.get(o.mesh);
+          triangles.push(o.triangles);
         });
         const layers = col.layers.map((l) => ({
           groups: l.groups.map((g) => ({ vertices: g.vertices, triangles: g.triangles, minX: g.minX, minY: g.minY, minZ: g.minZ, maxX: g.maxX, maxY: g.maxY, maxZ: g.maxZ })),
@@ -1791,7 +1816,7 @@ export function renderStage(node, ctx) {
             m.onChange?.();
           };
           w.onerror = (e) => fail(e.message || 'the worker stopped');
-          w.postMessage({ layers, meshes, objects });
+          w.postMessage({ layers, meshes, objects, triangles });
         } catch (e) {
           fail(e.message);
         }
@@ -1898,11 +1923,11 @@ export function renderStage(node, ctx) {
     function inspect(hit) {
       if (!hit) return select(null);
       const ob = hit.object, m = hit.mesh;
-      selection = ob ? { mesh: m, first: ob.firstIndex, count: ob.indexCount, object: ob, hit } : { mesh: m, first: 0, count: m.indices.length, object: null, hit };
+      selection = { mesh: m, object: ob || null, hit };
       selectionChanged();
     }
     function select(o) {
-      selection = o ? { mesh: o.mesh, first: o.firstIndex, count: o.indexCount, object: o, hit: null } : null;
+      selection = o ? { mesh: o.mesh, object: o, hit: null } : null;
       selectionChanged();
     }
     function selectionChanged() {
@@ -1925,8 +1950,8 @@ export function renderStage(node, ctx) {
         inspectBox.replaceChildren(el('p', { class: 'muted' }, 'Click the map to select an object.'));
         return;
       }
-      const { mesh: m, object: ob, hit, first, count } = selection;
-      const b = hit?.batch || m.batches.find((x) => x.firstIndex + x.indexCount > first && x.firstIndex < first + count);
+      const { mesh: m, object: ob, hit } = selection;
+      const b = hit?.batch || (ob ? (ob.spans.length ? m.batches[ob.spans[0]] : null) : m.batches[0]) || null;
       const texName = (n) => (n ? (scene.textures.has(lower(n)) ? n : `${n} (not in this bundle)`) : '—');
       const rows = [
         ['Object', ob ? shortObjectName(ob.name) : shortName(m.name)],
@@ -1935,7 +1960,7 @@ export function renderStage(node, ctx) {
         ['Layer', GROUPS.find(([k]) => k === m.kind)?.[1] || m.kind],
         ['Texture', texName(b?.texture)],
         ['Lightmap', texName(b?.lightmap)],
-        ['Triangles', Math.round(count / 3).toLocaleString()],
+        ['Triangles', (ob ? ob.triCount : Math.round(m.indices.length / 3)).toLocaleString()],
         hit ? ['Point', fmt(hit.point)] : null,
         ob?.recordOffset != null ? ['Record', `0x${ob.recordOffset.toString(16).toUpperCase()}`] : null,
       ].filter(Boolean);

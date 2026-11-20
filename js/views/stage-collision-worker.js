@@ -1,6 +1,7 @@
 // Matches a stage's collision triangles to its movable objects off the page's thread (the desktop's InitLiveCollision
 // runs it in the background too: 15–35 s on a large stage). In: {layers: [{groups: [{vertices, triangles, minX…maxZ}]}],
-// meshes: [{positions, indices}] (stock positions), objects: Int32Array of (mesh, firstIndex, indexCount) per object}.
+// meshes: [{positions}] (stock positions), objects: Int32Array of each object's mesh, triangles: [Uint32Array of each
+// object's vertex indices, three per triangle]}.
 // Out: {pct} now and then, then {owners: [Int32Array per layer, an object index or -1 per triangle], ms} or {error}.
 
 import { makeShape, groupOwners } from './stage-collision-match.js';
@@ -8,13 +9,9 @@ import { makeShape, groupOwners } from './stage-collision-match.js';
 self.onmessage = (ev) => {
   try {
     const t0 = performance.now();
-    const { layers, meshes, objects } = ev.data;
+    const { layers, meshes, objects, triangles } = ev.data;
     const shapes = [];
-    for (let i = 0; i * 3 < objects.length; i++) {
-      const m = meshes[objects[i * 3]], first = objects[i * 3 + 1], count = objects[i * 3 + 2];
-      const I = m.indices;
-      shapes.push(makeShape(i, m.positions, I.subarray ? I.subarray(first, first + count) : I.slice(first, first + count)));
-    }
+    for (let i = 0; i < objects.length; i++) shapes.push(makeShape(i, meshes[objects[i]].positions, triangles[i]));
     let total = 0;
     for (const l of layers) for (const g of l.groups) total += Math.trunc(g.triangles.length / 3);
     let done = 0, shown = 0;

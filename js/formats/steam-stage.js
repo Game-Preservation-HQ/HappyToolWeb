@@ -3,6 +3,7 @@
 // AppendTerrainRecords / AppendSteamMultiSubmeshMeshes. Not ported yet: the legacy descriptor scan
 // (CollectDescriptors / TryEmitSubmesh) for non-ModelData packs, Xbox One .rmd and Xbox 360 .rrmv stages.
 import { parseRrm, parseStageRrm, stripTextureExtension } from './rrm.js';
+import { splitIntoPieceObjects } from './stage-pieces.js';
 
 const MODELDATA_MAGIC = 0x0132b421;
 const MAT_STRIDE = 0x390;
@@ -499,12 +500,16 @@ export function buildSteamStage(entries) {
     const bytes = e.data;
     if (isMultiRecordTerrain(bytes)) {
       const mats = parseMaterialTables(bytes, dds);
-      for (const t of parseTerrainRecords(bytes, mats, dds, stemOf(e.name))) {
+      const records = parseTerrainRecords(bytes, mats, dds, stemOf(e.name));
+      for (const t of records) {
         const uv2Ok = t.uvs && t.uvs2 && t.uvs2.length === t.uvs.length;
         meshes.push({
-          name: `${e.name}/${t.name || 'record'}`, kind: 'terrain', positions: t.positions, normals: t.normals, uvs: t.uvs, uvs2: uv2Ok ? t.uvs2 : null, indices: t.indices,
+          // The desktop's names (AppendTerrainRecords): the record's name only when the file has several.
+          name: records.length > 1 ? `${e.name}/${t.name || 'record'}` : e.name, kind: 'terrain', positions: t.positions, normals: t.normals, uvs: t.uvs, uvs2: uv2Ok ? t.uvs2 : null, indices: t.indices,
           batches: t.batches.map((b) => colourAndLightmap(b.firstIndex, b.indexCount, b.baseTexture, uv2Ok ? b.lightmap : null, b.texture)),
         });
+        // Baked terrain fuses every rock, wall and tree into one buffer: split it into its connected pieces.
+        splitIntoPieceObjects(meshes[meshes.length - 1], t.recordOffset);
       }
       continue;
     }
@@ -523,6 +528,9 @@ export function buildSteamStage(entries) {
           return colourAndLightmap(b.firstIndex, b.indexCount, colour, uv2Ok ? b.lightmap : null, b.texture);
         }),
       });
+      // Little-endian ModelData terrain is one record (its base is cached at 0x8C); export patches it in place.
+      const record = isInlineModelData(bytes) && rd(bytes).u32(0x90) === 1 ? rd(bytes).u32(0x8C) : null;
+      splitIntoPieceObjects(meshes[meshes.length - 1], record);
       continue;
     }
     try {
