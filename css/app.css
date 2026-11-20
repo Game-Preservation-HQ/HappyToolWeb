@@ -448,6 +448,7 @@ span.twisty { cursor: default; }
 .stage-place .toolbar { flex-wrap: wrap; gap: 4px; margin: 0 0 6px; }
 .stage-place-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .stage-place-info, .stage-count { font-size: 12px; }
+.stage-col-info { font-size: 12px; white-space: pre-line; margin-top: 0; }
 .stage-sky p { margin: 0 0 6px; }
 .stage-sky select { width: 100%; margin: 0 0 6px; }
 .stage-sky .check { display: block; margin: 0 0 6px; }

@@ -13,7 +13,7 @@ import { stripTextureExtension } from '../formats/rrm.js';
 import {
   IDENTITY, AXES, UNIFORM, History, collectObjects, writeObject, withState, sameState, isEmpty, wrapDegrees, niceStep,
   shortObjectName, editsFile, readEditsFile, loadStored, store, stageKey, ringPoint, distanceToSegment,
-  closestParamOnAxis, screenAngle, screenTurnSign, turnAbout,
+  closestParamOnAxis, screenAngle, screenTurnSign, turnAbout, isIdentityTransform, rotation,
 } from './stage-edit.js';
 import {
   SKY_PRESETS, cloneSky, sameSky, skyLabel, presetSky, pictureSky, textureRoles, readSkyPack, bakeSky, encodeDxt1Dds,
@@ -22,7 +22,7 @@ import {
 import {
   makeFog, sameFog, fogHex, withHex, metres, fogFromFeature, readFog, readFogFromFile, bakeFog, fogPreviewOn, setFogPreview, fogRgb,
 } from './stage-fog.js';
-import { readCollision } from './stage-collision.js';
+import { readCollision, edgesOf } from './stage-collision.js';
 
 const FOV = Math.PI / 4;
 const SKY_RADIUS = 920; // ClipFar 1000 * 0.92 when StageCameraParam.json isn't read (ComputeSkyRenderRadius)
@@ -634,21 +634,7 @@ export function renderStage(node, ctx) {
           }
         }
       }
-      if (colBox.checked && colGpu.length && lineProg) {
-        // The collision layers as green lines over the map (DrawCollisionOverlay), depth-tested against it.
-        gl.useProgram(lineProg.program);
-        gl.uniformMatrix4fv(lineProg.u.uViewProj, false, vp);
-        gl.uniform3fv(lineProg.u.uEye, eye);
-        gl.uniform4f(lineProg.u.uColor, 0.15, 1, 0.35, 1);
-        gl.enable(gl.DEPTH_TEST);
-        gl.depthMask(false);
-        for (const g of colGpu) {
-          gl.bindVertexArray(g.vao);
-          gl.drawElements(gl.LINES, g.count, gl.UNSIGNED_INT, 0);
-        }
-        gl.depthMask(true);
-        gl.useProgram(prog.program);
-      }
+      if (lineProg) drawCollision(vp, eye);
       gl.bindVertexArray(null);
       overlayDirty = true;
     }
@@ -1012,6 +998,7 @@ export function renderStage(node, ctx) {
           { class: 'muted stage-place-info' },
           `${o.vertexCount.toLocaleString()} vertices · ${Math.round(o.indexCount / 3).toLocaleString()} triangles · pivot ${o.pivot.map((x) => x.toFixed(1)).join(', ')}`,
         ),
+        el('p', { class: 'muted stage-col-info' }),
         el('div', { class: 'toolbar stage-tools' }, toolBtns),
         el('div', { class: 'stage-xyz' }, el('span'), head('X'), head('Y'), head('Z'), head('Offset'), fields.t, head('Rotate°'), fields.r, head('Scale'), fields.s),
         el('div', { class: 'stage-checks' }, el('label', { class: 'check', title: 'Scale handles scale all three axes (hold Shift for one)' }, uniformBox, ' Uniform'), hiddenLabel, solidLabel),
@@ -1020,6 +1007,27 @@ export function renderStage(node, ctx) {
         fileRow,
       );
       syncPanel();
+    }
+    /** The selected object's collision, as the desktop's placement panel says it (CollisionSummary). */
+    function collisionSummary(o) {
+      const col = edit.colRead, m = edit.colMatch, st = o.state, shapeTris = Math.trunc(o.indexCount / 3);
+      const lines = [];
+      if (st.solid)
+        lines.push(shapeTris > 100 ? 'Solid: collides as its bounding box' : `Solid: ${shapeTris.toLocaleString()} triangles generated from its shape`);
+      if (!col) {
+        if (!st.solid) lines.push('Reading the collision…');
+      } else if (!col.live || m?.error) {
+        if (!st.solid) lines.push(!col.layers.length ? 'This stage has no collision files.' : 'Collision here is view-only (unfamiliar layout).');
+      } else if (!m?.owners) lines.push(`Collision: matching to objects… ${m?.pct ?? 0}%`);
+      else {
+        const own = (m.objTris[o.index]?.length ?? 0) / 9;
+        lines.push(own ? `Collision: ${own.toLocaleString()} triangle${own === 1 ? '' : 's'} — moves with it` : `No collision of its own${st.solid ? '' : ' — tick Solid (K) to add'}`);
+      }
+      return lines.join('\n');
+    }
+    function renderColInfo() {
+      const p = placeBox.querySelector('.stage-col-info'), o = selected();
+      if (p && o) p.textContent = collisionSummary(o);
     }
     /** Shows the selection's current placement and the edit count; force also rewrites the focused field. */
     function syncPanel(force = false) {
@@ -1035,6 +1043,7 @@ export function renderStage(node, ctx) {
         });
       fields.hidden.checked = o.state.hidden;
       fields.solid.checked = o.state.solid;
+      renderColInfo();
     }
 
     function saveFile() {
@@ -1115,6 +1124,10 @@ export function renderStage(node, ctx) {
       stopped = true;
       resize.disconnect();
       store(edit.stage, edit.objects, edit.sky, fogFeatures(edit));
+      if (edit.colMatch?.worker) {
+        edit.colMatch.worker.terminate();
+        edit.colMatch = null;
+      } else if (edit.colMatch) edit.colMatch.onChange = null;
       gl.getExtension('WEBGL_lose_context')?.loseContext();
     }
     const resize = new ResizeObserver(() => (dirty = true));
@@ -1496,23 +1509,302 @@ export function renderStage(node, ctx) {
     } catch (e) {
       console.warn(`Map editor: the collision lines can't be drawn: ${e.message}`);
     }
-    const colGpu = [];
-    let colRead = null; // {layers, unread} once read
+    // Colours as on the desktop (StageViewerForm.Collision.cs).
+    const COL_OWNED = [0.15, 1, 0.35], COL_STAGE = [0.35, 0.75, 1], COL_MOVED = [0.75, 1, 0.55], COL_SOLID = [1, 0.6, 0.15];
+    const COL_SELECTED = [1, 1, 0.45];
+    /** Above this many triangles a Solid object collides as its bounding box instead of its own triangles. */
+    const SOLID_BOX_THRESHOLD = 100;
+    const BOX_TRIS = [0, 2, 3, 0, 3, 1, 4, 5, 7, 4, 7, 6, 0, 4, 6, 0, 6, 2, 1, 3, 7, 1, 7, 5, 2, 6, 7, 2, 7, 3, 0, 1, 5, 0, 5, 4];
+    const BOX_TOP = [2, 6, 7, 2, 7, 3];
+    const colGpu = []; // per layer: {pos, main: owned triangles left in place (all before matching), stage: unowned}
+    let colRead = null; // {layers, unread, live} once read
+    let staticKey = null; // the displaced or hidden owners when main was last built
+    const dyn = { vao: null, buf: null, a: 0, b: 0, key: [] }; // moved objects' collision, then Solid shapes
+    const sel = { vao: null, buf: null, a: 0, b: 0, key: [] }; // the selected object's collision, then its Solid shape
+    const solidCache = new Map();
     colBox.checked = !!job.showCollision;
+    const displaced = (st) => st.hidden || !isIdentityTransform(st);
+    const sameList = (x, y) => x.length === y.length && x.every((v, i) => v === y[i]);
+    const matchDone = () => (edit.colMatch?.owners ? edit.colMatch : null);
+
+    function layerVao(pos) {
+      const vao = gl.createVertexArray(), ebo = gl.createBuffer();
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, pos);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+      gl.bindVertexArray(null);
+      return { vao, ebo, count: 0 };
+    }
+    function setEdges(part, edges) {
+      gl.bindVertexArray(part.vao);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, part.ebo);
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, edges, gl.STATIC_DRAW);
+      gl.bindVertexArray(null);
+      part.count = edges.length;
+    }
     /** Uploads each layer's vertices and edge list once read (UploadCollision). */
     function uploadCollision(col) {
       for (const l of col.layers) {
-        const vao = gl.createVertexArray();
-        gl.bindVertexArray(vao);
-        gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+        const pos = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, pos);
         gl.bufferData(gl.ARRAY_BUFFER, l.positions, gl.STATIC_DRAW);
+        const g = { pos, main: layerVao(pos), stage: layerVao(pos) };
+        setEdges(g.main, l.edges);
+        colGpu.push(g);
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    }
+    /** A line list's buffers get the lines of a, then of b (a and b: x, y, z per line end). */
+    function fillLines(list, a, b) {
+      if (!list.vao) {
+        list.vao = gl.createVertexArray();
+        list.buf = gl.createBuffer();
+        gl.bindVertexArray(list.vao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, list.buf);
         gl.enableVertexAttribArray(0);
         gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
-        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, l.edges, gl.STATIC_DRAW);
         gl.bindVertexArray(null);
-        colGpu.push({ vao, count: l.edges.length });
       }
+      const data = new Float32Array(a.length + b.length);
+      data.set(a);
+      data.set(b, a.length);
+      gl.bindBuffer(gl.ARRAY_BUFFER, list.buf);
+      gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      list.a = a.length / 3;
+      list.b = b.length / 3;
+    }
+    /** Where a stock point lands under a placement, as the object's vertices do (placePoint, rotation worked out once). */
+    function placer(st, pv) {
+      const R = rotation(st.r), t = st.t, s = st.s;
+      return (out, at, x, y, z) => {
+        const a = (x - pv[0]) * s[0], b = (y - pv[1]) * s[1], c = (z - pv[2]) * s[2];
+        out[at] = R[0] * a + R[1] * b + R[2] * c + pv[0] + t[0];
+        out[at + 1] = R[3] * a + R[4] * b + R[5] * c + pv[1] + t[1];
+        out[at + 2] = R[6] * a + R[7] * b + R[8] * c + pv[2] + t[2];
+      };
+    }
+    /** Adds the edges of triangles (9 floats each, stock) as placed lines. */
+    function addLines(out, tris, place) {
+      const p = new Float32Array(9);
+      for (let i = 0; i + 8 < tris.length; i += 9) {
+        place(p, 0, tris[i], tris[i + 1], tris[i + 2]);
+        place(p, 3, tris[i + 3], tris[i + 4], tris[i + 5]);
+        place(p, 6, tris[i + 6], tris[i + 7], tris[i + 8]);
+        out.push(p[0], p[1], p[2], p[3], p[4], p[5], p[3], p[4], p[5], p[6], p[7], p[8], p[6], p[7], p[8], p[0], p[1], p[2]);
+      }
+    }
+    /** What a Solid object collides as, stock (SolidShape): its own triangles, or past 100 its bounding box. */
+    function solidOf(o) {
+      let tris = solidCache.get(o);
+      if (tris) return tris;
+      const P = o.mesh.baked?.positions ?? o.mesh.positions, I = o.mesh.indices, n = Math.trunc(o.indexCount / 3);
+      if (n <= SOLID_BOX_THRESHOLD) {
+        tris = new Float32Array(n * 9);
+        for (let i = 0; i < n * 3; i++) {
+          const v = I[o.firstIndex + i] * 3;
+          tris[i * 3] = P[v];
+          tris[i * 3 + 1] = P[v + 1];
+          tris[i * 3 + 2] = P[v + 2];
+        }
+      } else {
+        const { min, max } = boundsOf(P, o.firstVertex, o.vertexCount);
+        const idx = max[1] - min[1] < 1 ? BOX_TOP : BOX_TRIS; // flat: its top only
+        tris = new Float32Array(idx.length * 3);
+        idx.forEach((k, i) => tris.set([k & 1 ? max[0] : min[0], k & 2 ? max[1] : min[1], k & 4 ? max[2] : min[2]], i * 3));
+      }
+      solidCache.set(o, tris);
+      return tris;
+    }
+    /** Rebuilds the in-place lists when an owner starts or stops being moved or hidden (owned: green; unowned: blue). */
+    function syncStatic(m) {
+      const key = m.ownerList.filter((i) => displaced(edit.objects[i].state)).join(',');
+      if (key === staticKey) return;
+      const first = staticKey === null;
+      staticKey = key;
+      const off = new Set(key ? key.split(',').map(Number) : []);
+      colRead.layers.forEach((l, li) => {
+        const own = m.owners[li], I = l.indices, keep = [], stage = [];
+        for (let t = 0; t < own.length; t++) {
+          const o = own[t];
+          if (o < 0) {
+            if (first) stage.push(I[t * 3], I[t * 3 + 1], I[t * 3 + 2]);
+          } else if (!off.has(o)) keep.push(I[t * 3], I[t * 3 + 1], I[t * 3 + 2]);
+        }
+        setEdges(colGpu[li].main, edgesOf(keep));
+        if (first) setEdges(colGpu[li].stage, edgesOf(stage));
+      });
+    }
+    /** Moved objects' collision placed with them (pale green) and Solid objects' shapes (orange); hidden ones draw nothing. */
+    function syncDyn(m) {
+      const list = [m];
+      for (const o of edit.objects) {
+        const st = o.state;
+        if (!st.hidden && (st.solid || (m?.objTris[o.index] && !isIdentityTransform(st)))) list.push(o, st);
+      }
+      if (sameList(list, dyn.key)) return;
+      dyn.key = list;
+      const a = [], b = [];
+      for (let i = 1; i < list.length; i += 2) {
+        const o = list[i], st = list[i + 1], place = placer(st, o.pivot), tris = m?.objTris[o.index];
+        if (tris && !isIdentityTransform(st)) addLines(a, tris, place);
+        if (st.solid) addLines(b, solidOf(o), place);
+      }
+      fillLines(dyn, a, b);
+    }
+    function syncSel(m, o) {
+      const st = o.state, key = [m, o, st];
+      if (sameList(key, sel.key)) return;
+      sel.key = key;
+      const a = [], b = [];
+      if (!st.hidden) {
+        const place = placer(st, o.pivot);
+        if (m?.objTris[o.index]) addLines(a, m.objTris[o.index], place);
+        if (st.solid) addLines(b, solidOf(o), place);
+      }
+      fillLines(sel, a, b);
+    }
+    /** The collision over the map (DrawLiveCollision), depth-tested; the selected object's on top, in yellow. */
+    function drawCollision(vp, eye) {
+      const on = colBox.checked && colGpu.length > 0, o = selected();
+      if (!on && !o) return;
+      const m = matchDone();
+      const colour = (c) => gl.uniform4f(lineProg.u.uColor, c[0], c[1], c[2], 1);
+      gl.useProgram(lineProg.program);
+      gl.uniformMatrix4fv(lineProg.u.uViewProj, false, vp);
+      gl.uniform3fv(lineProg.u.uEye, eye);
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthMask(false);
+      if (on) {
+        if (m) syncStatic(m);
+        syncDyn(m);
+        colour(COL_OWNED);
+        for (const g of colGpu) {
+          gl.bindVertexArray(g.main.vao);
+          gl.drawElements(gl.LINES, g.main.count, gl.UNSIGNED_INT, 0);
+        }
+        if (m) {
+          colour(COL_STAGE);
+          for (const g of colGpu) {
+            if (!g.stage.count) continue;
+            gl.bindVertexArray(g.stage.vao);
+            gl.drawElements(gl.LINES, g.stage.count, gl.UNSIGNED_INT, 0);
+          }
+        }
+        gl.bindVertexArray(dyn.vao);
+        if (dyn.a) {
+          colour(COL_MOVED);
+          gl.drawArrays(gl.LINES, 0, dyn.a);
+        }
+        if (dyn.b) {
+          colour(COL_SOLID);
+          gl.drawArrays(gl.LINES, dyn.a, dyn.b);
+        }
+      }
+      if (o) {
+        syncSel(m, o);
+        if (sel.a + sel.b) {
+          gl.disable(gl.DEPTH_TEST);
+          colour(COL_SELECTED);
+          gl.bindVertexArray(sel.vao);
+          gl.drawArrays(gl.LINES, 0, sel.a + sel.b);
+          gl.enable(gl.DEPTH_TEST);
+        }
+      }
+      gl.depthMask(true);
+      gl.useProgram(prog.program);
+    }
+    /** Each object's collision triangles (9 floats each, stock) from the owners, and the desktop's log line. */
+    function buildObjTris(col, m, owners) {
+      const n = edit.objects.length, count = new Int32Array(n), fill = new Int32Array(n);
+      let total = 0, owned = 0;
+      for (const own of owners) {
+        total += own.length;
+        for (const o of own)
+          if (o >= 0) {
+            count[o]++;
+            owned++;
+          }
+      }
+      const objTris = new Array(n).fill(null), ownerList = [];
+      for (let i = 0; i < n; i++)
+        if (count[i]) {
+          objTris[i] = new Float32Array(count[i] * 9);
+          ownerList.push(i);
+        }
+      col.layers.forEach((l, li) => {
+        const own = owners[li], P = l.positions, I = l.indices;
+        for (let t = 0; t < own.length; t++) {
+          const o = own[t];
+          if (o < 0) continue;
+          const out = objTris[o];
+          for (let k = 0; k < 3; k++) {
+            const v = I[t * 3 + k] * 3;
+            out[fill[o]++] = P[v];
+            out[fill[o]++] = P[v + 1];
+            out[fill[o]++] = P[v + 2];
+          }
+        }
+      });
+      Object.assign(m, { owners, objTris, ownerList, owned, total, pct: 100 });
+      console.info(`Map editor: live collision: ${owned} of ${total} triangles matched to ${ownerList.length} objects in ${m.ms} ms`);
+    }
+    /** Matches the collision to the objects in a worker, once per stage (StartOwnerMatching); kept while the page lives. */
+    function startMatching(col) {
+      if (!col.live) return;
+      let m = edit.colMatch;
+      if (!m) {
+        m = edit.colMatch = { pct: 0, owners: null, objTris: null, ownerList: null, owned: 0, total: 0, ms: 0, error: null, worker: null, onChange: null };
+        const meshes = [], at = new Map(), objects = new Int32Array(edit.objects.length * 3);
+        edit.objects.forEach((o, i) => {
+          if (!at.has(o.mesh)) {
+            at.set(o.mesh, meshes.length);
+            meshes.push({ positions: o.mesh.baked?.positions ?? o.mesh.positions, indices: o.mesh.indices });
+          }
+          objects[i * 3] = at.get(o.mesh);
+          objects[i * 3 + 1] = o.firstIndex;
+          objects[i * 3 + 2] = o.indexCount;
+        });
+        const layers = col.layers.map((l) => ({
+          groups: l.groups.map((g) => ({ vertices: g.vertices, triangles: g.triangles, minX: g.minX, minY: g.minY, minZ: g.minZ, maxX: g.maxX, maxY: g.maxY, maxZ: g.maxZ })),
+        }));
+        const fail = (msg) => {
+          m.worker?.terminate();
+          m.worker = null;
+          m.error = msg;
+          console.warn(`Map editor: the collision couldn't be matched to objects: ${msg}`);
+          m.onChange?.();
+        };
+        try {
+          const w = (m.worker = new Worker(new URL('./stage-collision-worker.js', import.meta.url), { type: 'module' }));
+          w.onmessage = (ev) => {
+            const d = ev.data;
+            if (d.error) return fail(d.error);
+            if (d.owners) {
+              w.terminate();
+              m.worker = null;
+              m.ms = d.ms;
+              buildObjTris(col, m, d.owners);
+            } else m.pct = d.pct;
+            m.onChange?.();
+          };
+          w.onerror = (e) => fail(e.message || 'the worker stopped');
+          w.postMessage({ layers, meshes, objects });
+        } catch (e) {
+          fail(e.message);
+        }
+      }
+      m.onChange = () => {
+        if (stopped) return;
+        staticKey = null;
+        dyn.key = [];
+        sel.key = [];
+        renderCollision();
+        renderColInfo();
+        dirty = true;
+      };
     }
     function renderCollision() {
       const col = colRead, n = col?.layers.length ?? 0;
@@ -1523,10 +1815,19 @@ export function renderStage(node, ctx) {
       if (!col) colLabel.title = 'Reading the collision…';
       else if (!n) colLabel.title = `No collision (.ccp) in this stage.${notRead}`;
       else if (!lineProg) colLabel.title = "This browser couldn't set up the collision lines.";
-      else
+      else {
+        const m = edit.colMatch;
+        const how = !col.live
+          ? " It's view-only here (an unfamiliar layout), so it doesn't follow moved objects."
+          : m?.error
+            ? " It couldn't be matched to objects, so it doesn't follow moved objects."
+            : m?.owners
+              ? ` ${m.owned.toLocaleString()} triangles belong to ${m.ownerList.length.toLocaleString()} objects and follow them: green stays put, pale green has moved, blue is the stage's own, orange is Solid objects, yellow is the selected object's.`
+              : ` Matching it to objects… ${m?.pct ?? 0}%`;
         colLabel.title =
-          `Show the stage's collision as green lines (H): ${n} layer${n === 1 ? '' : 's'}, ${tris.toLocaleString()} triangles ` +
-          `(${col.layers.map((l) => l.name).join(', ')}).${notRead}`;
+          `Show the stage's collision (H): ${n} layer${n === 1 ? '' : 's'}, ${tris.toLocaleString()} triangles ` +
+          `(${col.layers.map((l) => l.name).join(', ')}).${how}${notRead}`;
+      }
     }
     function showCollision() {
       job.showCollision = colBox.checked;
@@ -1541,16 +1842,19 @@ export function renderStage(node, ctx) {
     (job.collision || (job.collision = readCollision(model))).then(
       (col) => {
         if (stopped) return;
-        colRead = col;
+        colRead = edit.colRead = col;
         uploadCollision(col);
+        startMatching(col);
         renderCollision();
+        renderColInfo();
         dirty = true;
       },
       (e) => {
         if (stopped) return;
-        colRead = { layers: [], unread: [] };
+        colRead = edit.colRead = { layers: [], unread: [], live: false };
         console.warn(`Map editor: the collision of ${edit.stage} could not be read: ${e.message}`);
         renderCollision();
+        renderColInfo();
       },
     );
     renderCollision();
