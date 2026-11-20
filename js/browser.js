@@ -71,27 +71,25 @@ export function stageTableId(id) {
 const baseOf = (path) => path.slice(path.lastIndexOf('/') + 1);
 
 /**
- * The stage-select pictures of an opened Data folder as PNG object URLs by lower-case stage id (read from
- * scaleform/UI_main.bres and the stage table, as the desktop Workshop does). The caller revokes the URLs.
- * @returns {Promise<{urls: Map<string,string>, problem: string|null}>}
+ * The stage-select pictures of an opened Data folder by lower-case stage id (read from scaleform/UI_main.bres and
+ * the stage table, as the desktop Workshop does), each drawn once into a canvas that the stage tile shows. A canvas
+ * rather than a PNG URL: the browser may put off canvas.toBlob for about a second per picture.
+ * @returns {Promise<{pics: Map<string,HTMLCanvasElement>, problem: string|null}>}
  */
-export async function loadStagePictureUrls(files) {
+export async function loadStagePictures(files) {
   const find = (rel) => files.find((r) => `/${r.path.toLowerCase()}`.endsWith(`/${rel.toLowerCase()}`));
   const bundle = find(PICTURE_BUNDLE);
-  const urls = new Map();
-  if (!bundle) return { urls, problem: `${PICTURE_BUNDLE} isn't in this folder.` };
+  const pics = new Map();
+  if (!bundle) return { pics, problem: `${PICTURE_BUNDLE} isn't in this folder.` };
   const table = find(STAGE_TABLE);
   const read = async (r) => new Uint8Array(await r.file.arrayBuffer());
   const { pictures, problem } = await readStagePictures(await read(bundle), table ? await read(table) : null);
-  const canvas = document.createElement('canvas');
   for (const [id, pic] of pictures) {
-    canvas.width = pic.width;
-    canvas.height = pic.height;
+    const canvas = el('canvas', { width: pic.width, height: pic.height, role: 'img', 'aria-label': `${id} stage picture` });
     canvas.getContext('2d').putImageData(new ImageData(pic.rgba, pic.width, pic.height), 0, 0);
-    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
-    if (blob) urls.set(id.toLowerCase(), URL.createObjectURL(blob));
+    pics.set(id.toLowerCase(), canvas);
   }
-  return { urls, problem };
+  return { pics, problem };
 }
 
 // ---------- sidebar ----------
@@ -231,7 +229,7 @@ export function renderFolder(s, act) {
             return el(
               'button',
               { type: 'button', class: `tile stage-tile${r.dirty ? ' dirty' : ''}`, title: `${r.path}\nOpen the map`, onclick: () => act.openStage(r) },
-              pic ? el('span', { class: 'stage-pic' }, el('img', { src: pic, alt: '' })) : iconEl(stageArtSvg(), 'stage-pic'),
+              pic ? el('span', { class: 'stage-pic' }, pic) : iconEl(stageArtSvg(), 'stage-pic'),
               el('span', { class: 'tile-name' }, id),
               el('span', { class: 'tile-note' }, stageTableId(id)),
             );

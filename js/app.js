@@ -11,7 +11,7 @@ import { renderLng } from './views/lng-view.js';
 import { renderText } from './views/text-view.js';
 import { renderMedia } from './views/media-view.js';
 import { renderHex } from './views/hex-view.js';
-import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictureUrls } from './browser.js';
+import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictures } from './browser.js';
 import { loadHandle, saveHandle, readDirectory } from './data-folder.js';
 
 const $ = (id) => document.getElementById(id);
@@ -41,22 +41,18 @@ let browse = null;
 /** Stage-select pictures for the map tiles: read again whenever files are added, the first time a folder with stages is shown. */
 let stagePics = null;
 function stagePicturesFor(dir) {
-  if (stagePics?.tree === tree) return stagePics.urls;
+  if (stagePics?.tree === tree) return stagePics.pics;
   if (!dir || !dir.files.some((r) => stageIdFor(r.path))) return null;
-  if (stagePics) for (const u of stagePics.urls.values()) URL.revokeObjectURL(u);
-  const job = (stagePics = { tree, urls: new Map(), problem: null, done: false });
-  loadStagePictureUrls(files)
-    .then(({ urls, problem }) => {
-      if (stagePics !== job) {
-        for (const u of urls.values()) URL.revokeObjectURL(u);
-        return;
-      }
-      Object.assign(job, { urls, problem, done: true });
+  const job = (stagePics = { tree, pics: new Map(), problem: null, done: false });
+  loadStagePictures(files)
+    .then(({ pics, problem }) => {
+      if (stagePics !== job) return;
+      Object.assign(job, { pics, problem, done: true });
       if (problem) console.info(`Stage pictures: ${problem}`);
-      if (!top() && urls.size) renderView();
+      if (!top() && pics.size) renderView();
     })
     .catch((e) => Object.assign(job, { problem: e.message, done: true }));
-  return job.urls;
+  return job.pics;
 }
 const expanded = new Set();
 let savedHandle = null;
