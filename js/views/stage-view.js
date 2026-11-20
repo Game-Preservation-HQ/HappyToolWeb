@@ -3,6 +3,7 @@
 // and moves, turns, scales and hides objects with a gizmo, keys and a placement panel (slice 2, see stage-edit.js).
 // Lighting, lightmap modes and sky placement follow HappyTool/GUI/StageViewerForm.cs (InitGl, DrawMesh, sky pass).
 // The sky can be swapped for another stage's, a picture or a colour preset (slice 3, see stage-sky.js).
+// The stage's collision can be erased by hand and added to with walls, blocks, floors and ramps (see stage-colnav.js).
 import { el, button, toast, downloadBlob, pickFiles, confirmBox, debounce } from '../ui.js';
 import { decodeLayers, encodeLayers, writableLayers } from '../formats/wrappers.js';
 import { writeBres } from '../formats/bres.js';
@@ -32,6 +33,10 @@ import {
   makeFog, sameFog, fogHex, withHex, metres, fogFromFeature, readFog, readFogFromFile, bakeFog, fogPreviewOn, setFogPreview, fogRgb,
 } from './stage-fog.js';
 import { readCollision, edgesOf } from './stage-collision.js';
+import {
+  COLNAV_KEY, CN_SHAPES, CN_SIZES, CN_MIN_BRUSH, CN_MAX_BRUSH, readColNav, cloneColNav, colNavFeature, removedFlags,
+  setRemovedFlags, volumeTriangles, rayLayer, rayTris, eraseAt,
+} from '../formats/stage-colnav.js';
 
 const FOV = Math.PI / 4;
 const SKY_RADIUS = 920; // ClipFar 1000 * 0.92 when StageCameraParam.json isn't read (ComputeSkyRenderRadius)
@@ -55,11 +60,16 @@ const pause = () => new Promise((r) => setTimeout(r, 0));
 const presetDomes = new Map();
 /** Whether the fog differs from the stage's own (only then is it kept and written, as on the desktop). */
 const fogChanged = (e) => !!e.fogStock && !!e.fog && !sameFog(e.fog, e.fogStock);
-/** The edits file's Features: other features kept as read, plus the fog when it is changed (or as stored, until read). */
+/**
+ * The edits file's Features: other features kept as read, plus the fog when it is changed (or as stored, until read) and
+ * the collision edits when there are any.
+ */
 function fogFeatures(e) {
   const out = { ...e.otherFeatures };
   const fog = e.fogStock ? (fogChanged(e) ? e.fog : null) : e.storedFog;
   if (fog) out.fog = { Enable: fog.Enable, Near: fog.Near, Far: fog.Far, Color: fog.Color };
+  const cn = colNavFeature(e.colnav);
+  if (cn) out[COLNAV_KEY] = cn;
   return Object.keys(out).length ? out : null;
 }
 const lower = (s) => (s ? s.toLowerCase() : s);
@@ -416,6 +426,7 @@ function setUpEdits(scene, model) {
     fogStock: null,
     storedFog: null, // the fog kept in this browser, until the stage's own is read
     otherFeatures: {}, // edits-file features this page doesn't edit, kept as read
+    colnav: readColNav(null), // collision erased by hand and pieces added (the "colnav" feature)
     fogPreview: fogPreviewOn(),
   };
   const stored = loadStored(edit.stage);
@@ -432,8 +443,9 @@ function setUpEdits(scene, model) {
     }
     edit.sky = cloneSky(stored.Sky);
     if (stored.Features && typeof stored.Features === 'object' && !Array.isArray(stored.Features)) {
-      const { fog, ...rest } = stored.Features;
+      const { fog, [COLNAV_KEY]: cn, ...rest } = stored.Features;
       edit.storedFog = fogFromFeature(fog);
+      edit.colnav = readColNav(cn);
       edit.otherFeatures = rest;
     }
     if (edit.sky?.Mode === 'picture')
@@ -465,12 +477,13 @@ export function renderStage(node, ctx) {
   const skyBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const fogBox = el('div', { class: 'stage-sky stage-fog' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const downloadBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
+  const cnBox = el('div', { class: 'stage-sky stage-cn' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const canvas = el('canvas', { class: 'stage-canvas', tabindex: '0', 'aria-label': 'Stage map' });
   const overlay = el('canvas', { class: 'stage-overlay', 'aria-hidden': 'true' });
   const hint = el(
     'div',
     { class: 'stage-hint' },
-    'Drag: orbit · Right-drag: pan · Wheel: zoom · WASD/QE: fly · Click: select · 1/2/3: move/rotate/scale · Arrows, PgUp/PgDn: nudge (Ctrl: rotate, Shift: ×5) · [ ]: scale · Del: hide · Ctrl+Z/Y: undo/redo · F: frame · R: reset view · H: collision',
+    'Drag: orbit · Right-drag: pan · Wheel: zoom · WASD/QE: fly · Click: select · 1/2/3: move/rotate/scale · Arrows, PgUp/PgDn: nudge (Ctrl: rotate, Shift: ×5) · [ ]: scale · Del: hide · Ctrl+Z/Y: undo/redo · F: frame · R: reset view · H: collision · F3: edit collision',
   );
   const host = el('div', { class: 'stage-canvas-host' }, canvas, overlay, hint);
   const lmSelect = el('select', { class: 'input input-sm', 'aria-label': 'Lightmap mode' }, LM_MODES.map(([v, label]) => el('option', { value: v }, label)));
@@ -497,7 +510,7 @@ export function renderStage(node, ctx) {
     el(
       'div',
       { class: 'stage-body' },
-      el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Layers'), layersBox),
+      el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Collision edits'), cnBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Layers'), layersBox),
       host,
     ),
   );
@@ -735,6 +748,7 @@ export function renderStage(node, ctx) {
       g2.setTransform(1, 0, 0, 1, 0, 0);
       g2.clearRect(0, 0, w, h);
       g2.setTransform(dpr, 0, 0, dpr, 0, 0);
+      if (cnMode) drawCnOverlay(g2);
       const g = gizmo();
       if (!g) return;
       const b = g.o.bounds;
@@ -1116,7 +1130,7 @@ export function renderStage(node, ctx) {
         if (sky?.Mode === 'picture' && !picture) skyNote += ' Choose the picture again in the Sky panel to see it.';
       }
       // The file's fog (a "fog" feature), and the features this page doesn't edit, kept as they are.
-      const { fog: fileFog, ...rest } = res.features;
+      const { fog: fileFog, [COLNAV_KEY]: fileCn, ...rest } = res.features;
       Object.assign(edit.otherFeatures, rest);
       const fog = fogFromFeature(fileFog);
       if (fog && edit.fogStock && !sameFog(fog, edit.fog)) {
@@ -1124,6 +1138,16 @@ export function renderStage(node, ctx) {
         applyFog(fog);
         acts.push({ undo: () => applyFog(before), redo: () => applyFog(fog) });
         skyNote += ` Fog: ${fog.Enable ? `${metres(fog.Near)} → ${metres(fog.Far)}` : 'off'}.`;
+      }
+      // The file's collision edits (a "colnav" feature) replace these.
+      if (fileCn && typeof fileCn === 'object' && !Array.isArray(fileCn)) {
+        const before = cloneColNav(edit.colnav), after = readColNav(fileCn);
+        if (JSON.stringify(before) !== JSON.stringify(after)) {
+          applyColNav(cloneColNav(after));
+          acts.push({ undo: () => applyColNav(cloneColNav(before)), redo: () => applyColNav(cloneColNav(after)) });
+          const n = after.Volumes.length, e = cnErasedCount();
+          skyNote += ` Collision: ${e.toLocaleString()} triangle${e === 1 ? '' : 's'} erased, ${n} piece${n === 1 ? '' : 's'} added.`;
+        }
       }
       const action = acts.length
         ? { undo: () => acts.slice().reverse().forEach((a) => a.undo()), redo: () => acts.forEach((a) => a.redo()) }
@@ -1482,11 +1506,12 @@ export function renderStage(node, ctx) {
     // ----- download (objects, sky and fog written into a copy of the bundle, as the desktop export does) -----
     const downloadNote = el('p', { class: 'muted stage-count' });
     const bakeBtn = button('Download bundle', bakeBundle, {
-      title: 'Write the moved, hidden and Solid objects, the sky and the fog into a copy of the stage bundle, as the desktop export does',
+      title: 'Write the moved, hidden and Solid objects, the collision edits, the sky and the fog into a copy of the stage bundle, as the desktop export does',
     });
     function bakeParts() {
       const parts = [];
       if (edit.objects.some((o) => !isEmpty(o.state))) parts.push('objects');
+      if (Object.keys(edit.colnav.RemovedCollision).length || edit.colnav.Volumes.length) parts.push('collision');
       if (edit.sky && edit.sky.Mode !== 'dungeon') parts.push('sky');
       if (fogChanged(edit)) parts.push('fog');
       return parts;
@@ -1496,7 +1521,7 @@ export function renderStage(node, ctx) {
       const parts = bakeParts();
       downloadNote.textContent = parts.length
         ? `Writes the ${listOf(parts)} into a copy of ${edit.stage}.bres.`
-        : 'Move, hide or make objects Solid, or change the sky or fog, to write them into a copy of the bundle.';
+        : 'Move, hide or make objects Solid, change the sky or fog, or edit the collision, to write them into a copy of the bundle.';
       bakeBtn.disabled = !parts.length;
       if (!downloadBox.contains(bakeBtn)) downloadBox.replaceChildren(downloadNote, el('div', { class: 'toolbar' }, bakeBtn));
     }
@@ -1511,27 +1536,35 @@ export function renderStage(node, ctx) {
       }
       return list;
     }
+    /** The pieces added by hand, as shapes already in place (the volumes CollectExportSolids adds as "collision <shape>"). */
+    const exportPieces = () =>
+      edit.colnav.Volumes.map((v) => ({ name: `collision ${v.Shape}`, positions: volumeTriangles(v), triangles: null, world: null }));
     /**
      * The collision written as the desktop export does: the edited objects' triangles moved along in every .ccp layer
-     * (PatchCollision, once the collision is matched to the objects), Solid objects' generated collision appended to the
-     * _Chit and _Ehit layers (SolidCollision), and the changed layers' stale .mtf copies dropped. Returns {entries, line}
-     * or null when there's nothing to do; the entries are replaced in place (at: lower-case name -> index).
+     * (PatchCollision, once the collision is matched to the objects), the triangles erased by hand left out, Solid
+     * objects' generated collision and the pieces added by hand appended to the _Chit and _Ehit layers (SolidCollision),
+     * and the changed layers' stale .mtf copies dropped. Returns {entries, line} or null when there's nothing to do; the
+     * entries are replaced in place (at: lower-case name -> index).
      */
-    async function bakeCollision(edits, solids, entries, at) {
+    async function bakeCollision(edits, solids, added, entries, at) {
       const ccp = [];
       entries.forEach((e, i) => /\.ccp$/i.test(e.name || '') && !e.pointer && e.data?.length && ccp.push(i));
-      if (!ccp.length && !solids.length) return null;
+      if (!ccp.length && !solids.length && !added.length) return null;
+      const erased = Object.keys(edit.colnav.RemovedCollision).length > 0;
       const notes = [];
       let col = null, owners = null;
-      if (edits.length && ccp.length) {
+      if ((edits.length || erased) && ccp.length) {
+        const lost = [edits.length ? "doesn't follow the moved objects" : '', erased ? 'keeps the triangles erased by hand' : ''].filter(Boolean).join(' and ');
         status.textContent = 'Reading the collision…';
         try {
           col = await (job.collision || (job.collision = readCollision(model)));
         } catch (e) {
-          notes.push(`The collision couldn't be read (${e.message}), so it doesn't follow the moved objects.`);
+          notes.push(`The collision couldn't be read (${e.message}), so it ${lost}.`);
         }
-        if (col && !col.live) notes.push("The collision has an unfamiliar layout, so it doesn't follow the moved objects.");
-        else if (col) {
+        if (col && !col.live) {
+          notes.push(`The collision has an unfamiliar layout, so it ${lost}.`);
+          col = null;
+        } else if (col && edits.length) {
           if (!edit.colMatch) startMatching(col);
           for (let m = edit.colMatch; m && !m.owners && !m.error; m = edit.colMatch) {
             status.textContent = `Matching the collision to the objects… ${m.pct ?? 0}%`;
@@ -1546,15 +1579,18 @@ export function renderStage(node, ctx) {
       await pause();
       const rep = { log: [], warnings: [] }, changed = [], payloads = [];
       for (const i of ccp) payloads.push([i, (await decodeLayers(entries[i].data)).payload]);
-      const extra = solids.length ? solidCollision(payloads.map(([i, data]) => ({ name: entries[i].name, data })), solids, rep) : new Map();
+      const all = solids.concat(added);
+      const extra = all.length ? solidCollision(payloads.map(([i, data]) => ({ name: entries[i].name, data })), all, rep) : new Map();
+      const from = added.length ? (solids.length ? 'Solid objects and added pieces' : 'added pieces') : 'Solid objects';
       for (const [i, data] of payloads) {
         const name = entries[i].name;
-        const li = owners ? col.layers.findIndex((l) => l.name.toLowerCase() === name.toLowerCase()) : -1;
-        let out = li >= 0 ? patchCollision(data, name, edits, edit.objects, owners[li], rep) : null;
+        const li = col ? col.layers.findIndex((l) => l.name.toLowerCase() === name.toLowerCase()) : -1;
+        const removed = li >= 0 && erased ? removedFlags(edit.colnav, name, col.layers[li].indices.length / 3) : null;
+        let out = li >= 0 && (owners || removed) ? patchCollision(data, name, owners ? edits : [], edit.objects, owners ? owners[li] : null, rep, removed) : null;
         const add = extra.get(name);
         if (add?.length) {
           out = appendCollisionGroups(out ?? data, add);
-          rep.log.push(`${name}: +${add.length} group(s) from Solid objects`);
+          rep.log.push(`${name}: +${add.length} group(s) from ${from}`);
         }
         if (!out) continue;
         entries[i] = { ...entries[i], pointer: false, size: out.length, data: out };
@@ -1564,9 +1600,11 @@ export function renderStage(node, ctx) {
       const { entries: kept, dropped } = dropStaleCollisionCopies(entries, changed);
       const what = [];
       if (owners) what.push(`${(rep.trianglesMoved || 0).toLocaleString()} triangles moved, ${(rep.trianglesRemoved || 0).toLocaleString()} removed`);
+      if (rep.trianglesErased) what.push(`${rep.trianglesErased.toLocaleString()} erased by hand`);
       if (rep.collisionTrianglesGenerated) {
-        const k = rep.solidObjects;
-        what.push(`${rep.collisionTrianglesGenerated.toLocaleString()} generated for ${k.toLocaleString()} Solid object${k === 1 ? '' : 's'}`);
+        const p = Math.min(added.length, rep.solidObjects || 0), k = (rep.solidObjects || 0) - p;
+        const who = [k ? `${k.toLocaleString()} Solid object${k === 1 ? '' : 's'}` : '', p ? `${p.toLocaleString()} added piece${p === 1 ? '' : 's'}` : ''].filter(Boolean);
+        what.push(`${rep.collisionTrianglesGenerated.toLocaleString()} generated for ${listOf(who)}`);
       }
       const line =
         (changed.length
@@ -1585,11 +1623,12 @@ export function renderStage(node, ctx) {
       try {
         let archive = model;
         const lines = [];
-        if (parts.includes('objects')) {
+        if (parts.includes('objects') || parts.includes('collision')) {
           status.textContent = 'Writing the objects…';
           await pause();
           const { edits, skipped } = collectExportEdits(edit.objects);
-          const solids = exportSolids();
+          const solids = exportSolids(), added = exportPieces();
+          const erased = Object.keys(edit.colnav.RemovedCollision).length > 0;
           const at = new Map();
           archive.entries.forEach((e, i) => at.has(e.name.toLowerCase()) || at.set(e.name.toLowerCase(), i));
           const entryOf = (name) => archive.entries[at.get(name.toLowerCase())];
@@ -1609,7 +1648,7 @@ export function renderStage(node, ctx) {
                 `${n.verticesWritten.toLocaleString()} vertices, ${n.batchesRebounded.toLocaleString()} batch bounds refitted.` +
                 (skipped ? ` ${skipped.toLocaleString()} moved object(s) can't be written back (no Steam record).` : ''),
             );
-          const c = edits.length || solids.length ? await bakeCollision(edits, solids, entries, at) : null;
+          const c = edits.length || solids.length || added.length || erased ? await bakeCollision(edits, solids, added, entries, at) : null;
           if (c) lines.push(c.line);
           archive = { ...archive, entries: c ? c.entries : entries };
         }
@@ -1656,6 +1695,7 @@ export function renderStage(node, ctx) {
     // Colours as on the desktop (StageViewerForm.Collision.cs).
     const COL_OWNED = [0.15, 1, 0.35], COL_STAGE = [0.35, 0.75, 1], COL_MOVED = [0.75, 1, 0.55], COL_SOLID = [1, 0.6, 0.15];
     const COL_SELECTED = [1, 1, 0.45];
+    const COL_PIECE = [0.75, 0.45, 1]; // pieces added by hand
     /** Above this many triangles a Solid object collides as its bounding box instead of its own triangles. */
     const SOLID_BOX_THRESHOLD = 100;
     const BOX_TRIS = [0, 2, 3, 0, 3, 1, 4, 5, 7, 4, 7, 6, 0, 4, 6, 0, 6, 2, 1, 3, 7, 1, 7, 5, 2, 6, 7, 2, 7, 3, 0, 1, 5, 0, 5, 4];
@@ -1762,24 +1802,45 @@ export function renderStage(node, ctx) {
       solidCache.set(o, tris);
       return tris;
     }
-    /** Rebuilds the in-place lists when an owner starts or stops being moved or hidden (owned: green; unowned: blue). */
+    /**
+     * Rebuilds the in-place lists when an owner starts or stops being moved or hidden, and the layers whose erased
+     * triangles changed (owned: green; unowned: blue); erased triangles draw nothing.
+     */
     function syncStatic(m) {
       const key = m.ownerList.filter((i) => displaced(edit.objects[i].state)).join(',');
-      if (key === staticKey) return;
-      const first = staticKey === null;
+      if (key === staticKey && !cnTouched.size) return;
+      const first = staticKey === null, all = first || key !== staticKey || cnTouched.has(-1);
       staticKey = key;
-      const off = new Set(key ? key.split(',').map(Number) : []);
+      const off = new Set(key ? key.split(',').map(Number) : []), flags = erasedFlags();
       colRead.layers.forEach((l, li) => {
-        const own = m.owners[li], I = l.indices, keep = [], stage = [];
+        const touched = first || cnTouched.has(-1) || cnTouched.has(li);
+        if (!all && !touched) return;
+        const own = m.owners[li], f = flags[li], I = l.indices, keep = [], stage = [];
         for (let t = 0; t < own.length; t++) {
+          if (f && f[t]) continue;
           const o = own[t];
           if (o < 0) {
-            if (first) stage.push(I[t * 3], I[t * 3 + 1], I[t * 3 + 2]);
+            if (touched) stage.push(I[t * 3], I[t * 3 + 1], I[t * 3 + 2]);
           } else if (!off.has(o)) keep.push(I[t * 3], I[t * 3 + 1], I[t * 3 + 2]);
         }
         setEdges(colGpu[li].main, edgesOf(keep));
-        if (first) setEdges(colGpu[li].stage, edgesOf(stage));
+        if (touched) setEdges(colGpu[li].stage, edgesOf(stage));
       });
+      cnTouched.clear();
+    }
+    /** Before (or without) matching: each layer's lines less the triangles erased by hand, rebuilt where they changed. */
+    function syncPlain() {
+      if (!cnTouched.size) return;
+      const flags = erasedFlags();
+      colRead.layers.forEach((l, li) => {
+        if (!cnTouched.has(-1) && !cnTouched.has(li)) return;
+        const f = flags[li];
+        if (!f) return setEdges(colGpu[li].main, l.edges);
+        const I = l.indices, keep = [];
+        for (let t = 0; t < f.length; t++) if (!f[t]) keep.push(I[t * 3], I[t * 3 + 1], I[t * 3 + 2]);
+        setEdges(colGpu[li].main, edgesOf(keep));
+      });
+      cnTouched.clear();
     }
     /** Moved objects' collision placed with them (pale green) and Solid objects' shapes (orange); hidden ones draw nothing. */
     function syncDyn(m) {
@@ -1813,7 +1874,8 @@ export function renderStage(node, ctx) {
     /** The collision over the map (DrawLiveCollision), depth-tested; the selected object's on top, in yellow. */
     function drawCollision(vp, eye) {
       const on = colBox.checked && colGpu.length > 0, o = selected();
-      if (!on && !o) return;
+      const cnOn = (colBox.checked || cnMode > 0) && edit.colnav.Volumes.length > 0;
+      if (!on && !o && !cnOn) return;
       const m = matchDone();
       const colour = (c) => gl.uniform4f(lineProg.u.uColor, c[0], c[1], c[2], 1);
       gl.useProgram(lineProg.program);
@@ -1823,6 +1885,7 @@ export function renderStage(node, ctx) {
       gl.depthMask(false);
       if (on) {
         if (m) syncStatic(m);
+        else syncPlain();
         syncDyn(m);
         colour(COL_OWNED);
         for (const g of colGpu) {
@@ -1847,6 +1910,7 @@ export function renderStage(node, ctx) {
           gl.drawArrays(gl.LINES, dyn.a, dyn.b);
         }
       }
+      if (cnOn) drawPieces(colour);
       if (o) {
         syncSel(m, o);
         if (sel.a + sel.b) {
@@ -1860,18 +1924,14 @@ export function renderStage(node, ctx) {
       gl.depthMask(true);
       gl.useProgram(prog.program);
     }
-    /** Each object's collision triangles (9 floats each, stock) from the owners, and the desktop's log line. */
-    function buildObjTris(col, m, owners) {
+    /** Each object's collision triangles (9 floats each, stock) from the owners, leaving out those erased by hand. */
+    function fillObjTris(col, m) {
       const n = edit.objects.length, count = new Int32Array(n), fill = new Int32Array(n);
-      let total = 0, owned = 0;
-      for (const own of owners) {
-        total += own.length;
-        for (const o of own)
-          if (o >= 0) {
-            count[o]++;
-            owned++;
-          }
-      }
+      const flags = col.live ? col.layers.map((l) => removedFlags(edit.colnav, l.name, l.indices.length / 3)) : [];
+      m.owners.forEach((own, li) => {
+        const f = flags[li];
+        for (let t = 0; t < own.length; t++) if (own[t] >= 0 && !(f && f[t])) count[own[t]]++;
+      });
       const objTris = new Array(n).fill(null), ownerList = [];
       for (let i = 0; i < n; i++)
         if (count[i]) {
@@ -1879,10 +1939,10 @@ export function renderStage(node, ctx) {
           ownerList.push(i);
         }
       col.layers.forEach((l, li) => {
-        const own = owners[li], P = l.positions, I = l.indices;
+        const own = m.owners[li], f = flags[li], P = l.positions, I = l.indices;
         for (let t = 0; t < own.length; t++) {
           const o = own[t];
-          if (o < 0) continue;
+          if (o < 0 || (f && f[t])) continue;
           const out = objTris[o];
           for (let k = 0; k < 3; k++) {
             const v = I[t * 3 + k] * 3;
@@ -1892,8 +1952,18 @@ export function renderStage(node, ctx) {
           }
         }
       });
-      Object.assign(m, { owners, objTris, ownerList, owned, total, pct: 100 });
-      console.info(`Map editor: live collision: ${owned} of ${total} triangles matched to ${ownerList.length} objects in ${m.ms} ms`);
+      Object.assign(m, { objTris, ownerList });
+    }
+    /** The owners from the worker, each object's triangles, and the desktop's log line. */
+    function buildObjTris(col, m, owners) {
+      let total = 0, owned = 0;
+      for (const own of owners) {
+        total += own.length;
+        for (const o of own) if (o >= 0) owned++;
+      }
+      Object.assign(m, { owners, owned, total, pct: 100 });
+      fillObjTris(col, m);
+      console.info(`Map editor: live collision: ${owned} of ${total} triangles matched to ${m.ownerList.length} objects in ${m.ms} ms`);
     }
     /** Matches the collision to the objects in a worker, once per stage (StartOwnerMatching); kept while the page lives. */
     function startMatching(col) {
@@ -1965,7 +2035,7 @@ export function renderStage(node, ctx) {
           : m?.error
             ? " It couldn't be matched to objects, so it doesn't follow moved objects."
             : m?.owners
-              ? ` ${m.owned.toLocaleString()} triangles belong to ${m.ownerList.length.toLocaleString()} objects and follow them: green stays put, pale green has moved, blue is the stage's own, orange is Solid objects, yellow is the selected object's.`
+              ? ` ${m.owned.toLocaleString()} triangles belong to ${m.ownerList.length.toLocaleString()} objects and follow them: green stays put, pale green has moved, blue is the stage's own, orange is Solid objects, violet is pieces added by hand, yellow is the selected object's.`
               : ` Matching it to objects… ${m?.pct ?? 0}%`;
         colLabel.title =
           `Show the stage's collision (H): ${n} layer${n === 1 ? '' : 's'}, ${tris.toLocaleString()} triangles ` +
@@ -1990,6 +2060,7 @@ export function renderStage(node, ctx) {
         startMatching(col);
         renderCollision();
         renderColInfo();
+        renderColNav();
         dirty = true;
       },
       (e) => {
@@ -1998,9 +2069,511 @@ export function renderStage(node, ctx) {
         console.warn(`Map editor: the collision of ${edit.stage} could not be read: ${e.message}`);
         renderCollision();
         renderColInfo();
+        renderColNav();
       },
     );
     renderCollision();
+
+    // ----- collision edits: erase collision by hand, add pieces (StageViewerForm.ColNav.cs) -----
+    let cnMode = 0; // 0 off, 1 erase collision, 2 add collision
+    let cnBrush = 300, cnShape = 'Wall', cnYaw = 0, cnSel = -1, cnStroke = null, cnAim = null, cnShift = false;
+    let cnFlags = null, cnColWas = false, cnPending = null;
+    const cnSizes = Object.fromEntries(CN_SHAPES.map((s) => [s, CN_SIZES[s].slice()]));
+    /** Layers whose erased triangles changed since their lines were last built (-1: all of them). */
+    const cnTouched = new Set(Object.keys(edit.colnav.RemovedCollision).length ? [-1] : []);
+    const pieces = { vao: null, buf: null, a: 0, b: 0, key: null }; // unselected pieces, then the selected one
+    const CN_REACH = 80000;
+    const CN_NAMES = ['Off', 'Erase collision', 'Add collision'];
+    const CN_HINTS = [
+      null,
+      'Erase collision · Drag: erase · Shift+drag: bring back · Wheel or [ ]: brush size · Right-drag: orbit · Middle-drag: pan · 2: add · F3/Esc: leave · Ctrl+Z/Y: undo/redo',
+      'Add collision · Click: place or select a piece · Shift+click: delete it · Wheel: turn (Shift: 5°) · R: shape · [ ]: width (Shift: height) · - +: depth · Arrows, PgUp/PgDn: move (Shift: ×8) · Del: delete · Right-drag: orbit · 1: erase · F3/Esc: leave',
+    ];
+    const baseHint = hint.textContent;
+    const fmtM = (u) => String(Math.round(u) / 100);
+    const flash = (t) => (status.textContent = t);
+    const plural = (n, w) => `${n.toLocaleString()} ${w}${n === 1 ? '' : 's'}`;
+
+    /** Each live collision layer's triangles erased by hand (null where none); [] until the collision is live. */
+    function erasedFlags() {
+      if (!colRead?.live) return [];
+      return (cnFlags ??= colRead.layers.map((l) => removedFlags(edit.colnav, l.name, l.indices.length / 3)));
+    }
+    function cnErasedCount() {
+      return Object.values(edit.colnav.RemovedCollision).reduce((s, l) => s + l.length, 0);
+    }
+    /** The erased triangles changed as a whole (an undo, a loaded file): every line list built from them goes stale. */
+    function cnErased() {
+      cnFlags = null;
+      cnTouched.add(-1);
+      const m = matchDone();
+      if (m && colRead?.live) fillObjTris(colRead, m);
+      dyn.key = [];
+      sel.key = [];
+    }
+    /** Puts a collision-edits state in place (a change, an undo, a redo, a loaded file) and redraws what it touches. */
+    function applyColNav(c) {
+      const erasedSame = JSON.stringify(c.RemovedCollision) === JSON.stringify(edit.colnav.RemovedCollision);
+      edit.colnav = c;
+      if (!erasedSame) cnErased();
+      pieces.key = null;
+      if (cnSel >= c.Volumes.length) cnSel = -1;
+      saveSoon();
+      renderColNav();
+      downloadRefresh();
+      dirty = true;
+      overlayDirty = true;
+    }
+    /** One undoable change: fn edits a copy (returning false, or changing nothing, does nothing). */
+    function colNavChange(label, fn, mergeKey = null) {
+      const before = cloneColNav(edit.colnav), next = cloneColNav(edit.colnav);
+      if (fn(next) === false) return false;
+      const after = cloneColNav(next);
+      if (JSON.stringify(after) === JSON.stringify(before)) return false;
+      const action = {
+        before,
+        after,
+        undo() {
+          applyColNav(cloneColNav(this.before));
+        },
+        redo() {
+          applyColNav(cloneColNav(this.after));
+        },
+        merge(o) {
+          this.after = o.after;
+          return true;
+        },
+        drop() {
+          return JSON.stringify(this.before) === JSON.stringify(this.after);
+        },
+      };
+      applyColNav(cloneColNav(after));
+      edit.history.push([], label, mergeKey, action);
+      syncPanel();
+      return true;
+    }
+
+    // Drawing: the pieces as lines (violet, the selected one yellow on top), the brush ring and the next piece's outline.
+    function syncPieces() {
+      if (pieces.key === cnSel) return;
+      const a = [], b = [];
+      const asIs = (out, at, x, y, z) => {
+        out[at] = x;
+        out[at + 1] = y;
+        out[at + 2] = z;
+      };
+      edit.colnav.Volumes.forEach((v, i) => addLines(i === cnSel ? b : a, volumeTriangles(v), asIs));
+      fillLines(pieces, a, b);
+      pieces.key = cnSel;
+    }
+    function drawPieces(colour) {
+      syncPieces();
+      gl.bindVertexArray(pieces.vao);
+      if (pieces.a) {
+        colour(COL_PIECE);
+        gl.drawArrays(gl.LINES, 0, pieces.a);
+      }
+      if (pieces.b) {
+        gl.disable(gl.DEPTH_TEST);
+        colour(COL_SELECTED);
+        gl.drawArrays(gl.LINES, pieces.a, pieces.b);
+        gl.enable(gl.DEPTH_TEST);
+      }
+    }
+    function drawCnOverlay(g2) {
+      if (!cnAim) return;
+      if (cnMode === 1) {
+        const restore = cnStroke ? cnStroke.dir < 0 : cnShift;
+        g2.strokeStyle = restore ? 'rgb(115 255 128 / 0.9)' : 'rgb(255 102 89 / 0.9)';
+        g2.lineWidth = 2;
+        g2.beginPath();
+        let open = false;
+        for (let i = 0; i <= 48; i++) {
+          const a = (i / 48) * 2 * Math.PI;
+          const p = project([cnAim[0] + Math.cos(a) * cnBrush, cnAim[1], cnAim[2] + Math.sin(a) * cnBrush]);
+          if (!p) {
+            open = false;
+            continue;
+          }
+          if (open) g2.lineTo(p.x, p.y);
+          else g2.moveTo(p.x, p.y);
+          open = true;
+        }
+        g2.stroke();
+      } else if (cnMode === 2 && cnSel < 0) {
+        const f = volumeTriangles(cnGhost());
+        g2.strokeStyle = 'rgb(191 115 255 / 0.85)';
+        g2.lineWidth = 1.5;
+        g2.setLineDash([5, 4]);
+        g2.beginPath();
+        for (let i = 0; i + 8 < f.length; i += 9) {
+          const p = [0, 3, 6].map((k) => project([f[i + k], f[i + k + 1], f[i + k + 2]]));
+          if (p.some((x) => !x)) continue;
+          g2.moveTo(p[0].x, p[0].y);
+          g2.lineTo(p[1].x, p[1].y);
+          g2.lineTo(p[2].x, p[2].y);
+          g2.closePath();
+        }
+        g2.stroke();
+        g2.setLineDash([]);
+      }
+    }
+
+    /** Where a ray first meets the map, the collision left in place or a piece (CnRay); null when nothing is in reach. */
+    /** How far a ray looks: the desktop's 800 m, or as far as the map reaches when the view is pulled back to see it all. */
+    const cnReach = (o) =>
+      Math.max(CN_REACH, Math.hypot(o[0] - sceneCentre[0], o[1] - sceneCentre[1], o[2] - sceneCentre[2]) + sceneRadius);
+    function cnRay(o, d) {
+      const reach = cnReach(o);
+      let best = Math.min(reach, pick(scene, o, d)?.dist ?? reach);
+      if (colRead?.live) {
+        const m = matchDone(), flags = erasedFlags();
+        colRead.layers.forEach((l, li) => {
+          const f = flags[li], own = m?.owners[li];
+          const skip = f || own ? (t) => !!(f && f[t]) || (!!own && own[t] >= 0 && displaced(edit.objects[own[t]].state)) : null;
+          best = rayLayer(o, d, l.positions, l.indices, best, skip);
+        });
+      }
+      for (const v of edit.colnav.Volumes) best = rayTris(o, d, volumeTriangles(v), best);
+      return best < reach ? o.map((x, k) => x + d[k] * best) : null;
+    }
+    function cnRayAt(p) {
+      const { o, d } = rayAt(p.x, p.y);
+      return cnRay(o, d);
+    }
+
+    // Erase collision: a brush stroke is one undo step.
+    function cnStrokeStart(restore) {
+      if (!colRead?.live) return flash("The collision can't be erased here (it isn't read yet, or has an unfamiliar layout)");
+      cnStroke = { dir: restore ? -1 : 1, before: cloneColNav(edit.colnav), n: 0, layers: new Set() };
+      cnDab();
+      overlayDirty = true;
+    }
+    function cnDab() {
+      if (!cnStroke || !cnAim) return;
+      const m = matchDone(), flags = erasedFlags(), erase = cnStroke.dir > 0;
+      colRead.layers.forEach((l, li) => {
+        const own = m?.owners[li];
+        // Collision carried off with a moved or hidden object is left alone.
+        const skip = own ? (t) => own[t] >= 0 && displaced(edit.objects[own[t]].state) : null;
+        const r = eraseAt(l.positions, l.indices, flags[li], cnAim, cnBrush, erase, skip);
+        if (!r.n) return;
+        flags[li] = r.flags;
+        cnStroke.n += r.n;
+        cnStroke.layers.add(li);
+        cnTouched.add(li);
+        dirty = true;
+      });
+    }
+    function cnStrokeEnd() {
+      const s = cnStroke;
+      if (!s) return;
+      cnStroke = null;
+      overlayDirty = true;
+      if (!s.n) return;
+      const flags = erasedFlags();
+      for (const li of s.layers) setRemovedFlags(edit.colnav, colRead.layers[li].name, flags[li]);
+      const before = s.before, after = cloneColNav(edit.colnav);
+      edit.history.push([], s.dir > 0 ? 'Erase collision' : 'Restore collision', null, {
+        undo: () => applyColNav(cloneColNav(before)),
+        redo: () => applyColNav(cloneColNav(after)),
+      });
+      edit.history.breakMerge();
+      const m = matchDone();
+      if (m) fillObjTris(colRead, m);
+      dyn.key = [];
+      sel.key = [];
+      flash(`${s.dir > 0 ? 'Erased' : 'Brought back'} ${plural(s.n, 'triangle')}`);
+      edited();
+      renderColNav();
+    }
+
+    // Add collision: pieces standing where the pointer meets the map.
+    function cnGhost() {
+      const [W, H, D] = cnSizes[cnShape], r = (x) => Math.round(x * 10) / 10;
+      return { Shape: cnShape, X: r(cnAim[0]), Y: r(cnAim[1]), Z: r(cnAim[2]), W, H, D, Yaw: cnYaw };
+    }
+    function cnSelect(i) {
+      cnSel = i;
+      edit.history.breakMerge();
+      renderColNav();
+      dirty = overlayDirty = true;
+    }
+    function cnClick(p, shift) {
+      if (shift) return cnDelete();
+      const { o, d } = rayAt(p.x, p.y);
+      let best = -1, bestT = cnReach(o);
+      edit.colnav.Volumes.forEach((v, i) => {
+        const t = rayTris(o, d, volumeTriangles(v), bestT);
+        if (t < bestT) [best, bestT] = [i, t];
+      });
+      // An object in front of the piece wins.
+      if (best >= 0) {
+        const hit = pick(scene, o, d);
+        if (hit && hit.dist < bestT - 1) best = -1;
+      }
+      if (best >= 0) return cnSelect(cnSel === best ? -1 : best);
+      if (cnSel >= 0) return cnSelect(-1);
+      const at = cnRay(o, d);
+      if (!at) return flash('Point at a surface to place collision');
+      cnAim = at;
+      const v = cnGhost(), shape = v.Shape.toLowerCase();
+      if (!colNavChange(`Add ${shape}`, (c) => void c.Volumes.push(v))) return;
+      cnSelect(edit.colnav.Volumes.length - 1);
+      flash(`Added a ${shape} — bots walk around it${v.Shape === 'Wall' || v.Shape === 'Block' ? '' : ' and on it'}`);
+    }
+    function cnDelete() {
+      const v = edit.colnav.Volumes[cnSel];
+      if (!v) return flash('Select an added piece first (click it)');
+      const i = cnSel;
+      cnSel = -1;
+      colNavChange(`Delete ${v.Shape}`, (c) => void c.Volumes.splice(i, 1));
+      flash(`Deleted the ${v.Shape}`);
+    }
+    function cnTurn(deg) {
+      const i = cnSel;
+      if (i >= 0) colNavChange('Turn piece', (c) => void (c.Volumes[i].Yaw = wrapDegrees(c.Volumes[i].Yaw + deg)), `cn-turn:${i}`);
+      else {
+        cnYaw = wrapDegrees(cnYaw + deg);
+        overlayDirty = true;
+        renderColNav();
+      }
+    }
+    /** Makes the piece (or the next one) 25% bigger or 20% smaller along W, H or D; its shape then starts at that size. */
+    function cnResize(axis, up) {
+      const i = cnSel, v = edit.colnav.Volumes[i], shape = v ? v.Shape : cnShape, key = 'WHD'[axis];
+      const n = Math.max(10, Math.min(20000, Math.round((v ? v[key] : cnSizes[shape][axis]) * (up ? 1.25 : 0.8))));
+      cnSizes[shape][axis] = n;
+      if (v) colNavChange('Size piece', (c) => void (c.Volumes[i][key] = n), `cn-size:${i}:${axis}`);
+      else {
+        overlayDirty = true;
+        renderColNav();
+      }
+      const s = v ? edit.colnav.Volumes[i] : null, [W, H, D] = s ? [s.W, s.H, s.D] : cnSizes[shape];
+      flash(`${shape}: ${fmtM(W)} × ${fmtM(H)} × ${fmtM(D)} m`);
+    }
+    function cnSetShape(s) {
+      const i = cnSel;
+      cnShape = s;
+      if (i >= 0) {
+        const [W, H, D] = cnSizes[s];
+        colNavChange('Change shape', (c) => void Object.assign(c.Volumes[i], { Shape: s, W, H, D }));
+      }
+      overlayDirty = true;
+      renderColNav();
+      flash(`Shape: ${s}`);
+    }
+    function cnCycleShape(dir) {
+      const cur = cnSel >= 0 ? edit.colnav.Volumes[cnSel].Shape : cnShape, n = CN_SHAPES.length;
+      cnSetShape(CN_SHAPES[(CN_SHAPES.indexOf(cur) + dir + n) % n]);
+    }
+    /** Moves the selected piece along the view's forward and right, snapped to the nearer world axis, or up and down. */
+    function cnMove(k, coarse) {
+      const i = cnSel;
+      if (i < 0) return false;
+      const step = coarse ? 200 : 25, { f } = basis();
+      const fw = Math.abs(f[0]) >= Math.abs(f[2]) ? [Math.sign(f[0]), 0, 0] : [0, 0, Math.sign(f[2])];
+      const rt = [-fw[2], 0, fw[0]], neg = (a) => a.map((x) => -x);
+      const dir = { arrowup: fw, arrowdown: neg(fw), arrowright: rt, arrowleft: neg(rt), pageup: [0, 1, 0], pagedown: [0, -1, 0] }[k];
+      colNavChange(
+        'Move piece',
+        (c) => {
+          const v = c.Volumes[i];
+          v.X += dir[0] * step;
+          v.Y += dir[1] * step;
+          v.Z += dir[2] * step;
+        },
+        `cn-move:${i}`,
+      );
+      return true;
+    }
+    function cnSetBrush(r) {
+      cnBrush = Math.max(CN_MIN_BRUSH, Math.min(CN_MAX_BRUSH, r)); // unrounded: small wheel steps add up
+      overlayDirty = true;
+      renderColNav();
+      flash(`Brush: ${fmtM(cnBrush)} m`);
+    }
+    function cnRestoreAll() {
+      if (colNavChange('Bring back erased collision', (c) => void (c.RemovedCollision = {}))) flash('Brought back all erased collision');
+    }
+
+    /** Turns the tool on (1 erase, 2 add) or off (0); the collision lines show while it is on. */
+    function setCnMode(mode) {
+      if (mode === cnMode) return;
+      if (mode === 1 && !colRead?.live)
+        return flash(colRead ? "The collision can't be erased here: it isn't read, or has an unfamiliar layout" : 'Reading the collision…');
+      if (mode === 2 && !colRead?.layers.length) return flash(colRead ? 'This stage has no collision (.ccp) to add to' : 'Reading the collision…');
+      cnStrokeEnd();
+      const was = cnMode;
+      cnMode = mode;
+      if (!was) {
+        select(null);
+        cnColWas = colBox.checked;
+        if (!colBox.disabled && !colBox.checked) {
+          colBox.checked = true;
+          showCollision();
+        }
+      } else if (!mode && colBox.checked !== cnColWas) {
+        colBox.checked = cnColWas;
+        showCollision();
+      }
+      if (mode !== 2) cnSel = -1;
+      if (!mode) cnAim = null;
+      edit.history.breakMerge();
+      hint.textContent = mode ? CN_HINTS[mode] : baseHint;
+      canvas.style.cursor = mode ? 'crosshair' : '';
+      flash(mode ? `Collision & nav: ${CN_NAMES[mode]} — 1-2 / Tab switch tools, F3 done` : 'Left the collision tool');
+      renderColNav();
+      dirty = overlayDirty = true;
+    }
+    function cnPointerDown(p, shift) {
+      cnShift = shift;
+      if (cnMode === 2) return cnClick(p, shift);
+      cnAim = cnRayAt(p);
+      cnStrokeStart(shift);
+    }
+    /** Aims at most once a frame (a ray against the map and the whole collision), dabbing while a stroke is on. */
+    function cnPointerMove(p, shift) {
+      if (cnShift !== shift) overlayDirty = true;
+      cnShift = shift;
+      if (!cnPending)
+        requestAnimationFrame(() => {
+          const q = cnPending;
+          cnPending = null;
+          if (stopped || !cnMode) return;
+          cnAim = cnRayAt(q);
+          overlayDirty = true;
+          if (cnStroke) cnDab();
+        });
+      cnPending = p;
+    }
+    /**
+     * The wheel in the tool: brush size in Erase (x1.15 a notch), turning the selected piece in Add (15°, Shift 5°). A
+     * notch is 100 pixels (3 lines) of wheel, so a trackpad's many small events add up to the same as a mouse's notches.
+     */
+    let cnWheelAcc = 0;
+    function cnWheel(e) {
+      const delta = e.deltaY || e.deltaX;
+      if (!delta) return;
+      const notches = -delta / (e.deltaMode === 1 ? 3 : e.deltaMode === 2 ? 1 : 100);
+      if (cnMode === 1) return cnSetBrush(cnBrush * Math.pow(1.15, notches));
+      cnWheelAcc += notches;
+      const n = Math.trunc(cnWheelAcc + Math.sign(cnWheelAcc) * 1e-6); // 0.3 + 0.3 + 0.3 + 0.1 is a whole notch
+      if (!n) return;
+      cnWheelAcc -= n;
+      cnTurn(n * (e.shiftKey ? 5 : 15));
+    }
+    /** The tool's keys; true when one was used. */
+    function cnKey(e, k) {
+      const shift = e.shiftKey;
+      if (k === 'escape') {
+        cnStrokeEnd();
+        if (cnSel >= 0) cnSelect(-1);
+        else setCnMode(0);
+        return true;
+      }
+      if (e.altKey) return false;
+      if (k === '1' || k === '2') return setCnMode(Number(k)), true;
+      if (k === '3' || k === '4') return flash(`${k === '3' ? 'Paint nav' : 'Waypoints'} isn't in the web version yet`), true;
+      if (k === 'tab') return setCnMode(cnMode === 1 ? 2 : 1), true;
+      if (['g', 'b', 'n', 'k', 'home'].includes(k)) return true;
+      if (cnMode === 1) {
+        if (k === '[' || k === '{') return cnSetBrush(cnBrush / 1.15), true;
+        if (k === ']' || k === '}') return cnSetBrush(cnBrush * 1.15), true;
+        return false;
+      }
+      if (k === 'delete' || k === 'backspace') return cnDelete(), true;
+      if (k === 'r') return cnCycleShape(shift ? -1 : 1), true;
+      if (k === '[' || k === '{') return cnResize(shift ? 1 : 0, false), true;
+      if (k === ']' || k === '}') return cnResize(shift ? 1 : 0, true), true;
+      if (k === '-' || k === '_') return cnResize(2, false), true;
+      if (k === '+' || k === '=') return cnResize(2, true), true;
+      if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'pageup', 'pagedown'].includes(k)) return cnMove(k, shift);
+      return false;
+    }
+
+    // The panel.
+    const cnBtns = [
+      button('Off', () => setCnMode(0), { 'aria-pressed': 'true', title: 'Leave the collision tool (F3, Esc)' }),
+      button('Erase', () => setCnMode(1), { 'aria-pressed': 'false', title: 'Erase collision by hand: drag over it (F3, 1)' }),
+      button('Add', () => setCnMode(2), { 'aria-pressed': 'false', title: 'Add collision: walls, blocks, floors and ramps (2)' }),
+    ];
+    const cnNum = (label, min, max, step) => el('input', { type: 'number', class: 'input input-sm', min, max, step, 'aria-label': label });
+    const cnBrushIn = cnNum('Brush radius, in metres', String(CN_MIN_BRUSH / 100), String(CN_MAX_BRUSH / 100), '0.5');
+    const cnShapeSel = el('select', { class: 'input input-sm', 'aria-label': 'Piece shape' }, CN_SHAPES.map((s) => el('option', { value: s }, s)));
+    const cnDims = ['Width', 'Height', 'Depth'].map((n) => cnNum(`${n}, in metres`, '0.1', '200', '0.5'));
+    const cnYawIn = cnNum('Turn, in degrees', '-180', '180', '5');
+    const cnDelBtn = button('Delete piece', cnDelete, { title: 'Delete the selected piece (Del, or Shift+click it)' });
+    const cnRestoreBtn = button('Bring back erased', cnRestoreAll, { title: 'Bring back all the collision erased by hand (one undo step)' });
+    const cnRow = (label, input, unit, title) => el('label', { class: 'stage-fog-row', title }, label, input, el('span', {}, unit));
+    const cnBrushRow = cnRow('Brush', cnBrushIn, 'm', 'Triangles whose centre is this close to the pointer are erased');
+    const cnPieceRows = [
+      cnRow('Shape', cnShapeSel, '', 'Wall and Block: bots walk around it; Floor and Ramp: also on it (R)'),
+      cnRow('Width', cnDims[0], 'm', 'Across ([ ])'),
+      cnRow('Height', cnDims[1], 'm', 'Shift+[ ]'),
+      cnRow('Depth', cnDims[2], 'm', 'Along; a ramp rises this way (- +)'),
+      cnRow('Turn', cnYawIn, '°', 'About the vertical (wheel)'),
+    ];
+    const cnTools = el('div', { class: 'toolbar' }, cnDelBtn, cnRestoreBtn);
+    const cnLine = el('p', { class: 'muted stage-count' });
+    const cnNote = el('p', { class: 'muted' });
+    const cnInput = (inp, fn) =>
+      inp.addEventListener('change', () => {
+        const x = Number(inp.value);
+        if (inp.value === '' || !Number.isFinite(x)) return renderColNav();
+        fn(x);
+      });
+    cnInput(cnBrushIn, (m) => cnSetBrush(m * 100));
+    cnShapeSel.addEventListener('change', () => cnSetShape(cnShapeSel.value));
+    cnDims.forEach((inp, axis) =>
+      cnInput(inp, (m) => {
+        const i = cnSel, v = edit.colnav.Volumes[i], key = 'WHD'[axis];
+        const n = Math.max(10, Math.min(20000, Math.round(m * 100)));
+        cnSizes[v ? v.Shape : cnShape][axis] = n;
+        if (v) colNavChange('Size piece', (c) => void (c.Volumes[i][key] = n));
+        overlayDirty = true;
+        renderColNav();
+      }),
+    );
+    cnInput(cnYawIn, (deg) => {
+      const i = cnSel;
+      if (i >= 0) colNavChange('Turn piece', (c) => void (c.Volumes[i].Yaw = wrapDegrees(deg)));
+      else cnYaw = wrapDegrees(deg);
+      overlayDirty = true;
+      renderColNav();
+    });
+    function renderColNav() {
+      if (!cnBox.contains(cnLine)) cnBox.replaceChildren(el('div', { class: 'toolbar' }, cnBtns), cnBrushRow, ...cnPieceRows, cnTools, cnLine, cnNote);
+      const live = !!colRead?.live, layers = colRead?.layers.length ?? 0;
+      cnBtns.forEach((b, i) => b.setAttribute('aria-pressed', String(i === cnMode)));
+      cnBtns[1].disabled = !live;
+      cnBtns[2].disabled = !layers;
+      const v = edit.colnav.Volumes[cnSel] || null, shape = v ? v.Shape : cnShape, dims = v ? [v.W, v.H, v.D] : cnSizes[shape];
+      cnBrushIn.value = fmtM(cnBrush);
+      cnShapeSel.value = shape;
+      cnDims.forEach((inp, k) => (inp.value = fmtM(dims[k])));
+      cnYawIn.value = String(Math.round((v ? v.Yaw : cnYaw) * 10) / 10);
+      cnBrushRow.hidden = cnMode !== 1;
+      cnPieceRows.forEach((r) => (r.hidden = cnMode !== 2));
+      cnDelBtn.hidden = cnMode !== 2;
+      cnDelBtn.disabled = !v;
+      const erased = cnErasedCount(), n = edit.colnav.Volumes.length;
+      cnRestoreBtn.hidden = !erased;
+      cnTools.hidden = cnDelBtn.hidden && cnRestoreBtn.hidden;
+      cnLine.textContent = `${plural(erased, 'triangle')} erased · ${plural(n, 'piece')} added${v ? ` · piece ${cnSel + 1} selected` : ''}`;
+      cnNote.textContent = !colRead
+        ? 'Reading the collision…'
+        : !layers
+          ? 'This stage has no collision (.ccp) to edit.'
+          : cnMode === 1
+            ? 'Drag over the collision to erase it (red); Shift+drag brings it back (green). Collision carried off with a moved object is left alone.'
+            : cnMode === 2
+              ? v
+                ? 'Arrows and PgUp/PgDn move it, the wheel turns it, Del deletes it; click it again or Esc to let go.'
+                : `Click the map to place a ${shape.toLowerCase()}; click a piece to select it.`
+              : `F3, Erase or Add: change the collision the download writes; the changes are saved with the edits.${live ? '' : " This collision has an unfamiliar layout, so it can't be erased here."}`;
+    }
+    renderColNav();
     renderSky();
     if (edit.sky) showSky();
     edit.pictureJob?.then(() => !stopped && showSky());
@@ -2124,14 +2697,16 @@ export function renderStage(node, ctx) {
     canvas.addEventListener('pointerdown', (e) => {
       canvas.focus();
       canvas.setPointerCapture(e.pointerId);
+      if (cnMode && e.button === 0) return cnPointerDown(local(e), e.shiftKey);
       if (e.button === 0 && !gdrag) {
         const p = local(e), handle = gizmoHit(p);
         if (handle >= 0 && startGizmo(handle, p)) return;
       }
-      drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, pan: e.button !== 0 || e.shiftKey, moved: false };
+      drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, pan: cnMode ? e.button === 1 : e.button !== 0 || e.shiftKey, moved: false };
     });
     canvas.addEventListener('pointermove', (e) => {
       if (gdrag) return moveGizmo(local(e), e);
+      if (cnMode && !drag) return cnPointerMove(local(e), e.shiftKey);
       if (!drag) {
         const h = gizmoHit(local(e));
         if (h !== hover) {
@@ -2157,6 +2732,7 @@ export function renderStage(node, ctx) {
     });
     canvas.addEventListener('pointerup', (e) => {
       if (gdrag) return endGizmo();
+      if (cnStroke) return cnStrokeEnd();
       const d = drag;
       drag = null;
       if (!d || d.moved || e.button !== 0) return;
@@ -2166,9 +2742,11 @@ export function renderStage(node, ctx) {
     });
     canvas.addEventListener('pointercancel', () => {
       if (gdrag) cancelDrag();
+      cnStrokeEnd();
       drag = null;
     });
     canvas.addEventListener('dblclick', (e) => {
+      if (cnMode) return;
       const p = local(e);
       const { o, d } = rayAt(p.x, p.y);
       const hit = pick(scene, o, d);
@@ -2185,6 +2763,7 @@ export function renderStage(node, ctx) {
       'wheel',
       (e) => {
         e.preventDefault();
+        if (cnMode && !e.altKey) return cnWheel(e);
         cam.dist = Math.max(near(), cam.dist * Math.exp(e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0015)));
         dirty = true;
       },
@@ -2195,10 +2774,16 @@ export function renderStage(node, ctx) {
       const ctrl = e.ctrlKey || e.metaKey;
       if (ctrl && !e.altKey && (k === 'z' || k === 'y')) {
         e.preventDefault();
+        cnStrokeEnd();
         if (k === 'y' || e.shiftKey) redo();
         else undo();
         return;
       }
+      if (k === 'f3' && !ctrl) {
+        e.preventDefault();
+        return setCnMode(cnMode ? 0 : colRead?.live ? 1 : 2);
+      }
+      if (cnMode && !ctrl && cnKey(e, k)) return e.preventDefault();
       if (k === 'escape') return gdrag ? cancelDrag() : select(null);
       // Tab cycles the selection once there is one; with nothing selected it moves focus as usual.
       if (k === 'tab' && selected() && !ctrl && !e.altKey) {

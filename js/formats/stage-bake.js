@@ -7,7 +7,8 @@
 // object's triangles leave their group for new groups cut to the game's 1000-unit tiles, placed like the object; a
 // hidden object's triangles are dropped; everything else stays where it is. Solid objects get collision generated from
 // their own shapes (SolidCollision, CollisionSized, SolidTriangles, FlatTriangles, AppendCollisionGroups), appended to the
-// character and environment layers.
+// character and environment layers. Collision erased by hand in the Collision panel (removedByHand) neither stays nor
+// travels with its object.
 
 import { isIdentityTransform, rotation } from '../views/stage-edit.js';
 import { parseCollisionGroups } from '../views/stage-collision.js';
@@ -611,9 +612,10 @@ function tileGroups(node, tris, count) {
  * A layer's .ccp with the edited objects' triangles moved along (or dropped for hidden ones), or null when nothing in it
  * changes (PatchCollision). owners: the owning object index of every triangle in file order across the groups, -1 for
  * none (the map editor's matching, the desktop's TriangleOwner). objects: the editor's objects, indexed like the edits'
- * shape. report gains warnings, log lines and triangle counts.
+ * shape. removed: per triangle in file order, truthy for the ones erased by hand (ColNav's RemovedCollision), or null.
+ * report gains warnings, log lines and triangle counts.
  */
-export function patchCollision(d, name, edits, objects, owners, report) {
+export function patchCollision(d, name, edits, objects, owners, report, removed = null) {
   report.warnings ??= [];
   report.log ??= [];
   const groups = parseCollisionGroups(d);
@@ -632,12 +634,27 @@ export function patchCollision(d, name, edits, objects, owners, report) {
     firstTri.push(triCount);
     triCount += g.triangles.length / 3;
   }
-  if (!owners || owners.length !== triCount) {
-    report.warnings.push(`${name}: the collision matching doesn't fit this file, so its collision was left as it was.`);
-    return null;
+  // Triangles erased by hand (numbered across the groups in file order, as the editor reads them).
+  if (removed && removed.length !== triCount) {
+    report.warnings.push(`${name}: the collision erased by hand doesn't match this file's triangles, so it was kept.`);
+    removed = null;
   }
+  const handGroups = new Uint8Array(groups.length);
+  let handTotal = 0;
+  if (removed)
+    groups.forEach((g, gi) => {
+      for (let t = 0, tc = g.triangles.length / 3; t < tc; t++)
+        if (removed[firstTri[gi] + t]) {
+          handGroups[gi] = 1;
+          handTotal++;
+        }
+    });
+  const gone = (gi, t) => handGroups[gi] && removed[firstTri[gi] + t];
   const editOf = new Map();
-  for (const e of edits) if (e && e.shape != null && objects[e.shape]) editOf.set(e.shape, e);
+  if (edits.length && (!owners || owners.length !== triCount)) {
+    report.warnings.push(`${name}: the collision matching doesn't fit this file, so the edited objects' collision stays where it was.`);
+    if (!handTotal) return null;
+  } else for (const e of edits) if (e && e.shape != null && objects[e.shape]) editOf.set(e.shape, e);
   // Shapes that matter: the edited objects, at their stock place (what the collision was matched against).
   const wanted = [];
   for (const i of editOf.keys()) {
@@ -645,7 +662,7 @@ export function patchCollision(d, name, edits, objects, owners, report) {
     const s = makeShape(i, o.mesh.baked?.positions ?? o.mesh.positions, o.triangles);
     if (ensureBounds(s)) wanted.push(s);
   }
-  if (!wanted.length) return null;
+  if (!wanted.length && !handTotal) return null;
 
   // Owners that move, only for groups near an edited shape (as the desktop limits its matching).
   const own = new Array(groups.length).fill(null);
@@ -663,34 +680,44 @@ export function patchCollision(d, name, edits, objects, owners, report) {
     }
     own[gi] = a;
   });
-  if (!ownedTotal) return null;
+  if (!ownedTotal && !handTotal) return null;
 
-  let moved = 0, removed = 0, newGroups = 0, droppedGroups = 0;
+  let moved = 0, dropped = 0, erased = 0, newGroups = 0, droppedGroups = 0;
   const out = [];
   groups.forEach((g, gi) => {
-    const a = own[gi];
-    if (!a) {
+    let a = own[gi];
+    if (!a && !handGroups[gi]) {
       out.push(d.subarray(g.start, g.start + g.length));
       return;
     }
+    a ??= new Int32Array(g.triangles.length / 3).fill(-1);
     const stays = [], byShape = new Map();
+    let leaving = false;
     for (let t = 0; t < a.length; t++) {
+      if (gone(gi, t)) {
+        // Erased by hand: neither stays nor travels with its object.
+        leaving = true;
+        erased++;
+        continue;
+      }
       const si = a[t];
       if (si < 0) stays.push(t);
       else {
+        leaving = true;
         if (!byShape.has(si)) byShape.set(si, []);
         byShape.get(si).push(t);
       }
     }
     // What stays keeps the authored sphere and box (they still enclose a subset); an emptied group is dropped.
-    if (stays.length) {
+    if (!leaving) out.push(d.subarray(g.start, g.start + g.length));
+    else if (stays.length) {
       const kept = [];
       for (let k = 0; k < 43; k++) kept.push(f32(dv, g.ccb + k * 4));
       out.push(buildGroup(g, stays, null, kept));
     } else droppedGroups++;
     for (const si of [...byShape.keys()].sort((x, y) => x - y)) {
       const e = editOf.get(si), tris = byShape.get(si);
-      if (e.deleted) removed += tris.length;
+      if (e.deleted) dropped += tris.length;
       else {
         const placed = tileGroups(g.node, worldTriangles(g, tris, e.world));
         out.push(...placed);
@@ -705,9 +732,11 @@ export function patchCollision(d, name, edits, objects, owners, report) {
     report.warnings.push(`${name}: kept one collision group, as the game can't load a stage file with none.`);
   }
   report.trianglesMoved = (report.trianglesMoved || 0) + moved;
-  report.trianglesRemoved = (report.trianglesRemoved || 0) + removed;
+  report.trianglesRemoved = (report.trianglesRemoved || 0) + dropped;
+  report.trianglesErased = (report.trianglesErased || 0) + erased;
   report.log.push(
-    `${name}: ${moved} triangle(s) moved (${newGroups} new group(s)), ${removed} removed, ${droppedGroups} emptied group(s) dropped; ` +
+    `${name}: ${moved} triangle(s) moved (${newGroups} new group(s)), ${dropped} removed, ${erased} erased by hand, ` +
+      `${droppedGroups} emptied group(s) dropped; ` +
       `${groups.length} -> ${out.length} groups`,
   );
 
