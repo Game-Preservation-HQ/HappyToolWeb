@@ -11,7 +11,7 @@ import { renderLng } from './views/lng-view.js';
 import { renderText } from './views/text-view.js';
 import { renderMedia } from './views/media-view.js';
 import { renderHex } from './views/hex-view.js';
-import { buildTree, renderSidebar, renderFolder, findFile } from './browser.js';
+import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictureUrls } from './browser.js';
 import { loadHandle, saveHandle, readDirectory } from './data-folder.js';
 
 const $ = (id) => document.getElementById(id);
@@ -38,6 +38,26 @@ const top = () => stack().at(-1);
 let tree = buildTree([]);
 /** The folder shown when no file is open ('' = the top level), or null before anything is loaded. */
 let browse = null;
+/** Stage-select pictures for the map tiles: read again whenever files are added, the first time a folder with stages is shown. */
+let stagePics = null;
+function stagePicturesFor(dir) {
+  if (stagePics?.tree === tree) return stagePics.urls;
+  if (!dir || !dir.files.some((r) => stageIdFor(r.path))) return null;
+  if (stagePics) for (const u of stagePics.urls.values()) URL.revokeObjectURL(u);
+  const job = (stagePics = { tree, urls: new Map(), problem: null, done: false });
+  loadStagePictureUrls(files)
+    .then(({ urls, problem }) => {
+      if (stagePics !== job) {
+        for (const u of urls.values()) URL.revokeObjectURL(u);
+        return;
+      }
+      Object.assign(job, { urls, problem, done: true });
+      if (problem) console.info(`Stage pictures: ${problem}`);
+      if (!top() && urls.size) renderView();
+    })
+    .catch((e) => Object.assign(job, { problem: e.message, done: true }));
+  return job.urls;
+}
 const expanded = new Set();
 let savedHandle = null;
 const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
@@ -371,7 +391,7 @@ const LAYER_HELP = {
 function renderView() {
   const node = top();
   if (!node) {
-    dom.view.replaceChildren(files.length && browse !== null ? renderFolder({ tree, browse, mode: prefs.mode, pins: prefs.pins }, folderActions) : emptyState());
+    dom.view.replaceChildren(files.length && browse !== null ? renderFolder({ tree, browse, mode: prefs.mode, pins: prefs.pins, pics: stagePicturesFor(tree.dirs.get(browse) ?? tree.root) }, folderActions) : emptyState());
     return;
   }
   const ctx = {

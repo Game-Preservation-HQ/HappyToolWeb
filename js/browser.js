@@ -3,6 +3,7 @@
 import { el, button } from './ui.js';
 import { formatSize } from './util.js';
 import { fileType, fileIconSvg, folderIconSvg, stageArtSvg, iconEl } from './icons.js';
+import { readStagePictures, PICTURE_BUNDLE, STAGE_TABLE } from './formats/stage-pictures.js';
 
 // The desktop Workshop's notes for well-known Data subfolders (GameDataEditor.Workshop.cs FolderNotes).
 const FOLDER_NOTES = {
@@ -68,6 +69,30 @@ export function stageTableId(id) {
 }
 
 const baseOf = (path) => path.slice(path.lastIndexOf('/') + 1);
+
+/**
+ * The stage-select pictures of an opened Data folder as PNG object URLs by lower-case stage id (read from
+ * scaleform/UI_main.bres and the stage table, as the desktop Workshop does). The caller revokes the URLs.
+ * @returns {Promise<{urls: Map<string,string>, problem: string|null}>}
+ */
+export async function loadStagePictureUrls(files) {
+  const find = (rel) => files.find((r) => `/${r.path.toLowerCase()}`.endsWith(`/${rel.toLowerCase()}`));
+  const bundle = find(PICTURE_BUNDLE);
+  const urls = new Map();
+  if (!bundle) return { urls, problem: `${PICTURE_BUNDLE} isn't in this folder.` };
+  const table = find(STAGE_TABLE);
+  const read = async (r) => new Uint8Array(await r.file.arrayBuffer());
+  const { pictures, problem } = await readStagePictures(await read(bundle), table ? await read(table) : null);
+  const canvas = document.createElement('canvas');
+  for (const [id, pic] of pictures) {
+    canvas.width = pic.width;
+    canvas.height = pic.height;
+    canvas.getContext('2d').putImageData(new ImageData(pic.rgba, pic.width, pic.height), 0, 0);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+    if (blob) urls.set(id.toLowerCase(), URL.createObjectURL(blob));
+  }
+  return { urls, problem };
+}
 
 // ---------- sidebar ----------
 
@@ -202,10 +227,11 @@ export function renderFolder(s, act) {
           { class: 'tiles stage-tiles' },
           ...stages.map((r) => {
             const id = stageIdFor(r.path);
+            const pic = s.pics?.get(id.toLowerCase());
             return el(
               'button',
               { type: 'button', class: `tile stage-tile${r.dirty ? ' dirty' : ''}`, title: `${r.path}\nOpen the map`, onclick: () => act.openStage(r) },
-              iconEl(stageArtSvg(), 'stage-pic'),
+              pic ? el('span', { class: 'stage-pic' }, el('img', { src: pic, alt: '' })) : iconEl(stageArtSvg(), 'stage-pic'),
               el('span', { class: 'tile-name' }, id),
               el('span', { class: 'tile-note' }, stageTableId(id)),
             );
