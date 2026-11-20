@@ -202,6 +202,11 @@ code, pre, .hex { font-family: var(--mono); }
 .file-dir { grid-column: 1 / -1; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-list li.dirty .file-name::after { content: ' ●'; color: var(--accent); }
 .sidebar > p { margin: 0; }
+.sidebar > .legal { margin-top: auto; padding-top: 8px; border-top: 1px solid var(--border); line-height: 1.45; }
+.legal a { color: inherit; }
+.about { max-width: 34rem; }
+.about p { margin: 0 0 10px; line-height: 1.5; }
+.about .about-links { display: flex; gap: 12px; flex-wrap: wrap; }
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 12px 16px; gap: 8px; min-height: 0; }
 .crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; }
 .crumb { font: inherit; background: none; border: 0; color: var(--accent); cursor: pointer; padding: 2px 4px; border-radius: 4px; }

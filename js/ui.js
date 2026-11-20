@@ -51,7 +51,8 @@ export function pickFiles({ multiple = false, accept = '', directory = false } =
   });
 }
 
-function openDialog(build) {
+/** Shows a modal dialog built by build(dlg, done); resolves to the value passed to done, or null on Escape. */
+export function openDialog(build) {
   return new Promise((resolve) => {
     const dlg = el('dialog', { class: 'dialog' });
     const done = (value) => {

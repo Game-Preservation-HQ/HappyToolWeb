@@ -1,5 +1,5 @@
 // HappyTool web: open Happy Wars data files, unwrap them, browse and edit, save with the original wrappers.
-import { el, button, toast, pickFiles } from './ui.js';
+import { el, button, toast, pickFiles, openDialog } from './ui.js';
 import { decodeLayers, encodeLayers, writableLayers } from './formats/wrappers.js';
 import { parseBres, writeBres } from './formats/bres.js';
 import { parseLng, writeLng, validateLng } from './formats/lng.js';
@@ -682,3 +682,40 @@ loadHandle().then((h) => {
     render();
   }
 });
+
+// ---------- about ----------
+
+const SOURCE_URL = 'https://github.com/Game-Preservation-HQ/HappyToolWeb';
+$('btn-about').addEventListener('click', () =>
+  openDialog((dlg, done) => {
+    const link = (href, text) => el('a', { href, target: '_blank', rel: 'noopener' }, text);
+    dlg.append(
+      el(
+        'div',
+        { class: 'about' },
+        el('h2', { class: 'dialog-title' }, 'HappyTool web'),
+        el('p', {}, 'Copyright (C) 2026 Serenity, Game Preservation HQ.'),
+        el(
+          'p',
+          {},
+          'This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public ' +
+            'License as published by the Free Software Foundation, version 3.',
+        ),
+        el(
+          'p',
+          {},
+          'This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty ' +
+            'of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.',
+        ),
+        el(
+          'p',
+          {},
+          'If you share HappyTool web or a changed version of it, or run a changed version for other people over a network, keep this ' +
+            'notice and the credit, and give those people its source code under the same license.',
+        ),
+        el('p', { class: 'about-links' }, link(`${SOURCE_URL}/blob/main/LICENSE`, 'License (GNU AGPL v3)'), link(SOURCE_URL, 'Source code')),
+        el('div', { class: 'dialog-actions' }, button('Close', () => done(null), { autofocus: true })),
+      ),
+    );
+  }),
+);
