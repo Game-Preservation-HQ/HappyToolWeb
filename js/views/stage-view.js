@@ -1,11 +1,17 @@
-// Map viewer (map editor slice 1): draws a Steam stage bundle with WebGL2 — terrain, models, prop packs and sky,
-// colour textures on UV0 and baked lightmaps on UV1 — with an orbit/fly camera, layer toggles and click to inspect.
+// Map viewer and editor: draws a Steam stage bundle with WebGL2 — terrain, models, prop packs and sky, colour
+// textures on UV0 and baked lightmaps on UV1 — with an orbit/fly camera, layer toggles and click to inspect (slice 1),
+// and moves, turns, scales and hides objects with a gizmo, keys and a placement panel (slice 2, see stage-edit.js).
 // Lighting, lightmap modes and sky placement follow HappyTool/GUI/StageViewerForm.cs (InitGl, DrawMesh, sky pass).
-import { el, button } from '../ui.js';
+import { el, button, toast, downloadBlob, pickFiles, confirmBox, debounce } from '../ui.js';
 import { decodeLayers } from '../formats/wrappers.js';
 import { decodeDds } from '../formats/dds.js';
 import { buildSteamStage } from '../formats/steam-stage.js';
 import { stripTextureExtension } from '../formats/rrm.js';
+import {
+  IDENTITY, AXES, UNIFORM, History, collectObjects, writeObject, withState, sameState, isEmpty, wrapDegrees, niceStep,
+  shortObjectName, editsFile, readEditsFile, loadStored, store, stageKey, ringPoint, distanceToSegment,
+  closestParamOnAxis, screenAngle, screenTurnSign, turnAbout,
+} from './stage-edit.js';
 
 const FOV = Math.PI / 4;
 const SKY_RADIUS = 920; // ClipFar 1000 * 0.92 when StageCameraParam.json isn't read (ComputeSkyRenderRadius)
@@ -249,26 +255,28 @@ function compile(gl) {
   return { program: p, u };
 }
 
+/** The mesh's vertex array, plus its position and normal buffers, which placement edits rewrite in place. */
 function uploadMesh(gl, m) {
   const vao = gl.createVertexArray();
   gl.bindVertexArray(vao);
-  const attr = (data, loc, size) => {
+  const attr = (data, loc, size, usage = gl.STATIC_DRAW) => {
     if (!data) return gl.disableVertexAttribArray(loc);
     const b = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, b);
-    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    gl.bufferData(gl.ARRAY_BUFFER, data instanceof Float32Array ? data : new Float32Array(data), usage);
     gl.enableVertexAttribArray(loc);
     gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+    return b;
   };
-  attr(m.positions, 0, 3);
-  attr(m.normals, 1, 3);
+  const pos = attr(m.positions, 0, 3, m.sky ? gl.STATIC_DRAW : gl.DYNAMIC_DRAW);
+  const nrm = attr(m.normals, 1, 3, m.sky ? gl.STATIC_DRAW : gl.DYNAMIC_DRAW);
   attr(m.uvs, 2, 2);
   attr(m.uvs2, 3, 2);
   const ebo = gl.createBuffer();
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
   gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, m.indices, gl.STATIC_DRAW);
   gl.bindVertexArray(null);
-  return vao;
+  return { vao, pos, nrm };
 }
 
 function uploadTexture(gl, img, aniso) {
@@ -327,8 +335,35 @@ function pick(scene, o, d) {
   best.point = [o[0] + d[0] * best.dist, o[1] + d[1] * best.dist, o[2] + d[2] * best.dist];
   const first = best.tri * 3;
   best.batch = best.mesh.batches.find((b) => first >= b.firstIndex && first < b.firstIndex + b.indexCount) || null;
-  best.object = best.mesh.objects?.find((ob) => first >= ob.firstIndex && first < ob.firstIndex + ob.indexCount) || null;
+  best.object = best.mesh.editObjects?.find((ob) => first >= ob.firstIndex && first < ob.firstIndex + ob.indexCount) || null;
   return best;
+}
+
+/**
+ * The scene's movable objects and undo history, made once per scene, with the edits kept in this browser for the
+ * stage put back on them.
+ */
+function setUpEdits(scene, model) {
+  for (const m of scene.meshes) {
+    if (m.sky) continue;
+    if (!(m.positions instanceof Float32Array)) m.positions = Float32Array.from(m.positions);
+    if (!(m.normals instanceof Float32Array)) m.normals = Float32Array.from(m.normals);
+  }
+  const edit = { objects: collectObjects(scene.meshes), history: new History(), stage: stageKey(model.name), restored: 0 };
+  const stored = loadStored(edit.stage);
+  if (stored) {
+    try {
+      for (const c of readEditsFile(stored, edit.objects).changed) {
+        c.obj.pivot = c.pivot;
+        c.obj.state = c.after;
+        writeObject(c.obj);
+        edit.restored++;
+      }
+    } catch (e) {
+      console.warn(`Map editor: the edits kept for ${edit.stage} could not be read: ${e.message}`);
+    }
+  }
+  return edit;
 }
 
 // ---------- view ----------
@@ -346,10 +381,16 @@ export function renderStage(node, ctx) {
   job.report = (t) => (status.textContent = t);
 
   const layersBox = el('div', { class: 'stage-layers' });
-  const inspectBox = el('div', { class: 'stage-inspect' }, el('p', { class: 'muted' }, 'Click the map to inspect a piece.'));
+  const placeBox = el('div', { class: 'stage-place' }, el('p', { class: 'muted' }, 'Reading the stage…'));
+  const inspectBox = el('div', { class: 'stage-inspect' }, el('p', { class: 'muted' }, 'Click the map to select an object.'));
   const canvas = el('canvas', { class: 'stage-canvas', tabindex: '0', 'aria-label': 'Stage map' });
-  const hint = el('div', { class: 'stage-hint' }, 'Drag: orbit · Right-drag: pan · Wheel: zoom · WASD/QE: fly (Shift: fast) · Click: inspect · Double-click: focus · F: frame · R: reset');
-  const host = el('div', { class: 'stage-canvas-host' }, canvas, hint);
+  const overlay = el('canvas', { class: 'stage-overlay', 'aria-hidden': 'true' });
+  const hint = el(
+    'div',
+    { class: 'stage-hint' },
+    'Drag: orbit · Right-drag: pan · Wheel: zoom · WASD/QE: fly · Click: select · 1/2/3: move/rotate/scale · Arrows, PgUp/PgDn: nudge (Ctrl: rotate, Shift: ×5) · [ ]: scale · Del: hide · Ctrl+Z/Y: undo/redo · F: frame · R: reset view',
+  );
+  const host = el('div', { class: 'stage-canvas-host' }, canvas, overlay, hint);
   const lmSelect = el('select', { class: 'input input-sm', 'aria-label': 'Lightmap mode' }, LM_MODES.map(([v, label]) => el('option', { value: v }, label)));
   lmSelect.value = localStorage.getItem(LM_KEY) || 'normal';
   const texBox = el('input', { type: 'checkbox', checked: true });
@@ -368,7 +409,12 @@ export function renderStage(node, ctx) {
       el('span', { class: 'spacer' }),
       status,
     ),
-    el('div', { class: 'stage-body' }, el('aside', { class: 'stage-side' }, el('h3', {}, 'Layers'), layersBox, el('h3', {}, 'Inspect'), inspectBox), host),
+    el(
+      'div',
+      { class: 'stage-body' },
+      el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Layers'), layersBox),
+      host,
+    ),
   );
 
   job.promise.then(
@@ -394,21 +440,32 @@ export function renderStage(node, ctx) {
       return;
     }
     const aniso = gl.getExtension('EXT_texture_filter_anisotropic');
-    const vaos = new Map(scene.meshes.map((m) => [m, uploadMesh(gl, m)]));
+    const edit = scene.edit || (scene.edit = setUpEdits(scene, model));
+    const gpu = new Map(scene.meshes.map((m) => [m, uploadMesh(gl, m)]));
     const glTex = new Map([...scene.textures].map(([k, img]) => [k, uploadTexture(gl, img, aniso)]));
     const tris = scene.meshes.reduce((s, m) => s + m.indices.length / 3, 0);
     status.textContent =
-      `${scene.meshes.length} meshes · ${Math.round(tris).toLocaleString()} triangles · ${glTex.size} textures` +
+      `${scene.meshes.length} meshes · ${edit.objects.length.toLocaleString()} objects · ${Math.round(tris).toLocaleString()} triangles · ${glTex.size} textures` +
       (scene.missing.length ? ` (${scene.missing.length} not in this bundle)` : '') +
       (scene.skipped.length ? ` · ${scene.skipped.length} models not read` : '');
     if (scene.missing.length) status.title = `Textures not in this bundle: ${scene.missing.join(', ')}`;
+    if (edit.restored && !edit.announced) {
+      edit.announced = true;
+      toast(`${edit.restored} edited object${edit.restored === 1 ? '' : 's'} put back from this browser.`);
+    }
 
     const sceneCentre = centre(scene.bounds), sceneRadius = radius(scene.bounds);
+    const nudgeStep = niceStep(Math.max(1, sceneRadius * 0.01)); // NudgeStep
     const cam = job.camera || (job.camera = framed(scene.bounds, { yaw: 0.6, pitch: -0.55 }));
-    let selection = null;
-    let dirty = true;
+    let selection = null; // {mesh, first, count, object, hit}
+    let tool = 0; // 0 move, 1 rotate, 2 scale
+    let hover = -1; // gizmo handle under the pointer
+    let gdrag = null; // gizmo drag in progress
+    let dirty = true, overlayDirty = true;
+    let vp = null, viewW = 1, viewH = 1;
     const keys = new Set();
     let last = performance.now();
+    const saveSoon = debounce(() => store(edit.stage, edit.objects), 250);
 
     function framed(b, from) {
       return { yaw: from.yaw, pitch: from.pitch, target: centre(b), dist: (radius(b) / Math.sin(FOV / 2)) * 1.05 };
@@ -438,7 +495,9 @@ export function renderStage(node, ctx) {
       const hasSky = scene.meshes.some((m) => m.sky && m.visible);
       let far = toCentre + sceneRadius * 4 + 10;
       if (hasSky) far = Math.max(far, SKY_RADIUS * 1.05);
-      const vp = mul(perspective(FOV, w / h, near, far), lookAt(eye, f, r, u));
+      vp = mul(perspective(FOV, w / h, near, far), lookAt(eye, f, r, u));
+      viewW = canvas.clientWidth;
+      viewH = canvas.clientHeight;
       gl.useProgram(prog.program);
       const U = prog.u;
       gl.uniformMatrix4fv(U.uViewProj, false, vp);
@@ -449,6 +508,12 @@ export function renderStage(node, ctx) {
       gl.disable(gl.CULL_FACE);
       const texturesOn = texBox.checked;
       const lmOn = lmSelect.value !== 'off';
+      // Draws indices [a, z) of the bound mesh, tinted when they are the selected object's.
+      const range = (a, z, tinted) => {
+        if (z <= a) return;
+        gl.uniform4f(U.uTint, 1, 0.78, 0.2, tinted ? 0.35 : 0);
+        gl.drawElements(gl.TRIANGLES, z - a, gl.UNSIGNED_INT, a * 4);
+      };
       for (const pass of ['sky', 'solid']) {
         const skyPass = pass === 'sky';
         if (skyPass) {
@@ -461,8 +526,9 @@ export function renderStage(node, ctx) {
         gl.uniform1f(U.uSkyRadius, skyPass ? SKY_RADIUS : 0);
         for (const m of scene.meshes) {
           if (!m.visible || m.sky !== skyPass) continue;
-          gl.bindVertexArray(vaos.get(m));
+          gl.bindVertexArray(gpu.get(m).vao);
           const useTex = (skyPass || texturesOn) && !!m.uvs;
+          const s0 = selection?.mesh === m ? selection.first : 0, s1 = selection?.mesh === m ? selection.first + selection.count : 0;
           for (const b of m.batches) {
             const colour = useTex && b.texture ? glTex.get(lower(b.texture)) : null;
             const light = useTex && m.uvs2 && b.lightmap ? glTex.get(lower(b.lightmap)) : null;
@@ -475,14 +541,460 @@ export function renderStage(node, ctx) {
             gl.bindTexture(gl.TEXTURE_2D, mode === 3 ? light : null);
             gl.uniform1i(U.uMode, mode);
             gl.uniform1i(U.uLit, skyPass || useLight ? 0 : 1);
-            const sel = selection && selection.mesh === m && b.firstIndex >= selection.first && b.firstIndex < selection.first + selection.count;
-            gl.uniform4f(U.uTint, 1, 0.78, 0.2, sel ? 0.35 : 0);
-            gl.drawElements(gl.TRIANGLES, b.indexCount, gl.UNSIGNED_INT, b.firstIndex * 4);
+            const b0 = b.firstIndex, b1 = b.firstIndex + b.indexCount, lo = Math.max(b0, s0), hi = Math.min(b1, s1);
+            if (lo >= hi) range(b0, b1, false);
+            else {
+              range(b0, lo, false);
+              range(lo, hi, true);
+              range(hi, b1, false);
+            }
           }
         }
       }
       gl.bindVertexArray(null);
+      overlayDirty = true;
     }
+
+    // ----- gizmo (StageViewerForm.Gizmo.cs) -----
+    const AXIS_COLOURS = ['#f0525f', '#5fcf62', '#4d8fff'];
+    const ACTIVE = '#ffd43b';
+    const GRAB = 9; // px
+    const RING = 64;
+    const BOX_EDGES = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
+    const selected = () => selection?.object || null;
+
+    /** World point → CSS pixels in the canvas, or null behind the eye. */
+    function project(p) {
+      if (!vp) return null;
+      const x = vp[0] * p[0] + vp[4] * p[1] + vp[8] * p[2] + vp[12];
+      const y = vp[1] * p[0] + vp[5] * p[1] + vp[9] * p[2] + vp[13];
+      const w = vp[3] * p[0] + vp[7] * p[1] + vp[11] * p[2] + vp[15];
+      if (w <= 1e-6) return null;
+      return { x: ((x / w) * 0.5 + 0.5) * viewW, y: (0.5 - (y / w) * 0.5) * viewH };
+    }
+    /** The selected object's gizmo: origin at pivot + offset, arms 12% of the distance to the eye (GizmoLength). */
+    function gizmo() {
+      const o = selected();
+      if (!o) return null;
+      const origin = o.pivot.map((x, k) => x + o.state.t[k]);
+      const { eye } = basis();
+      return { o, origin, len: Math.max(1e-3, Math.hypot(origin[0] - eye[0], origin[1] - eye[1], origin[2] - eye[2]) * 0.12) };
+    }
+    const tipOf = (g, a) => project(g.origin.map((x, k) => x + AXES[a][k] * g.len));
+    const ringOf = (g, a) => Array.from({ length: RING + 1 }, (_, i) => project(ringPoint(g.origin, a, g.len, (i / RING) * 2 * Math.PI)));
+
+    /** The handle under p: 0-2 an axis, UNIFORM the scale centre, -1 none (HitTestGizmo). */
+    function gizmoHit(p) {
+      const g = gizmo();
+      const c = g && project(g.origin);
+      if (!c) return -1;
+      if (tool === 2 && Math.hypot(p.x - c.x, p.y - c.y) <= GRAB + 3) return UNIFORM;
+      let best = -1, bestD = GRAB;
+      for (let a = 0; a < 3; a++) {
+        let d = Infinity;
+        if (tool === 1) {
+          const ring = ringOf(g, a);
+          for (let i = 1; i < ring.length; i++) if (ring[i - 1] && ring[i]) d = Math.min(d, distanceToSegment(p, ring[i - 1], ring[i]));
+        } else {
+          const tip = tipOf(g, a);
+          if (tip) d = distanceToSegment(p, { x: c.x + (tip.x - c.x) * 0.2, y: c.y + (tip.y - c.y) * 0.2 }, tip);
+        }
+        if (d < bestD) [best, bestD] = [a, d];
+      }
+      return best;
+    }
+
+    function drawOverlay() {
+      overlayDirty = false;
+      const dpr = window.devicePixelRatio || 1;
+      const w = Math.max(1, Math.round(overlay.clientWidth * dpr)), h = Math.max(1, Math.round(overlay.clientHeight * dpr));
+      if (overlay.width !== w || overlay.height !== h) {
+        overlay.width = w;
+        overlay.height = h;
+      }
+      const g2 = overlay.getContext('2d');
+      g2.setTransform(1, 0, 0, 1, 0, 0);
+      g2.clearRect(0, 0, w, h);
+      g2.setTransform(dpr, 0, 0, dpr, 0, 0);
+      const g = gizmo();
+      if (!g) return;
+      const b = g.o.bounds;
+      if (b) {
+        const corner = Array.from({ length: 8 }, (_, i) => project([0, 1, 2].map((k) => ((i >> k) & 1 ? b.max[k] : b.min[k]))));
+        g2.strokeStyle = 'rgb(255 212 59 / 0.7)';
+        g2.lineWidth = 1;
+        g2.beginPath();
+        for (const [i, j] of BOX_EDGES)
+          if (corner[i] && corner[j]) {
+            g2.moveTo(corner[i].x, corner[i].y);
+            g2.lineTo(corner[j].x, corner[j].y);
+          }
+        g2.stroke();
+      }
+      const c = project(g.origin);
+      if (!c) return;
+      const active = gdrag ? gdrag.axis : hover;
+      const style = (a) => {
+        g2.strokeStyle = g2.fillStyle = a === active ? ACTIVE : AXIS_COLOURS[a];
+        g2.lineWidth = a === active ? 3.5 : 2.2;
+      };
+      g2.lineCap = 'round';
+      if (tool === 1) {
+        for (let a = 0; a < 3; a++) {
+          style(a);
+          g2.beginPath();
+          let pen = false;
+          for (const q of ringOf(g, a)) {
+            if (!q) pen = false;
+            else if (pen) g2.lineTo(q.x, q.y);
+            else {
+              g2.moveTo(q.x, q.y);
+              pen = true;
+            }
+          }
+          g2.stroke();
+        }
+        return;
+      }
+      for (let a = 0; a < 3; a++) {
+        const tip = tipOf(g, a);
+        if (!tip) continue;
+        style(a);
+        g2.beginPath();
+        g2.moveTo(c.x, c.y);
+        g2.lineTo(tip.x, tip.y);
+        g2.stroke();
+        const l = Math.hypot(tip.x - c.x, tip.y - c.y) || 1, ux = (tip.x - c.x) / l, uy = (tip.y - c.y) / l;
+        g2.beginPath();
+        if (tool === 0) {
+          g2.moveTo(tip.x + ux * 11, tip.y + uy * 11);
+          g2.lineTo(tip.x - uy * 5, tip.y + ux * 5);
+          g2.lineTo(tip.x + uy * 5, tip.y - ux * 5);
+          g2.closePath();
+        } else g2.rect(tip.x - 5, tip.y - 5, 10, 10);
+        g2.fill();
+      }
+      if (tool === 2) {
+        g2.fillStyle = active === UNIFORM ? ACTIVE : '#e8e8e8';
+        g2.fillRect(c.x - 6, c.y - 6, 12, 12);
+      }
+    }
+
+    function startGizmo(handle, p) {
+      const g = gizmo();
+      const d = { axis: handle, tool, o: g.o, before: g.o.state, origin: g.origin, len: g.len, startY: p.y };
+      if (tool === 0 || (tool === 2 && handle !== UNIFORM)) {
+        const { o: ro, d: rd } = rayAt(p.x, p.y);
+        const s0 = closestParamOnAxis(g.origin, AXES[handle], ro, rd);
+        if (s0 == null) return false;
+        // A scale drag measures against the grab point, kept off the origin so the factor can't blow up.
+        d.s0 = tool === 2 && Math.abs(s0) < g.len * 0.1 ? (s0 < 0 ? -1 : 1) * g.len * 0.1 : s0;
+      } else if (tool === 1) {
+        const c = project(g.origin);
+        if (!c) return false;
+        Object.assign(d, { c, prev: screenAngle(c, p), acc: 0, sign: 1 });
+        // Which way a positive turn about the axis goes on screen, at the ring point nearest the pointer
+        // (RotationScreenSign).
+        let near = null, nearD = Infinity;
+        for (let i = 0; i < RING; i++) {
+          const w = ringPoint(g.origin, handle, g.len, (i / RING) * 2 * Math.PI), q = project(w);
+          const dq = q ? Math.hypot(q.x - p.x, q.y - p.y) : Infinity;
+          if (dq < nearD) [near, nearD] = [{ w, q }, dq];
+        }
+        const turned = near && project(turnAbout(near.w, g.origin, handle, 2));
+        if (turned) d.sign = screenTurnSign(c, near.q, turned);
+      }
+      gdrag = d;
+      edit.history.breakMerge();
+      overlayDirty = true;
+      return true;
+    }
+
+    function moveGizmo(p, e) {
+      const d = gdrag, st = d.before, snap = e.ctrlKey || e.metaKey;
+      let next;
+      if (d.tool === 0) {
+        const { o: ro, d: rd } = rayAt(p.x, p.y);
+        const s = closestParamOnAxis(d.origin, AXES[d.axis], ro, rd);
+        if (s == null) return;
+        const lim = Math.max(1, sceneRadius * 4);
+        let delta = Math.max(-lim, Math.min(lim, s - d.s0));
+        if (snap) delta = Math.round(delta / nudgeStep) * nudgeStep;
+        next = withState(st, { t: st.t.map((x, k) => (k === d.axis ? x + delta : x)) });
+      } else if (d.tool === 1) {
+        const a = screenAngle(d.c, p);
+        let da = a - d.prev;
+        while (da > Math.PI) da -= 2 * Math.PI;
+        while (da < -Math.PI) da += 2 * Math.PI;
+        d.prev = a;
+        d.acc += da;
+        let deg = ((d.acc * 180) / Math.PI) * d.sign;
+        if (snap) deg = Math.round(deg / 15) * 15;
+        next = withState(st, { r: st.r.map((x, k) => (k === d.axis ? wrapDegrees(x + deg) : x)) });
+      } else {
+        let f;
+        if (d.axis === UNIFORM) f = Math.pow(2, (d.startY - p.y) / 120);
+        else {
+          const { o: ro, d: rd } = rayAt(p.x, p.y);
+          const s = closestParamOnAxis(d.origin, AXES[d.axis], ro, rd);
+          if (s == null) return;
+          f = Math.max(0.02, Math.min(50, s / d.s0));
+        }
+        if (snap) f = Math.max(0.1, Math.round(f * 10) / 10);
+        const all = d.axis === UNIFORM || (uniformBox.checked && !e.shiftKey);
+        next = withState(st, { s: st.s.map((x, k) => (all || k === d.axis ? x * f : x)) });
+      }
+      apply(d.o, next);
+      syncPanel();
+    }
+
+    function endGizmo() {
+      const d = gdrag;
+      gdrag = null;
+      edit.history.push([{ obj: d.o, before: d.before, after: d.o.state }], ['Move', 'Rotate', 'Scale'][d.tool]);
+      edit.history.breakMerge();
+      edited();
+    }
+
+    function cancelDrag() {
+      const d = gdrag;
+      gdrag = null;
+      apply(d.o, d.before);
+      syncPanel();
+    }
+
+    // ----- placement edits -----
+    /** Places an object and sends its vertices to the GPU. */
+    function apply(o, st) {
+      o.state = st;
+      writeObject(o);
+      const g = gpu.get(o.mesh), a = o.firstVertex * 3, z = (o.firstVertex + o.vertexCount) * 3;
+      gl.bindBuffer(gl.ARRAY_BUFFER, g.pos);
+      gl.bufferSubData(gl.ARRAY_BUFFER, a * 4, o.mesh.positions.subarray(a, z));
+      if (g.nrm) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, g.nrm);
+        gl.bufferSubData(gl.ARRAY_BUFFER, a * 4, o.mesh.normals.subarray(a, z));
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      dirty = true;
+    }
+    /** Changes objects' placements as one undo step (merged with the last when mergeKey matches). */
+    function change(list, fn, label, mergeKey = null) {
+      const changes = [];
+      for (const o of list) {
+        const before = o.state, after = fn(before, o);
+        if (!after || sameState(before, after)) continue;
+        apply(o, after);
+        changes.push({ obj: o, before, after });
+      }
+      if (!changes.length) return;
+      edit.history.push(changes, label, mergeKey);
+      edited();
+    }
+    function edited() {
+      saveSoon();
+      syncPanel();
+      dirty = true;
+    }
+    function undo() {
+      const step = edit.history.undo.pop();
+      if (!step) return;
+      for (const c of [...step.changes].reverse()) apply(c.obj, c.before);
+      edit.history.redo.push(step);
+      edit.history.breakMerge();
+      edited();
+      status.textContent = `Undid: ${step.label}`;
+    }
+    function redo() {
+      const step = edit.history.redo.pop();
+      if (!step) return;
+      for (const c of step.changes) apply(c.obj, c.after);
+      edit.history.undo.push(step);
+      edit.history.breakMerge();
+      edited();
+      status.textContent = `Redid: ${step.label}`;
+    }
+
+    /** Keyboard placement of the selection (HandlePlacementKey); true when the key was used. */
+    function placementKey(e, k) {
+      const o = selected();
+      if (!o) return false;
+      const ctrl = e.ctrlKey || e.metaKey, coarse = e.shiftKey;
+      const MOVE = { arrowleft: [0, -1], arrowright: [0, 1], arrowup: [2, -1], arrowdown: [2, 1], pageup: [1, 1], pagedown: [1, -1] };
+      const TURN = { arrowleft: [1, -1], arrowright: [1, 1], arrowup: [0, 1], arrowdown: [0, -1], pageup: [2, 1], pagedown: [2, -1] };
+      if (MOVE[k]) {
+        if (ctrl) {
+          const [axis, sign] = TURN[k];
+          change([o], (st) => withState(st, { r: st.r.map((x, i) => (i === axis ? wrapDegrees(x + sign * (coarse ? 45 : 5)) : x)) }), 'Rotate', 'key-rotate');
+        } else {
+          const [axis, sign] = MOVE[k];
+          change([o], (st) => withState(st, { t: st.t.map((x, i) => (i === axis ? x + sign * nudgeStep * (coarse ? 5 : 1) : x)) }), 'Move', 'key-move');
+        }
+        return true;
+      }
+      if (ctrl) return false;
+      const up = [']', '}', '+', '='].includes(k), down = ['[', '{', '-', '_'].includes(k);
+      if (up || down) {
+        const f = coarse ? 1.25 : 1.05;
+        change([o], (st) => withState(st, { s: st.s.map((x) => (up ? x * f : x / f)) }), 'Scale', 'key-scale');
+        return true;
+      }
+      if (k === 'home') change([o], (st) => ({ ...IDENTITY, hidden: st.hidden, solid: st.solid }), 'Reset');
+      else if (k === 'delete') change([o], (st) => ({ ...st, hidden: !st.hidden }), o.state.hidden ? 'Show' : 'Hide');
+      else if (k === 'k') change([o], (st) => ({ ...st, solid: !st.solid }), 'Solid');
+      else return false;
+      return true;
+    }
+
+    function setTool(t) {
+      tool = t;
+      hover = -1;
+      overlayDirty = true;
+      toolBtns.forEach((b, i) => b.setAttribute('aria-pressed', String(i === t)));
+    }
+
+    // ----- placement panel -----
+    const fmtNum = (x) => String(Math.round(x * 1000) / 1000);
+    const uniformBox = el('input', { type: 'checkbox' });
+    const toolBtns = ['Move', 'Rotate', 'Scale'].map((label, i) => button(label, () => setTool(i), { 'aria-pressed': String(i === tool), title: `${label} tool (${i + 1})` }));
+    const undoBtn = button('Undo', undo, { title: 'Undo (Ctrl+Z)' });
+    const redoBtn = button('Redo', redo, { title: 'Redo (Ctrl+Y)' });
+    const countLine = el('p', { class: 'muted stage-count' });
+    const fileRow = el(
+      'div',
+      { class: 'toolbar stage-file' },
+      button('Save edits…', saveFile, { title: 'Download the edits as a HappyTool stage edits file, the same JSON the desktop app keeps in stage_edits' }),
+      button('Load edits…', loadFile, { title: 'Apply a stage edits file saved here or by the desktop HappyTool' }),
+      button('Clear all', clearAll, { title: 'Put every edited object back where the stage file has it' }),
+    );
+    let fields = null;
+
+    function renderPanel() {
+      const o = selected();
+      if (!o) {
+        fields = null;
+        placeBox.replaceChildren(
+          el('p', { class: 'muted' }, 'Click an object on the map to move, rotate, scale or hide it.'),
+          el('div', { class: 'toolbar' }, undoBtn, redoBtn),
+          countLine,
+          fileRow,
+        );
+        return syncPanel();
+      }
+      const num = (g, k, title) => {
+        const input = el('input', { type: 'number', class: 'input input-sm', step: 'any', title, 'aria-label': title });
+        input.addEventListener('change', () => {
+          const v = input.value === '' ? NaN : Number(input.value);
+          if (Number.isFinite(v)) change([o], (st) => withState(st, { [g]: st[g].map((x, i) => (i === k ? (g === 'r' ? wrapDegrees(v) : v) : x)) }), title);
+          syncPanel(true);
+        });
+        return input;
+      };
+      const check = (label, key, title) => {
+        const box = el('input', { type: 'checkbox' });
+        box.addEventListener('change', () => change([o], (st) => ({ ...st, [key]: box.checked }), label));
+        return [box, el('label', { class: 'check', title }, box, ` ${label}`)];
+      };
+      const [hiddenBox, hiddenLabel] = check('Hidden', 'hidden', 'Hide the object (Delete); the desktop app writes it as Deleted');
+      const [solidBox, solidLabel] = check('Solid', 'solid', 'Mark the object as blocking the player (K)');
+      fields = {
+        t: [0, 1, 2].map((k) => num('t', k, `Offset ${'XYZ'[k]}`)),
+        r: [0, 1, 2].map((k) => num('r', k, `Rotate ${'XYZ'[k]} (degrees)`)),
+        s: [0, 1, 2].map((k) => num('s', k, `Scale ${'XYZ'[k]}`)),
+        hidden: hiddenBox,
+        solid: solidBox,
+      };
+      const head = (t) => el('span', { class: 'stage-xyz-head' }, t);
+      placeBox.replaceChildren(
+        el('div', { class: 'stage-place-name', title: o.name }, shortObjectName(o.name)),
+        el(
+          'p',
+          { class: 'muted stage-place-info' },
+          `${o.vertexCount.toLocaleString()} vertices · ${Math.round(o.indexCount / 3).toLocaleString()} triangles · pivot ${o.pivot.map((x) => x.toFixed(1)).join(', ')}`,
+        ),
+        el('div', { class: 'toolbar stage-tools' }, toolBtns),
+        el('div', { class: 'stage-xyz' }, el('span'), head('X'), head('Y'), head('Z'), head('Offset'), fields.t, head('Rotate°'), fields.r, head('Scale'), fields.s),
+        el('div', { class: 'stage-checks' }, el('label', { class: 'check', title: 'Scale handles scale all three axes (hold Shift for one)' }, uniformBox, ' Uniform'), hiddenLabel, solidLabel),
+        el('div', { class: 'toolbar' }, button('Reset', () => placementKey({}, 'home'), { title: 'Undo every move, turn and scale of this object (Home)' }), undoBtn, redoBtn),
+        countLine,
+        fileRow,
+      );
+      syncPanel();
+    }
+    /** Shows the selection's current placement and the edit count; force also rewrites the focused field. */
+    function syncPanel(force = false) {
+      const n = edit.objects.reduce((s, o) => s + (isEmpty(o.state) ? 0 : 1), 0);
+      countLine.textContent = n ? `${n} object${n === 1 ? '' : 's'} edited · kept in this browser` : 'No edits yet.';
+      undoBtn.disabled = !edit.history.undo.length;
+      redoBtn.disabled = !edit.history.redo.length;
+      const o = selected();
+      if (!fields || !o) return;
+      for (const g of ['t', 'r', 's'])
+        fields[g].forEach((input, k) => {
+          if (force || document.activeElement !== input) input.value = fmtNum(o.state[g][k]);
+        });
+      fields.hidden.checked = o.state.hidden;
+      fields.solid.checked = o.state.solid;
+    }
+
+    function saveFile() {
+      const file = editsFile(edit.stage, edit.objects);
+      if (!Object.keys(file.Objects).length) return toast('There are no edits to save yet.');
+      downloadBlob(new Blob([JSON.stringify(file, null, 2)], { type: 'application/json' }), `${edit.stage}.json`);
+    }
+    async function loadFile() {
+      const [f] = await pickFiles({ accept: '.json,application/json' });
+      if (!f) return;
+      let res;
+      try {
+        res = readEditsFile(JSON.parse((await f.text()).replace(/^﻿/, '')), edit.objects);
+      } catch (e) {
+        return toast(`${f.name} could not be read: ${e.message}`, 'error');
+      }
+      const changes = [];
+      for (const c of res.changed) {
+        c.obj.pivot = c.pivot;
+        apply(c.obj, c.after);
+        changes.push({ obj: c.obj, before: c.before, after: c.after });
+      }
+      edit.history.push(changes, 'Load edits file');
+      edit.history.breakMerge();
+      edited();
+      renderPanel();
+      const missed = res.unmatched.length ? `; ${res.unmatched.length} not on this stage` : '';
+      toast(`${f.name}: ${changes.length} object${changes.length === 1 ? '' : 's'} placed${missed}.`);
+      if (res.unmatched.length) console.info('Map editor: names in the edits file not on this stage:', res.unmatched);
+    }
+    async function clearAll() {
+      const list = edit.objects.filter((o) => !isEmpty(o.state));
+      if (!list.length) return toast('There are no edits to clear.');
+      if (!(await confirmBox(`Put all ${list.length} edited objects back where the stage file has them? Undo can bring the edits back.`, 'Clear all', true))) return;
+      change(list, () => IDENTITY, 'Clear all edits');
+    }
+
+    let stopped = false;
+    function frame(now) {
+      if (stopped) return;
+      if (!canvas.isConnected) return stop();
+      const dt = Math.min(0.1, (now - last) / 1000);
+      last = now;
+      if (fly(dt)) dirty = true;
+      if (dirty) {
+        dirty = false;
+        draw();
+      }
+      if (overlayDirty) drawOverlay();
+      requestAnimationFrame(frame);
+    }
+    function stop() {
+      stopped = true;
+      resize.disconnect();
+      store(edit.stage, edit.objects);
+      gl.getExtension('WEBGL_lose_context')?.loseContext();
+    }
+    const resize = new ResizeObserver(() => (dirty = true));
+    resize.observe(host);
+    requestAnimationFrame(frame);
 
     function fly(dt) {
       if (!keys.size) return false;
@@ -500,28 +1012,6 @@ export function renderStage(node, ctx) {
       cam.target = cam.target.map((x, k) => x + mv[k] * speed);
       return true;
     }
-
-    let stopped = false;
-    function frame(now) {
-      if (stopped) return;
-      if (!canvas.isConnected) return stop();
-      const dt = Math.min(0.1, (now - last) / 1000);
-      last = now;
-      if (fly(dt)) dirty = true;
-      if (dirty) {
-        dirty = false;
-        draw();
-      }
-      requestAnimationFrame(frame);
-    }
-    function stop() {
-      stopped = true;
-      resize.disconnect();
-      gl.getExtension('WEBGL_lose_context')?.loseContext();
-    }
-    const resize = new ResizeObserver(() => (dirty = true));
-    resize.observe(host);
-    requestAnimationFrame(frame);
 
     // ----- layers -----
     function renderLayers() {
@@ -553,27 +1043,51 @@ export function renderStage(node, ctx) {
     }
     renderLayers();
 
-    // ----- inspect -----
+    // ----- selection and inspect -----
     const fmt = (v) => v.map((x) => x.toFixed(2)).join(', ');
+    /** Selects what a click hit (null clears the selection). */
     function inspect(hit) {
-      if (!hit) {
-        selection = null;
-        inspectBox.replaceChildren(el('p', { class: 'muted' }, 'Nothing there. Click the map to inspect a piece.'));
-        dirty = true;
+      if (!hit) return select(null);
+      const ob = hit.object, m = hit.mesh;
+      selection = ob ? { mesh: m, first: ob.firstIndex, count: ob.indexCount, object: ob, hit } : { mesh: m, first: 0, count: m.indices.length, object: null, hit };
+      selectionChanged();
+    }
+    function select(o) {
+      selection = o ? { mesh: o.mesh, first: o.firstIndex, count: o.indexCount, object: o, hit: null } : null;
+      selectionChanged();
+    }
+    function selectionChanged() {
+      if (gdrag) cancelDrag();
+      edit.history.breakMerge();
+      hover = -1;
+      canvas.style.cursor = '';
+      renderInspect();
+      renderPanel();
+      dirty = true;
+    }
+    function cycle(dir) {
+      const list = edit.objects.filter((o) => o.mesh.visible);
+      if (!list.length) return;
+      const i = list.indexOf(selected());
+      select(list[i < 0 ? (dir > 0 ? 0 : list.length - 1) : (i + dir + list.length) % list.length]);
+    }
+    function renderInspect() {
+      if (!selection) {
+        inspectBox.replaceChildren(el('p', { class: 'muted' }, 'Click the map to select an object.'));
         return;
       }
-      const m = hit.mesh, ob = hit.object, b = hit.batch;
-      selection = ob ? { mesh: m, first: ob.firstIndex, count: ob.indexCount, object: ob } : { mesh: m, first: 0, count: m.indices.length };
+      const { mesh: m, object: ob, hit, first, count } = selection;
+      const b = hit?.batch || m.batches.find((x) => x.firstIndex + x.indexCount > first && x.firstIndex < first + count);
       const texName = (n) => (n ? (scene.textures.has(lower(n)) ? n : `${n} (not in this bundle)`) : '—');
       const rows = [
-        ['Object', ob ? shortName(ob.name) : shortName(m.name)],
+        ['Object', ob ? shortObjectName(ob.name) : shortName(m.name)],
         ob?.label ? ['Node', ob.label] : null,
         ['File', m.name.split('/')[0]],
         ['Layer', GROUPS.find(([k]) => k === m.kind)?.[1] || m.kind],
         ['Texture', texName(b?.texture)],
         ['Lightmap', texName(b?.lightmap)],
-        ['Triangles', Math.round((ob ? ob.indexCount : m.indices.length) / 3).toLocaleString()],
-        ['Point', fmt(hit.point)],
+        ['Triangles', Math.round(count / 3).toLocaleString()],
+        hit ? ['Point', fmt(hit.point)] : null,
         ob?.recordOffset != null ? ['Record', `0x${ob.recordOffset.toString(16).toUpperCase()}`] : null,
       ].filter(Boolean);
       inspectBox.replaceChildren(
@@ -581,23 +1095,26 @@ export function renderStage(node, ctx) {
         el(
           'div',
           { class: 'toolbar' },
-          button('Frame', frameSelection, { title: 'Move the camera to this piece (F)' }),
+          button('Frame', frameSelection, { title: 'Move the camera to this object (F)' }),
           button('Hide layer', () => {
             m.visible = false;
-            inspect(null);
+            select(null);
             renderLayers();
           }),
         ),
       );
-      dirty = true;
     }
     function frameSelection() {
       let b = scene.bounds;
-      if (selection?.object) b = boundsOf(selection.mesh.positions, selection.object.firstVertex, selection.object.vertexCount);
-      else if (selection) b = selection.mesh.bounds;
+      const o = selected();
+      if (o) {
+        const at = o.pivot.map((x, k) => x + o.state.t[k]);
+        b = o.bounds || { min: at, max: at };
+      } else if (selection) b = selection.mesh.bounds;
       Object.assign(cam, framed(b, cam));
       dirty = true;
     }
+    renderPanel();
 
     // ----- input -----
     const rayAt = (x, y) => {
@@ -606,15 +1123,32 @@ export function renderStage(node, ctx) {
       const { f, r, u, eye } = basis();
       return { o: eye, d: norm3([0, 1, 2].map((k) => f[k] + r[k] * nx * t * (w / h) + u[k] * ny * t)) };
     };
+    const local = (e) => {
+      const rect = canvas.getBoundingClientRect();
+      return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    };
     let drag = null;
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     canvas.addEventListener('pointerdown', (e) => {
       canvas.focus();
       canvas.setPointerCapture(e.pointerId);
+      if (e.button === 0 && !gdrag) {
+        const p = local(e), handle = gizmoHit(p);
+        if (handle >= 0 && startGizmo(handle, p)) return;
+      }
       drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, pan: e.button !== 0 || e.shiftKey, moved: false };
     });
     canvas.addEventListener('pointermove', (e) => {
-      if (!drag) return;
+      if (gdrag) return moveGizmo(local(e), e);
+      if (!drag) {
+        const h = gizmoHit(local(e));
+        if (h !== hover) {
+          hover = h;
+          overlayDirty = true;
+          canvas.style.cursor = h >= 0 ? 'pointer' : '';
+        }
+        return;
+      }
       const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
       drag.x = e.clientX;
       drag.y = e.clientY;
@@ -630,16 +1164,21 @@ export function renderStage(node, ctx) {
       dirty = true;
     });
     canvas.addEventListener('pointerup', (e) => {
+      if (gdrag) return endGizmo();
       const d = drag;
       drag = null;
       if (!d || d.moved || e.button !== 0) return;
-      const rect = canvas.getBoundingClientRect();
-      const { o, d: dir } = rayAt(e.clientX - rect.left, e.clientY - rect.top);
+      const p = local(e);
+      const { o, d: dir } = rayAt(p.x, p.y);
       inspect(pick(scene, o, dir));
     });
+    canvas.addEventListener('pointercancel', () => {
+      if (gdrag) cancelDrag();
+      drag = null;
+    });
     canvas.addEventListener('dblclick', (e) => {
-      const rect = canvas.getBoundingClientRect();
-      const { o, d } = rayAt(e.clientX - rect.left, e.clientY - rect.top);
+      const p = local(e);
+      const { o, d } = rayAt(p.x, p.y);
       const hit = pick(scene, o, d);
       if (!hit) return;
       const f = norm3(hit.point.map((x, k) => x - o[k]));
@@ -661,7 +1200,23 @@ export function renderStage(node, ctx) {
     );
     canvas.addEventListener('keydown', (e) => {
       const k = e.key.toLowerCase();
-      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const ctrl = e.ctrlKey || e.metaKey;
+      if (ctrl && !e.altKey && (k === 'z' || k === 'y')) {
+        e.preventDefault();
+        if (k === 'y' || e.shiftKey) redo();
+        else undo();
+        return;
+      }
+      if (k === 'escape') return gdrag ? cancelDrag() : select(null);
+      // Tab cycles the selection once there is one; with nothing selected it moves focus as usual.
+      if (k === 'tab' && selected() && !ctrl && !e.altKey) {
+        e.preventDefault();
+        return cycle(e.shiftKey ? -1 : 1);
+      }
+      if (e.altKey) return;
+      if (!ctrl && (k === '1' || k === '2' || k === '3')) return setTool(Number(k) - 1);
+      if (!gdrag && placementKey(e, k)) return e.preventDefault();
+      if (ctrl) return;
       if (['w', 'a', 's', 'd', 'q', 'e', 'shift', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) {
         keys.add(k);
         e.preventDefault();
@@ -669,9 +1224,12 @@ export function renderStage(node, ctx) {
       else if (k === 'r' || k === 'home') {
         Object.assign(cam, framed(scene.bounds, { yaw: 0.6, pitch: -0.55 }));
         dirty = true;
-      } else if (k === 'escape') inspect(null);
+      }
     });
-    canvas.addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
+    canvas.addEventListener('keyup', (e) => {
+      keys.delete(e.key.toLowerCase());
+      edit.history.breakMerge(); // a released key ends its burst of nudges
+    });
     canvas.addEventListener('blur', () => keys.clear());
     resetBtn.addEventListener('click', () => {
       Object.assign(cam, framed(scene.bounds, { yaw: 0.6, pitch: -0.55 }));
