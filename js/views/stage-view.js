@@ -34,6 +34,7 @@ import {
 } from './stage-fog.js';
 import { readCollision, edgesOf } from './stage-collision.js';
 import { readNav, navLines } from '../formats/stage-nav.js';
+import { rebuildNav, Blocker, nodeRefKey, navSummary, navChanged, pathChanged } from '../formats/stage-nav-edit.js';
 import {
   COLNAV_KEY, CN_SHAPES, CN_SIZES, CN_MIN_BRUSH, CN_MAX_BRUSH, readColNav, cloneColNav, colNavFeature, removedFlags,
   setRemovedFlags, volumeTriangles, rayLayer, rayTris, eraseAt,
@@ -1079,6 +1080,8 @@ export function renderStage(node, ctx) {
         const own = (m.objTris[o.index]?.length ?? 0) / 9;
         lines.push(own ? `Collision: ${own.toLocaleString()} triangle${own === 1 ? '' : 's'} — moves with it` : `No collision of its own${st.solid ? '' : ' — tick Solid (K) to add'}`);
       }
+      const nav = navSummaryLine(o.index);
+      if (nav) lines.push(nav);
       return lines.join('\n');
     }
     function renderColInfo() {
@@ -1190,10 +1193,15 @@ export function renderStage(node, ctx) {
       stopped = true;
       resize.disconnect();
       store(edit.stage, edit.objects, edit.sky, fogFeatures(edit));
-      if (edit.colMatch?.worker) {
-        edit.colMatch.worker.terminate();
-        edit.colMatch = null;
-      } else if (edit.colMatch) edit.colMatch.onChange = null;
+      if (edit.navMatch && !edit.navMatch.done) {
+        // Unfinished (the worker running, or the nav still being read): the next view starts it again.
+        edit.navMatch.worker?.terminate();
+        edit.navMatch.done = true;
+        edit.colMatch = edit.navMatch = null;
+      } else {
+        if (edit.colMatch) edit.colMatch.onChange = null;
+        if (edit.navMatch) edit.navMatch.onChange = null;
+      }
       gl.getExtension('WEBGL_lose_context')?.loseContext();
     }
     const resize = new ResizeObserver(() => (dirty = true));
@@ -1970,12 +1978,16 @@ export function renderStage(node, ctx) {
       fillObjTris(col, m);
       console.info(`Map editor: live collision: ${owned} of ${total} triangles matched to ${m.ownerList.length} objects in ${m.ms} ms`);
     }
-    /** Matches the collision to the objects in a worker, once per stage (StartOwnerMatching); kept while the page lives. */
+    /**
+     * Matches the collision triangles, nav cells and waypoints to the objects in a worker, once per stage
+     * (StartOwnerMatching; the nav is read first); kept while the page lives. edit.colMatch only when the collision is
+     * live, edit.navMatch always.
+     */
     function startMatching(col) {
-      if (!col.live) return;
-      let m = edit.colMatch;
-      if (!m) {
-        m = edit.colMatch = { pct: 0, owners: null, objTris: null, ownerList: null, owned: 0, total: 0, ms: 0, error: null, worker: null, onChange: null };
+      let m = edit.colMatch, nm = edit.navMatch;
+      if (!nm) {
+        if (col.live) m = edit.colMatch = { pct: 0, owners: null, objTris: null, ownerList: null, owned: 0, total: 0, ms: 0, error: null, worker: null, onChange: null };
+        nm = edit.navMatch = { done: false, cellOwner: null, nodeOwner: null, worker: null, onChange: null };
         const meshes = [], at = new Map(), objects = new Int32Array(edit.objects.length), triangles = [];
         edit.objects.forEach((o, i) => {
           if (!at.has(o.mesh)) {
@@ -1985,35 +1997,67 @@ export function renderStage(node, ctx) {
           objects[i] = at.get(o.mesh);
           triangles.push(o.triangles);
         });
-        const layers = col.layers.map((l) => ({
+        const layers = !col.live ? [] : col.layers.map((l) => ({
           groups: l.groups.map((g) => ({ vertices: g.vertices, triangles: g.triangles, minX: g.minX, minY: g.minY, minZ: g.minZ, maxX: g.maxX, maxY: g.maxY, maxZ: g.maxZ })),
         }));
         const fail = (msg) => {
-          m.worker?.terminate();
-          m.worker = null;
-          m.error = msg;
-          console.warn(`Map editor: the collision couldn't be matched to objects: ${msg}`);
-          m.onChange?.();
+          nm.worker?.terminate();
+          nm.worker = null;
+          nm.done = true;
+          if (m) {
+            m.worker = null;
+            m.error = msg;
+          }
+          console.warn(`Map editor: the collision and nav couldn't be matched to objects: ${msg}`);
+          m?.onChange?.();
+          nm.onChange?.();
         };
-        try {
-          const w = (m.worker = new Worker(new URL('./stage-collision-worker.js', import.meta.url), { type: 'module' }));
-          w.onmessage = (ev) => {
-            const d = ev.data;
-            if (d.error) return fail(d.error);
-            if (d.owners) {
-              w.terminate();
-              m.worker = null;
-              m.ms = d.ms;
-              buildObjTris(col, m, d.owners);
-            } else m.pct = d.pct;
-            m.onChange?.();
-          };
-          w.onerror = (e) => fail(e.message || 'the worker stopped');
-          w.postMessage({ layers, meshes, objects, triangles });
-        } catch (e) {
-          fail(e.message);
-        }
+        (job.nav || (job.nav = readNav(model))).catch(() => null).then((r) => {
+          if (nm.done) return; // the view closed meanwhile
+          const navCells = r?.nav ? r.nav.cells.map((c) => Array.from(c.v)) : null;
+          const navNodes = r?.path ? Float32Array.from(r.path.nodes.flatMap((n) => [n.x, n.y, n.z])) : null;
+          if (!m && !navCells && !navNodes) return void (nm.done = true);
+          try {
+            const w = (nm.worker = new Worker(new URL('./stage-collision-worker.js', import.meta.url), { type: 'module' }));
+            if (m) m.worker = w;
+            w.onmessage = (ev) => {
+              const d = ev.data;
+              if (d.error) return fail(d.error);
+              if (d.owners) {
+                w.terminate();
+                nm.worker = null;
+                if (m) {
+                  m.worker = null;
+                  m.ms = d.ms;
+                  buildObjTris(col, m, d.owners);
+                }
+                Object.assign(nm, { done: true, cellOwner: d.cellOwner, nodeOwner: d.nodeOwner });
+                if (d.cellOwner || d.nodeOwner) {
+                  const owned = (a) => (a ? a.reduce((s, o) => s + (o >= 0 ? 1 : 0), 0) : 0);
+                  console.info(
+                    `Map editor: live nav: ${owned(d.cellOwner)} of ${d.cellOwner?.length ?? 0} cells and ` +
+                      `${owned(d.nodeOwner)} of ${d.nodeOwner?.length ?? 0} waypoints matched to objects`,
+                  );
+                }
+                nm.onChange?.();
+              } else if (m) m.pct = d.pct;
+              m?.onChange?.();
+            };
+            w.onerror = (e) => fail(e.message || 'the worker stopped');
+            w.postMessage({ layers, meshes, objects, triangles, navCells, navNodes });
+          } catch (e) {
+            fail(e.message);
+          }
+        });
       }
+      nm.onChange = () => {
+        if (stopped) return;
+        navKey = null;
+        renderNav();
+        renderColInfo();
+        dirty = true;
+      };
+      if (!m) return;
       m.onChange = () => {
         if (stopped) return;
         staticKey = null;
@@ -2072,6 +2116,7 @@ export function renderStage(node, ctx) {
         if (stopped) return;
         colRead = edit.colRead = { layers: [], unread: [], live: false };
         console.warn(`Map editor: the collision of ${edit.stage} could not be read: ${e.message}`);
+        startMatching(colRead);
         renderCollision();
         renderColInfo();
         renderColNav();
@@ -2080,19 +2125,27 @@ export function renderStage(node, ctx) {
     renderCollision();
 
     // ----- nav mesh and waypoints (StageViewerForm.Nav.cs DrawLiveNav; key P) -----
-    // Colours as on the desktop: nav cells cyan and depth-tested; drops, waypoint links and waypoints on top.
-    const NAV_CELL = [0.15, 0.85, 1], NAV_DROP = [1, 0.3, 0.9], NAV_LINK = [1, 0.75, 0.3], NAV_NODE = [1, 0.55, 0.1];
+    // Colours as on the desktop: nav cells cyan and depth-tested, the ones that moved pale blue; drops, waypoint links
+    // and waypoints on top, the waypoints that moved yellow.
+    const NAV_CELL = [0.15, 0.85, 1], NAV_CELL_MOVED = [0.75, 0.95, 1], NAV_DROP = [1, 0.3, 0.9], NAV_LINK = [1, 0.75, 0.3];
+    const NAV_NODE = [1, 0.55, 0.1], NAV_NODE_MOVED = [1, 0.95, 0.2];
     const navGpu = { vao: null, buf: null, parts: [], drops: 0 }; // parts: {first, count, colour, depth}
     let navRead = null; // {nav, navName, path, pathName, unread} once read
+    // The live nav (EnsureNavRebuilt): rebuilt from the stage's when what it follows changes, at most every 120 ms.
+    let navKey = null, navLive = null, navAt = 0, navTimer = 0, navWinding = 0;
+    const navWorlds = [], navBlockers = [], navBefore = []; // per object, cached by its state and collision
     navBox.checked = !!job.showNav;
-    /** Uploads the nav cells, drop links, waypoint links and waypoint rings as one line list. */
-    function uploadNav(r) {
-      const l = navLines(r.nav, r.path);
+    /** Uploads the nav cells, drop links, waypoint links and waypoint rings as one line list (UploadLiveNav). */
+    function uploadNav(nav, path, cellGroup = null, nodeGroup = null) {
+      const moved = (g) => g && Array.from(g, (v) => v !== -1);
+      const l = navLines(nav, path, moved(cellGroup), moved(nodeGroup));
       const lists = [
         [l.cells, NAV_CELL, true],
+        [l.changed, NAV_CELL_MOVED, true],
         [l.drops, NAV_DROP, false],
         [l.links, NAV_LINK, false],
         [l.nodes, NAV_NODE, false],
+        [l.nodesChanged, NAV_NODE_MOVED, false],
       ];
       navGpu.drops = l.drops.length / 6;
       const data = new Float32Array(lists.reduce((s, [a]) => s + a.length, 0));
@@ -2103,6 +2156,9 @@ export function renderStage(node, ctx) {
         if (a.length) navGpu.parts.push({ first: at / 3, count: a.length / 3, colour, depth });
         at += a.length;
       }
+      if (navGpu.vao) gl.deleteVertexArray(navGpu.vao);
+      if (navGpu.buf) gl.deleteBuffer(navGpu.buf);
+      navGpu.vao = navGpu.buf = null;
       if (!navGpu.parts.length) return;
       navGpu.vao = gl.createVertexArray();
       navGpu.buf = gl.createBuffer();
@@ -2114,8 +2170,137 @@ export function renderStage(node, ctx) {
       gl.bindVertexArray(null);
       gl.bindBuffer(gl.ARRAY_BUFFER, null);
     }
+    /** An object's placement now (row-major 3×4), or null when it hasn't moved. */
+    function navWorld(i) {
+      const o = edit.objects[i];
+      if (!o) return null;
+      const c = navWorlds[i];
+      if (c && c.st === o.state) return c.w;
+      const w = isIdentityTransform(o.state) ? null : placementMatrix(o.state, o.pivot.map(Math.fround));
+      navWorlds[i] = { st: o.state, w };
+      return w;
+    }
+    /**
+     * Where a moved or Solid object now keeps bots out (NavBlocker): its own collision plus, when Solid, what it
+     * collides as, placed where it stands; `before` is where it stood. Null when it blocks nothing.
+     */
+    function navBlocker(i, m) {
+      const o = edit.objects[i], st = o.state, own = m?.objTris?.[i] ?? null;
+      if (st.hidden || !(st.solid || !isIdentityTransform(st)) || !(st.solid || own?.length)) return null;
+      const c = navBlockers[i];
+      if (c && c.st === st && c.own === own) return c.b;
+      const solid = st.solid ? solidOf(o) : null, nOwn = own?.length ?? 0;
+      const pos = new Float32Array(nOwn + (solid?.length ?? 0));
+      if (own) pos.set(own);
+      if (solid) pos.set(solid, nOwn);
+      const tris = new Int32Array(pos.length / 3);
+      for (let k = 0; k < tris.length; k++) tris[k] = k;
+      const world = navWorld(i);
+      let before = null;
+      if (world) {
+        // The desktop caches this per object only; here it follows the object's collision and Solid too.
+        const bc = navBefore[i];
+        if (bc && bc.own === own && bc.solid === !!st.solid) before = bc.b;
+        else navBefore[i] = { own, solid: !!st.solid, b: (before = Blocker.fromTriangles(i, pos, tris, null)) };
+      }
+      const b = Blocker.fromTriangles(i, pos, tris, world, before?.cell ?? 0);
+      b.before = before;
+      navBlockers[i] = { st, own, b: b.spans.size ? b : null };
+      return navBlockers[i].b;
+    }
+    /** A walkable cell on a triangle, wound like the stage's own cells (NavCellFrom). */
+    function navCellFrom(t, k) {
+      if (!navWinding) {
+        let up = 0, down = 0;
+        for (const cell of navRead?.nav?.cells ?? []) {
+          const v = cell.v, ny = Math.fround(Math.fround((v[5] - v[2]) * (v[6] - v[0])) - Math.fround((v[3] - v[0]) * (v[8] - v[2])));
+          if (ny > 0) up++;
+          else if (ny < 0) down++;
+        }
+        navWinding = down > up ? -1 : 1;
+      }
+      const ny = (t[k + 5] - t[k + 2]) * (t[k + 6] - t[k]) - (t[k + 3] - t[k]) * (t[k + 8] - t[k + 2]);
+      const v = Float32Array.from(t.subarray(k, k + 9));
+      if (ny > 0 !== navWinding > 0) v.set([t[k + 6], t[k + 7], t[k + 8], t[k + 3], t[k + 4], t[k + 5]], 3);
+      return v;
+    }
+    /** What the rebuild follows (NavInput and AddColNavInput): the objects, and the hand edits in the colnav file. */
+    function navInput(r, nm, m) {
+      const c = edit.colnav, input = {
+        nav: r.nav, path: r.path, cellOwner: nm?.cellOwner ?? null, nodeOwner: nm?.nodeOwner ?? null,
+        hidden: (i) => !!edit.objects[i]?.state.hidden, world: navWorld,
+        blockers: [], extraCells: [], eraseStamps: [], handNodes: [], removedNodes: new Set(), handLinks: [], cutLinks: new Set(),
+      };
+      for (let i = 0; i < edit.objects.length; i++) {
+        const b = navBlocker(i, m);
+        if (b) input.blockers.push(b);
+      }
+      for (const v of c.NavCells) if (Array.isArray(v) && v.length >= 9) input.extraCells.push({ v: Float32Array.from(v.slice(0, 9)), hand: true });
+      for (const s of c.NavErase) if (Array.isArray(s) && s.length >= 4) input.eraseStamps.push(s.map(Number));
+      for (const w of c.Waypoints)
+        if (w) {
+          const n = (x, d = 0) => Math.fround(Number.isFinite(+x) ? +x : d);
+          input.handNodes.push({ id: Math.trunc(+w.Id || 0), x: n(w.X), y: n(w.Y), z: n(w.Z), radius: n(w.Radius, 150) });
+        }
+      for (const i of c.RemovedWaypoints) if (Number.isInteger(i)) input.removedNodes.add(i);
+      for (const l of c.Links) if (Array.isArray(l) && l.length >= 2) input.handLinks.push([l[0], l[1]]);
+      for (const l of c.Cuts) if (Array.isArray(l) && l.length >= 2) input.cutLinks.add(nodeRefKey(l[0], l[1]));
+      // Added collision blocks bots where it stands, and its walkable tops (a floor, a ramp) are walkable.
+      c.Volumes.forEach((vol, k) => {
+        const t = volumeTriangles(vol), id = -1000 - k, idx = new Int32Array(t.length / 3);
+        for (let j = 0; j < idx.length; j++) idx[j] = j;
+        const b = Blocker.fromTriangles(id, t, idx, null);
+        if (b.spans.size) input.blockers.push(b);
+        for (let j = 0; j + 8 < t.length; j += 9) {
+          const ex = t[j + 3] - t[j], ey = t[j + 4] - t[j + 1], ez = t[j + 5] - t[j + 2];
+          const fx = t[j + 6] - t[j], fy = t[j + 7] - t[j + 1], fz = t[j + 8] - t[j + 2];
+          const nx = ey * fz - ez * fy, ny = ez * fx - ex * fz, nz = ex * fy - ey * fx, len = Math.hypot(nx, ny, nz);
+          if (len > 1 && ny / len >= 0.7071) input.extraCells.push({ v: navCellFrom(t, j), object: id });
+        }
+      });
+      return input;
+    }
+    /** Rebuilds the live nav when something it follows changed, at most every 120 ms (EnsureNavRebuilt). */
+    function syncNav() {
+      const r = navRead;
+      if (!r || (!r.nav && !r.path)) return;
+      const nm = edit.navMatch, m = edit.colMatch;
+      const key = [edit.colnav, nm?.cellOwner, nm?.nodeOwner, m?.objTris];
+      for (const o of edit.objects) key.push(o.state);
+      if (navKey && sameList(key, navKey)) return;
+      const now = performance.now();
+      if (navKey && now - navAt < 120) {
+        if (!navTimer) navTimer = setTimeout(() => ((navTimer = 0), (dirty = true)), 120 - (now - navAt));
+        return;
+      }
+      navKey = key;
+      navAt = now;
+      try {
+        const navIn = navInput(r, nm, m);
+        navLive = rebuildNav(navIn);
+        navLive.ms = performance.now() - now;
+        uploadNav(navLive.nav, navLive.path, navLive.cellGroup, navLive.nodeGroup);
+      } catch (e) {
+        navLive = null;
+        console.warn(`Map editor: live nav: rebuild failed: ${e?.message ?? e}`);
+        uploadNav(r.nav, r.path);
+      }
+      renderNav();
+    }
+    /** The selected object's nav line (NavSummaryLine): how many nav cells and waypoints move with it. */
+    function navSummaryLine(i) {
+      const nm = edit.navMatch;
+      if (!nm?.done || (!nm.cellOwner && !nm.nodeOwner)) return ''; // (owners only come with a nav read)
+      let cells = 0, nodes = 0;
+      if (nm.cellOwner) for (const o of nm.cellOwner) if (o === i) cells++;
+      if (nm.nodeOwner) for (const o of nm.nodeOwner) if (o === i) nodes++;
+      if (!cells && !nodes) return '';
+      return `Nav: ${cells.toLocaleString()} cell${cells === 1 ? '' : 's'} · ${nodes.toLocaleString()} waypoint${nodes === 1 ? '' : 's'} move with it`;
+    }
     function drawNav(vp, eye) {
-      if (!navBox.checked || !navGpu.vao) return;
+      if (!navBox.checked) return;
+      syncNav();
+      if (!navGpu.vao) return;
       gl.useProgram(lineProg.program);
       gl.uniformMatrix4fv(lineProg.u.uViewProj, false, vp);
       gl.uniform3fv(lineProg.u.uEye, eye);
@@ -2132,12 +2317,12 @@ export function renderStage(node, ctx) {
       gl.useProgram(prog.program);
     }
     function renderNav() {
-      const r = navRead, nav = r?.nav, path = r?.path;
+      const r = navRead, nav = navLive?.nav ?? r?.nav, path = navLive?.path ?? r?.path;
       const notRead = r?.unread.length ? ` Not read: ${r.unread.join(', ')}.` : '';
-      navBox.disabled = !navGpu.vao || !lineProg;
+      navBox.disabled = !(r?.nav || r?.path) || !lineProg;
       navLabel.classList.toggle('muted', navBox.disabled);
       if (!r) navLabel.title = 'Reading the nav mesh…';
-      else if (!nav && !path) navLabel.title = `No nav mesh or waypoints (navi/path .spd) in this stage.${notRead}`;
+      else if (!r.nav && !r.path) navLabel.title = `No nav mesh or waypoints (navi/path .spd) in this stage.${notRead}`;
       else if (!lineProg) navLabel.title = "This browser couldn't set up the nav lines.";
       else {
         const parts = [];
@@ -2148,9 +2333,15 @@ export function renderStage(node, ctx) {
               `${path.regions.length.toLocaleString()} regions (${r.pathName})`,
           );
         }
+        const nm = edit.navMatch;
+        let live = '';
+        if (nm && !nm.done) live = ' Matching it to the objects…';
+        else if (navKey && !navLive) live = " The rebuild failed, so this is the stage's as it was.";
+        else if (navLive && (navChanged(navLive) || pathChanged(navLive))) live = ` ${navSummary(navLive)}`;
         navLabel.title =
           `Show where the bots walk (P): ${parts.join('; ')}. Cyan: nav cells; magenta: one-way drops; ` +
-          `orange: waypoints and their links. View-only for now: it doesn't follow moved objects yet.${notRead}`;
+          'orange: waypoints and their links. It follows moved, hidden and Solid objects and the collision edits: ' +
+          `pale blue cells and yellow waypoints have moved.${live}${notRead}`;
       }
     }
     function showNav() {
@@ -2167,7 +2358,8 @@ export function renderStage(node, ctx) {
       (r) => {
         if (stopped) return;
         navRead = r;
-        if (lineProg) uploadNav(r);
+        navKey = null;
+        if (lineProg) uploadNav(r.nav, r.path);
         renderNav();
         dirty = true;
       },

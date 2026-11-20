@@ -275,6 +275,36 @@ function triangleOwner(g, t, cands) {
 }
 
 /**
+ * The object a free-standing triangle (a nav cell's 9 corner values) lies on, by the surface rule alone; -1 when
+ * nothing is close enough (OwnerOfTriangle).
+ */
+export function navCellOwner(v, shapes) {
+  const x0 = Math.min(v[0], v[3], v[6]), x1 = Math.max(v[0], v[3], v[6]);
+  const y0 = Math.min(v[1], v[4], v[7]), y1 = Math.max(v[1], v[4], v[7]);
+  const z0 = Math.min(v[2], v[5], v[8]), z1 = Math.max(v[2], v[5], v[8]);
+  const cands = [];
+  for (const s of shapes) if (s && ensureBounds(s) && overlaps(x0, y0, z0, x1, y1, z1, s, 200.0)) cands.push(s);
+  if (!cands.length) return -1;
+  const owner = surfaceOwner(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], cands);
+  return owner ? owner.index : -1;
+}
+
+/** The object whose surface is nearest a point (a waypoint), closer than tol; -1 when none. Ties go to the earlier shape (OwnerOfPoint). */
+export function pointOwner(x, y, z, shapes, tol) {
+  let best = tol, owner = -1;
+  for (const s of shapes) {
+    if (!s || !ensureBounds(s) || boxDistance(s, x, y, z) >= best) continue;
+    if (!s.grid) s.grid = new TriangleGrid(s);
+    const d = s.grid.distance(x, y, z, best);
+    if (d < best) {
+      best = d;
+      owner = s.index;
+    }
+  }
+  return owner;
+}
+
+/**
  * The owning shape index of every triangle of a group ({vertices, triangles, minX…maxZ}), -1 where no object is close
  * enough (GroupOwners). Shapes must have index set to their list position.
  */
