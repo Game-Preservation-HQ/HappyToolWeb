@@ -195,7 +195,12 @@ export class History {
     changes = changes.filter((c) => !sameState(c.before, c.after));
     if (!changes.length && !action) return;
     if (action) {
-      this.undo.push({ changes, label, mergeKey: null, action });
+      // A step that only runs an action merges into the previous one of the same kind when that action can take it
+      // (merge returns true; drop() true when the two cancel out).
+      const top = this.undo.at(-1);
+      if (mergeKey && top?.mergeKey === mergeKey && !changes.length && !top.changes.length && top.action?.merge?.(action)) {
+        if (top.action.drop?.()) this.undo.pop();
+      } else this.undo.push({ changes, label, mergeKey, action });
       this.redo.length = 0;
       return;
     }
@@ -221,7 +226,7 @@ export const stageKey = (name) => name.replace(/\\/g, '/').split('/').pop().repl
  * The edits in the desktop sidecar's shape: {Version, Stage, Objects: {index: {Name, Translate, Rotate?, Scale?, Pivot?,
  * Deleted, Solid?}}, Sky?}; a sky makes it version 5, as the desktop writes it.
  */
-export function editsFile(stage, objects, sky = null) {
+export function editsFile(stage, objects, sky = null, features = null) {
   const Objects = {};
   let solid = false;
   for (const o of objects) {
@@ -235,8 +240,10 @@ export function editsFile(stage, objects, sky = null) {
     if (st.solid) e.Solid = solid = true;
     Objects[o.index] = e;
   }
-  const file = { Version: sky ? 5 : solid ? 4 : 2, Stage: stage, Objects };
+  const hasFeatures = !!features && Object.keys(features).length > 0;
+  const file = { Version: hasFeatures ? 6 : sky ? 5 : solid ? 4 : 2, Stage: stage, Objects };
   if (sky) file.Sky = sky;
+  if (hasFeatures) file.Features = features;
   return file;
 }
 
@@ -247,7 +254,8 @@ const vec = (v, fallback) => (Array.isArray(v) && v.length === 3 && v.every(Numb
  * objects whose state changed and the names that matched nothing. Objects not in the file are left as they are.
  */
 export function readEditsFile(json, objects) {
-  if (!json || typeof json !== 'object' || ((typeof json.Objects !== 'object' || !json.Objects) && typeof json.Sky !== 'object'))
+  const isObj = (v) => !!v && typeof v === 'object';
+  if (!isObj(json) || (!isObj(json.Objects) && !isObj(json.Sky) && !isObj(json.Features)))
     throw new Error('This is not a HappyTool stage edits file.');
   const byName = new Map(objects.map((o) => [o.name.toLowerCase(), o]));
   const changed = [], unmatched = [];
@@ -262,7 +270,7 @@ export function readEditsFile(json, objects) {
     if (sameState(st, o.state) && pivot.every((x, k) => x === o.pivot[k])) continue;
     changed.push({ obj: o, before: o.state, after: st, pivot });
   }
-  return { changed, unmatched, sky: json.Sky && typeof json.Sky === 'object' ? json.Sky : null };
+  return { changed, unmatched, sky: isObj(json.Sky) ? json.Sky : null, features: isObj(json.Features) ? json.Features : {} };
 }
 
 export function loadStored(stage) {
@@ -274,11 +282,11 @@ export function loadStored(stage) {
   }
 }
 
-export function store(stage, objects, sky = null) {
-  const file = editsFile(stage, objects, sky);
+export function store(stage, objects, sky = null, features = null) {
+  const file = editsFile(stage, objects, sky, features);
   const key = STORE + stage.toLowerCase();
   try {
-    if (Object.keys(file.Objects).length || file.Sky) localStorage.setItem(key, JSON.stringify(file));
+    if (Object.keys(file.Objects).length || file.Sky || file.Features) localStorage.setItem(key, JSON.stringify(file));
     else localStorage.removeItem(key);
   } catch (e) {
     console.warn(`Map editor: edits could not be kept in this browser: ${e.message}`);

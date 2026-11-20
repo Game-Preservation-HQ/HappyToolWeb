@@ -19,6 +19,9 @@ import {
   SKY_PRESETS, cloneSky, sameSky, skyLabel, presetSky, pictureSky, textureRoles, readSkyPack, bakeSky, encodeDxt1Dds,
   storePicture, loadPicture,
 } from './stage-sky.js';
+import {
+  makeFog, sameFog, fogHex, withHex, metres, fogFromFeature, readFog, readFogFromFile, bakeFog, fogPreviewOn, setFogPreview, fogRgb,
+} from './stage-fog.js';
 
 const FOV = Math.PI / 4;
 const SKY_RADIUS = 920; // ClipFar 1000 * 0.92 when StageCameraParam.json isn't read (ComputeSkyRenderRadius)
@@ -40,6 +43,15 @@ const jobs = new WeakMap();
 const pause = () => new Promise((r) => setTimeout(r, 0));
 /** Preset name → its dome picture, made once. */
 const presetDomes = new Map();
+/** Whether the fog differs from the stage's own (only then is it kept and written, as on the desktop). */
+const fogChanged = (e) => !!e.fogStock && !!e.fog && !sameFog(e.fog, e.fogStock);
+/** The edits file's Features: other features kept as read, plus the fog when it is changed (or as stored, until read). */
+function fogFeatures(e) {
+  const out = { ...e.otherFeatures };
+  const fog = e.fogStock ? (fogChanged(e) ? e.fog : null) : e.storedFog;
+  if (fog) out.fog = { Enable: fog.Enable, Near: fog.Near, Far: fog.Far, Color: fog.Color };
+  return Object.keys(out).length ? out : null;
+}
 const lower = (s) => (s ? s.toLowerCase() : s);
 const shortName = (n) => n.replace(/\\/g, '/').split('/').slice(-2).join('/');
 
@@ -225,6 +237,10 @@ uniform bool uLit;
 uniform float uLmScale;
 uniform vec3 uEye;
 uniform vec4 uTint;
+uniform bool uFogOn;
+uniform vec3 uFogColor;
+uniform vec2 uFogRange;
+uniform vec3 uFwd;
 out vec4 outColor;
 const vec3 LIGHT = normalize(vec3(0.4, 1.0, 0.6));
 void main() {
@@ -243,6 +259,10 @@ void main() {
   }
   c *= tex.rgb;
   if (uMode == 3) c = min(c * texture(uTex1, vUv1).rgb * uLmScale, vec3(1.0));
+  if (uFogOn) {
+    float d = dot(vWorld - uEye, uFwd);
+    c = mix(uFogColor, c, clamp((uFogRange.y - d) / (uFogRange.y - uFogRange.x), 0.0, 1.0));
+  }
   outColor = vec4(mix(c, uTint.rgb, uTint.a), 1.0);
 }`;
 
@@ -260,7 +280,7 @@ function compile(gl) {
   gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
   const u = {};
-  for (const name of ['uViewProj', 'uEye', 'uSkyRadius', 'uTex0', 'uTex1', 'uMode', 'uLit', 'uLmScale', 'uTint']) u[name] = gl.getUniformLocation(p, name);
+  for (const name of ['uViewProj', 'uEye', 'uSkyRadius', 'uTex0', 'uTex1', 'uMode', 'uLit', 'uLmScale', 'uTint', 'uFogOn', 'uFogColor', 'uFogRange', 'uFwd']) u[name] = gl.getUniformLocation(p, name);
   return { program: p, u };
 }
 
@@ -366,6 +386,11 @@ function setUpEdits(scene, model) {
     sky: null, // the sky setting (SkyEdit), null = the stage's own
     skyPicture: null, // {name, width, height, rgba, canvas}: the dome picture in picture mode
     storedPicture: null, // the picture kept in this browser
+    fog: null, // the fog setting {Enable, Near, Far, Color}, read with the stage's own (fogStock)
+    fogStock: null,
+    storedFog: null, // the fog kept in this browser, until the stage's own is read
+    otherFeatures: {}, // edits-file features this page doesn't edit, kept as read
+    fogPreview: fogPreviewOn(),
   };
   const stored = loadStored(edit.stage);
   if (stored) {
@@ -380,6 +405,11 @@ function setUpEdits(scene, model) {
       console.warn(`Map editor: the edits kept for ${edit.stage} could not be read: ${e.message}`);
     }
     edit.sky = cloneSky(stored.Sky);
+    if (stored.Features && typeof stored.Features === 'object' && !Array.isArray(stored.Features)) {
+      const { fog, ...rest } = stored.Features;
+      edit.storedFog = fogFromFeature(fog);
+      edit.otherFeatures = rest;
+    }
     if (edit.sky?.Mode === 'picture')
       edit.pictureJob = loadPicture(edit.stage).then((pic) => {
         edit.storedPicture = pic;
@@ -407,6 +437,8 @@ export function renderStage(node, ctx) {
   const placeBox = el('div', { class: 'stage-place' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const inspectBox = el('div', { class: 'stage-inspect' }, el('p', { class: 'muted' }, 'Click the map to select an object.'));
   const skyBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
+  const fogBox = el('div', { class: 'stage-sky stage-fog' }, el('p', { class: 'muted' }, 'Reading the stage…'));
+  const downloadBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const canvas = el('canvas', { class: 'stage-canvas', tabindex: '0', 'aria-label': 'Stage map' });
   const overlay = el('canvas', { class: 'stage-overlay', 'aria-hidden': 'true' });
   const hint = el(
@@ -436,7 +468,7 @@ export function renderStage(node, ctx) {
     el(
       'div',
       { class: 'stage-body' },
-      el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Layers'), layersBox),
+      el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Layers'), layersBox),
       host,
     ),
   );
@@ -489,7 +521,7 @@ export function renderStage(node, ctx) {
     let vp = null, viewW = 1, viewH = 1;
     const keys = new Set();
     let last = performance.now();
-    const saveSoon = debounce(() => store(edit.stage, edit.objects, edit.sky), 250);
+    const saveSoon = debounce(() => store(edit.stage, edit.objects, edit.sky, fogFeatures(edit)), 250);
 
     function framed(b, from) {
       return { yaw: from.yaw, pitch: from.pitch, target: centre(b), dist: (radius(b) / Math.sin(FOV / 2)) * 1.05 };
@@ -527,6 +559,12 @@ export function renderStage(node, ctx) {
       const U = prog.u;
       gl.uniformMatrix4fv(U.uViewProj, false, vp);
       gl.uniform3fv(U.uEye, eye);
+      gl.uniform3fv(U.uFwd, f);
+      const fogShown = edit.fogPreview && !!edit.fogStock && !!edit.fog?.Enable;
+      if (fogShown) {
+        gl.uniform3fv(U.uFogColor, fogRgb(edit.fog).map((v) => v / 255));
+        gl.uniform2f(U.uFogRange, Math.max(0, edit.fog.Near), Math.max(edit.fog.Near + 1, edit.fog.Far));
+      }
       gl.uniform1i(U.uTex0, 0);
       gl.uniform1i(U.uTex1, 1);
       gl.uniform1f(U.uLmScale, lmSelect.value === 'bright' ? 2 : 1);
@@ -549,6 +587,7 @@ export function renderStage(node, ctx) {
           gl.depthMask(true);
         }
         gl.uniform1f(U.uSkyRadius, skyPass ? SKY_RADIUS : 0);
+        gl.uniform1i(U.uFogOn, fogShown && !skyPass ? 1 : 0);
         for (const m of skyPass ? skyList : scene.meshes) {
           if (!m.visible || m.sky !== skyPass) continue;
           gl.bindVertexArray(meshGpu(m).vao);
@@ -965,8 +1004,8 @@ export function renderStage(node, ctx) {
     }
 
     function saveFile() {
-      const file = editsFile(edit.stage, edit.objects, edit.sky);
-      if (!Object.keys(file.Objects).length && !file.Sky) return toast('There are no edits to save yet.');
+      const file = editsFile(edit.stage, edit.objects, edit.sky, fogFeatures(edit));
+      if (!Object.keys(file.Objects).length && !file.Sky && !file.Features) return toast('There are no edits to save yet.');
       downloadBlob(new Blob([JSON.stringify(file, null, 2)], { type: 'application/json' }), `${edit.stage}.json`);
     }
     async function loadFile() {
@@ -985,16 +1024,30 @@ export function renderStage(node, ctx) {
         changes.push({ obj: c.obj, before: c.before, after: c.after });
       }
       // The file's sky, when it has one (a picture by name only: the one held here if the names match).
-      let action = null, skyNote = '';
+      const acts = [];
+      let skyNote = '';
       const sky = cloneSky(res.sky);
       if (res.sky && !sameSky(sky, edit.sky)) {
         const picture = sky?.Mode === 'picture' ? (edit.skyPicture?.name === sky.Picture ? edit.skyPicture : null) : edit.skyPicture;
         const before = skyState(), after = { sky, picture };
         applySky(after);
-        action = { undo: () => applySky(before), redo: () => applySky(after) };
+        acts.push({ undo: () => applySky(before), redo: () => applySky(after) });
         skyNote = ` Sky: ${skyLabel(sky)}.`;
         if (sky?.Mode === 'picture' && !picture) skyNote += ' Choose the picture again in the Sky panel to see it.';
       }
+      // The file's fog (a "fog" feature), and the features this page doesn't edit, kept as they are.
+      const { fog: fileFog, ...rest } = res.features;
+      Object.assign(edit.otherFeatures, rest);
+      const fog = fogFromFeature(fileFog);
+      if (fog && edit.fogStock && !sameFog(fog, edit.fog)) {
+        const before = edit.fog;
+        applyFog(fog);
+        acts.push({ undo: () => applyFog(before), redo: () => applyFog(fog) });
+        skyNote += ` Fog: ${fog.Enable ? `${metres(fog.Near)} → ${metres(fog.Far)}` : 'off'}.`;
+      }
+      const action = acts.length
+        ? { undo: () => acts.slice().reverse().forEach((a) => a.undo()), redo: () => acts.forEach((a) => a.redo()) }
+        : null;
       edit.history.push(changes, 'Load edits file', null, action);
       edit.history.breakMerge();
       edited();
@@ -1027,7 +1080,7 @@ export function renderStage(node, ctx) {
     function stop() {
       stopped = true;
       resize.disconnect();
-      store(edit.stage, edit.objects, edit.sky);
+      store(edit.stage, edit.objects, edit.sky, fogFeatures(edit));
       gl.getExtension('WEBGL_lose_context')?.loseContext();
     }
     const resize = new ResizeObserver(() => (dirty = true));
@@ -1140,6 +1193,7 @@ export function renderStage(node, ctx) {
       }
       saveSoon();
       showSky();
+      renderDownload();
     }
     /** Changes the sky as one undo step (SetSky). */
     function setSky(next, label, picture = edit.skyPicture) {
@@ -1156,9 +1210,6 @@ export function renderStage(node, ctx) {
     const cloudsBox = el('input', { type: 'checkbox' });
     const skyLine = el('p', { class: 'muted stage-count' });
     const skyNote = el('p', { class: 'muted stage-count' });
-    const bakeBtn = button('Download bundle with this sky', bakeSkyBundle, {
-      title: "Write this sky into a copy of the stage bundle, as the desktop export does (object placement isn't written yet)",
-    });
     skySelect.addEventListener('change', async () => {
       const v = skySelect.value;
       if (v === 'own') return setSky(edit.sky?.HideClouds ? { HideClouds: true } : null, "Sky: this stage's own");
@@ -1207,40 +1258,202 @@ export function renderStage(node, ctx) {
       skyLine.textContent = skyLabel(s);
       skyNote.textContent = skyProblem;
       skyNote.hidden = !skyProblem;
-      bakeBtn.disabled = !s || s.Mode === 'dungeon';
       if (!skyBox.contains(skySelect))
         skyBox.replaceChildren(
           skyLine,
           skySelect,
           el('label', { class: 'check', title: 'Make the cloud textures clear (the download writes them clear)' }, cloudsBox, ' Hide clouds'),
           skyNote,
-          el('div', { class: 'toolbar' }, bakeBtn),
         );
     }
-    /** Downloads a copy of the bundle with the sky written in (ApplySkyToBundle). */
-    async function bakeSkyBundle() {
-      const s = edit.sky;
-      if (!s) return toast("The sky is this stage's own: choose another one first.");
+    // ----- fog (StageViewerForm.Fog.cs) -----
+    const fogLine = el('p', { class: 'muted stage-count' });
+    const fogShowBox = el('input', { type: 'checkbox' });
+    const fogOnBox = el('input', { type: 'checkbox' });
+    const fogNear = el('input', { type: 'number', class: 'input input-sm', min: '0', step: '10', 'aria-label': 'Fog starts at, in metres' });
+    const fogFar = el('input', { type: 'number', class: 'input input-sm', min: '10', step: '10', 'aria-label': 'Fog full at, in metres' });
+    const fogColour = el('input', { type: 'color', 'aria-label': 'Fog colour' });
+    const fogStages = el('select', { class: 'input input-sm', 'aria-label': "Take another stage's fog" });
+    const fogOwnBtn = button("Back to this stage's own", () => setFog(edit.fogStock, "Stage's own fog"));
+    let fogRead = false;
+    function fogSummary() {
+      const f = edit.fog, changed = fogChanged(edit) ? ' · changed' : '';
+      return f.Enable ? `${metres(f.Near)} → ${metres(f.Far)}${changed}${edit.fogPreview ? ' · shown' : ''}` : `off${changed}`;
+    }
+    /** Puts a fog value in place (set, undo, redo): keeps it in this browser and redraws. */
+    function applyFog(v) {
+      edit.fog = v;
+      saveSoon();
+      dirty = true;
+      renderFog();
+      renderDownload();
+    }
+    /** Changes the fog as one undo step; steps of the same kind (kind) merge, as the desktop's SetFog does. */
+    function setFog(next, label, kind = null) {
+      if (!edit.fogStock || sameFog(next, edit.fog)) return renderFog();
+      const action = {
+        before: edit.fog,
+        after: next,
+        undo() { applyFog(this.before); },
+        redo() { applyFog(this.after); },
+        merge(o) { this.after = o.after; return true; },
+        drop() { return sameFog(this.before, this.after); },
+      };
+      applyFog(next);
+      edit.history.push([], label, kind, action);
+      syncPanel();
+    }
+    fogShowBox.addEventListener('change', () => {
+      edit.fogPreview = fogShowBox.checked;
+      setFogPreview(edit.fogPreview);
+      dirty = true;
+      renderFog();
+    });
+    fogOnBox.addEventListener('change', () => {
+      const f = edit.fog;
+      setFog(makeFog(fogOnBox.checked, f.Near, f.Far, f.Color), fogOnBox.checked ? 'Fog on' : 'Fog off');
+    });
+    fogNear.addEventListener('change', () => {
+      const f = edit.fog, m = Number(fogNear.value);
+      if (fogNear.value === '' || !Number.isFinite(m)) return renderFog();
+      setFog(makeFog(f.Enable, Math.max(0, Math.min(f.Far - 1000, Math.round(m) * 100)), f.Far, f.Color), 'Fog start', 'fog-near');
+    });
+    fogFar.addEventListener('change', () => {
+      const f = edit.fog, m = Number(fogFar.value);
+      if (fogFar.value === '' || !Number.isFinite(m)) return renderFog();
+      setFog(makeFog(f.Enable, f.Near, Math.max(f.Near + 1000, Math.round(m) * 100), f.Color), 'Fog distance', 'fog-far');
+    });
+    fogColour.addEventListener('change', () => setFog(withHex(edit.fog, fogColour.value), 'Fog colour'));
+    fogStages.addEventListener('change', async () => {
+      const id = fogStages.value;
+      fogStages.value = '';
+      if (!id) return;
+      const src = ctx.stageBundles?.().find((b) => b.id === id);
+      if (!src) return toast(`${id} isn't among the open files.`);
+      try {
+        const fog = await readFogFromFile(await src.read());
+        if (stopped) return;
+        if (!fog) return toast(`No fog found in ${id}.`, 'error');
+        setFog(fog, `${id}'s fog`);
+        if (!edit.fogPreview) {
+          edit.fogPreview = true;
+          setFogPreview(true);
+          dirty = true;
+          renderFog();
+        }
+        toast(`Fog of ${id}: ${fogSummary()}`);
+      } catch (e) {
+        toast(`No fog found in ${id}: ${e.message}`, 'error');
+      }
+    });
+    function renderFog() {
+      if (!edit.fogStock) {
+        fogBox.replaceChildren(el('p', { class: 'muted' }, fogRead ? "This stage has no fog settings to read (StageCameraParam.json)." : 'Reading the fog…'));
+        return;
+      }
+      const f = edit.fog, own = edit.fogStock;
+      fogLine.textContent = `This stage's own: ${own.Enable ? `${metres(own.Near)} → ${metres(own.Far)}` : 'off'}. Now: ${fogSummary()}`;
+      fogShowBox.checked = edit.fogPreview;
+      fogOnBox.checked = f.Enable;
+      fogNear.value = String(Math.round(f.Near / 100));
+      fogFar.value = String(Math.round(f.Far / 100));
+      fogColour.value = fogHex(f);
+      fogOwnBtn.disabled = !fogChanged(edit);
+      const others = (ctx.stageBundles?.() ?? []).map((b) => b.id).filter((id) => id.toLowerCase() !== edit.stage.toLowerCase());
+      others.sort((a, b) => a.localeCompare(b));
+      fogStages.replaceChildren(
+        el('option', { value: '' }, others.length ? "Take another stage's fog…" : "Another stage's fog: open the Data folder"),
+        ...others.map((id) => el('option', { value: id }, id)),
+      );
+      fogStages.disabled = !others.length;
+      if (!fogBox.contains(fogOnBox))
+        fogBox.replaceChildren(
+          fogLine,
+          el('label', { class: 'check', title: "Draw the fog over the map as the game does (the sky stays clear). Only a preview: it doesn't change the map." }, fogShowBox, ' Show it here'),
+          el('label', { class: 'check', title: 'Whether the game draws fog on this map' }, fogOnBox, ' Fog in the game'),
+          el('label', { class: 'stage-fog-row', title: 'Closer than this the air is clear' }, 'Starts at', fogNear, 'm'),
+          el('label', { class: 'stage-fog-row', title: "From here on everything is the fog's colour (the game draws nothing beyond the camera's far clip)" }, 'Full at', fogFar, 'm'),
+          el('label', { class: 'stage-fog-row', title: 'The colour far-away things fade into' }, 'Colour', fogColour),
+          fogStages,
+          el('div', { class: 'toolbar' }, fogOwnBtn),
+        );
+    }
+    readFog(model).then(
+      (stock) => {
+        if (stopped) return;
+        fogRead = true;
+        edit.fogStock = stock;
+        if (stock) edit.fog = edit.storedFog || stock;
+        dirty = true;
+        renderFog();
+        renderDownload();
+      },
+      (e) => {
+        fogRead = true;
+        console.warn(`Map editor: the fog of ${edit.stage} could not be read: ${e.message}`);
+        renderFog();
+      },
+    );
+
+    // ----- download (the sky and fog written into a copy of the bundle, as the desktop export does) -----
+    const downloadNote = el('p', { class: 'muted stage-count' });
+    const bakeBtn = button('Download bundle', bakeBundle, {
+      title: "Write the sky and fog into a copy of the stage bundle, as the desktop export does (object placement isn't written yet)",
+    });
+    function bakeParts() {
+      const parts = [];
+      if (edit.sky && edit.sky.Mode !== 'dungeon') parts.push('sky');
+      if (fogChanged(edit)) parts.push('fog');
+      return parts;
+    }
+    function renderDownload() {
+      const parts = bakeParts();
+      downloadNote.textContent = parts.length
+        ? `Writes the ${parts.join(' and ')} into a copy of ${edit.stage}.bres. Object placement isn't written yet: keep it with Save edits.`
+        : 'Change the sky or fog to write them into a copy of the bundle.';
+      bakeBtn.disabled = !parts.length;
+      if (!downloadBox.contains(bakeBtn)) downloadBox.replaceChildren(downloadNote, el('div', { class: 'toolbar' }, bakeBtn));
+    }
+    /** Downloads a copy of the bundle with the sky (ApplySkyToBundle) and fog (FogExport) written in. */
+    async function bakeBundle() {
+      const parts = bakeParts();
+      if (!parts.length) return toast('Change the sky or fog first.');
       bakeBtn.disabled = true;
       const was = status.textContent;
       try {
-        const pack = s.Mode === 'stage' ? await skyPack(s.Stage) : null;
-        const dome = domeImage(s);
-        if (s.Mode === 'picture' && !dome) throw new Error(`the sky picture ${s.Picture} isn't here; choose it again`);
-        status.textContent = 'Writing the bundle with this sky…';
+        let archive = model;
+        const lines = [];
+        if (parts.includes('sky')) {
+          const s = edit.sky;
+          const pack = s.Mode === 'stage' ? await skyPack(s.Stage) : null;
+          const dome = domeImage(s);
+          if (s.Mode === 'picture' && !dome) throw new Error(`the sky picture ${s.Picture} isn't here; choose it again`);
+          status.textContent = 'Writing the bundle…';
+          await pause();
+          const domeDds = dome ? encodeDxt1Dds(dome.width, dome.height, dome.rgba) : null;
+          const r = await bakeSky(archive, s, pack, textureRoles(pack ? pack.meshes : ownSky), domeDds);
+          archive = r.archive;
+          lines.push(r.summary);
+        }
+        if (parts.includes('fog')) {
+          const r = await bakeFog(archive, edit.fog);
+          archive = r.archive;
+          lines.push(r.summary);
+        }
+        status.textContent = 'Writing the bundle…';
         await pause();
-        const domeDds = dome ? encodeDxt1Dds(dome.width, dome.height, dome.rgba) : null;
-        const { archive, summary } = await bakeSky(model, s, pack, textureRoles(pack ? pack.meshes : ownSky), domeDds);
         const bytes = await encodeLayers(writeBres(archive), writableLayers(node.layers || []));
         downloadBytes(bytes, `${edit.stage}.bres`);
-        toast(`${edit.stage}.bres downloaded. ${summary} Object placement isn't written into it yet: keep it with Save edits.`, 'ok', 10000);
+        toast(`${edit.stage}.bres downloaded. ${lines.join(' ')} Object placement isn't written into it yet: keep it with Save edits.`, 'ok', 10000);
       } catch (e) {
         toast(`The bundle could not be written: ${e.message}`, 'error', 10000);
       } finally {
         status.textContent = was;
-        bakeBtn.disabled = false;
+        renderDownload();
       }
     }
+    renderFog();
+    renderDownload();
     renderSky();
     if (edit.sky) showSky();
     edit.pictureJob?.then(() => !stopped && showSky());
