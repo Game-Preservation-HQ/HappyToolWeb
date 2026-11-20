@@ -6,6 +6,7 @@
 import { el, button, toast, downloadBlob, pickFiles, confirmBox, debounce } from '../ui.js';
 import { decodeLayers, encodeLayers, writableLayers } from '../formats/wrappers.js';
 import { writeBres } from '../formats/bres.js';
+import { collectExportEdits, bakeEdits } from '../formats/stage-bake.js';
 import { downloadBytes } from '../util.js';
 import { decodeDds } from '../formats/dds.js';
 import { buildSteamStage } from '../formats/steam-stage.js';
@@ -901,9 +902,11 @@ export function renderStage(node, ctx) {
       edit.history.push(changes, label, mergeKey);
       edited();
     }
+    let downloadRefresh = () => {};
     function edited() {
       saveSoon();
       syncPanel();
+      downloadRefresh();
       dirty = true;
     }
     function undo() {
@@ -1468,22 +1471,24 @@ export function renderStage(node, ctx) {
       },
     );
 
-    // ----- download (the sky and fog written into a copy of the bundle, as the desktop export does) -----
+    // ----- download (objects, sky and fog written into a copy of the bundle, as the desktop export does) -----
     const downloadNote = el('p', { class: 'muted stage-count' });
     const bakeBtn = button('Download bundle', bakeBundle, {
-      title: "Write the sky and fog into a copy of the stage bundle, as the desktop export does (object placement isn't written yet)",
+      title: 'Write the moved and hidden objects, the sky and the fog into a copy of the stage bundle, as the desktop export does',
     });
     function bakeParts() {
       const parts = [];
+      if (edit.objects.some((o) => !isEmpty({ ...o.state, solid: false }))) parts.push('objects');
       if (edit.sky && edit.sky.Mode !== 'dungeon') parts.push('sky');
       if (fogChanged(edit)) parts.push('fog');
       return parts;
     }
+    const listOf = (a) => (a.length > 1 ? `${a.slice(0, -1).join(', ')} and ${a[a.length - 1]}` : a[0]);
     function renderDownload() {
       const parts = bakeParts();
       downloadNote.textContent = parts.length
-        ? `Writes the ${parts.join(' and ')} into a copy of ${edit.stage}.bres. Object placement isn't written yet: keep it with Save edits.`
-        : 'Change the sky or fog to write them into a copy of the bundle.';
+        ? `Writes the ${listOf(parts)} into a copy of ${edit.stage}.bres.`
+        : 'Move or hide objects, or change the sky or fog, to write them into a copy of the bundle.';
       bakeBtn.disabled = !parts.length;
       if (!downloadBox.contains(bakeBtn)) downloadBox.replaceChildren(downloadNote, el('div', { class: 'toolbar' }, bakeBtn));
     }
@@ -1496,6 +1501,30 @@ export function renderStage(node, ctx) {
       try {
         let archive = model;
         const lines = [];
+        if (parts.includes('objects')) {
+          status.textContent = 'Writing the objects…';
+          await pause();
+          const { edits, skipped } = collectExportEdits(edit.objects);
+          const at = new Map();
+          archive.entries.forEach((e, i) => at.has(e.name.toLowerCase()) || at.set(e.name.toLowerCase(), i));
+          const entryOf = (name) => archive.entries[at.get(name.toLowerCase())];
+          const r = await bakeEdits(edits, async (name) => {
+            const e = entryOf(name);
+            return e && !e.pointer && e.data?.length ? (await decodeLayers(e.data)).payload : null;
+          });
+          const entries = archive.entries.slice();
+          for (const [name, data] of r.changed) {
+            const i = at.get(name.toLowerCase());
+            entries[i] = { ...entries[i], pointer: false, size: data.length, data };
+          }
+          archive = { ...archive, entries };
+          const n = r.report;
+          lines.push(
+            `Objects: ${n.objectsWritten.toLocaleString()} written${n.objectsHidden ? ` (${n.objectsHidden.toLocaleString()} hidden)` : ''}, ` +
+              `${n.verticesWritten.toLocaleString()} vertices, ${n.batchesRebounded.toLocaleString()} batch bounds refitted.` +
+              (skipped ? ` ${skipped.toLocaleString()} moved object(s) can't be written back (no Steam record).` : ''),
+          );
+        }
         if (parts.includes('sky')) {
           const s = edit.sky;
           const pack = s.Mode === 'stage' ? await skyPack(s.Stage) : null;
@@ -1517,7 +1546,7 @@ export function renderStage(node, ctx) {
         await pause();
         const bytes = await encodeLayers(writeBres(archive), writableLayers(node.layers || []));
         downloadBytes(bytes, `${edit.stage}.bres`);
-        toast(`${edit.stage}.bres downloaded. ${lines.join(' ')} Object placement isn't written into it yet: keep it with Save edits.`, 'ok', 10000);
+        toast(`${edit.stage}.bres downloaded. ${lines.join(' ')}`, 'ok', 10000);
       } catch (e) {
         toast(`The bundle could not be written: ${e.message}`, 'error', 10000);
       } finally {
@@ -1527,6 +1556,7 @@ export function renderStage(node, ctx) {
     }
     renderFog();
     renderDownload();
+    downloadRefresh = renderDownload;
 
     // ----- collision (CcpCollisionParser: every .ccp layer, drawn as lines; key H) -----
     let lineProg = null;

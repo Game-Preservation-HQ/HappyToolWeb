@@ -164,6 +164,7 @@ export function collectObjects(meshes) {
         name: r.name || m.name || `mesh${mi}`,
         label: r.label || firstTexture[k],
         recordOffset: r.recordOffset ?? null,
+        nodeMatrix: r.nodeMatrix ?? null,
         firstVertex: r.firstVertex,
         vertexCount: r.vertexCount,
         triangles: Uint32Array.from(lists[k]),

@@ -505,7 +505,7 @@ export function buildSteamStage(entries) {
         const uv2Ok = t.uvs && t.uvs2 && t.uvs2.length === t.uvs.length;
         meshes.push({
           // The desktop's names (AppendTerrainRecords): the record's name only when the file has several.
-          name: records.length > 1 ? `${e.name}/${t.name || 'record'}` : e.name, kind: 'terrain', positions: t.positions, normals: t.normals, uvs: t.uvs, uvs2: uv2Ok ? t.uvs2 : null, indices: t.indices,
+          name: records.length > 1 ? `${e.name}/${t.name || 'record'}` : e.name, kind: 'terrain', sourceResource: e.name, positions: t.positions, normals: t.normals, uvs: t.uvs, uvs2: uv2Ok ? t.uvs2 : null, indices: t.indices,
           batches: t.batches.map((b) => colourAndLightmap(b.firstIndex, b.indexCount, b.baseTexture, uv2Ok ? b.lightmap : null, b.texture)),
         });
         // Baked terrain fuses every rock, wall and tree into one buffer: split it into its connected pieces.
@@ -530,6 +530,7 @@ export function buildSteamStage(entries) {
       });
       // Little-endian ModelData terrain is one record (its base is cached at 0x8C); export patches it in place.
       const record = isInlineModelData(bytes) && rd(bytes).u32(0x90) === 1 ? rd(bytes).u32(0x8C) : null;
+      if (record != null) meshes[meshes.length - 1].sourceResource = e.name;
       splitIntoPieceObjects(meshes[meshes.length - 1], record);
       continue;
     }
@@ -582,14 +583,14 @@ function mergePack(label, subs) {
     let name = `${label}/${s.name || 'obj'}`;
     for (let dup = 2; names.has(name.toLowerCase()); dup++) name = `${label}/${s.name || 'obj'}~${dup}`;
     names.add(name.toLowerCase());
-    objects.push({ name, label: s.nodeName, firstVertex: v, vertexCount: vc, firstIndex: ii, indexCount: s.indices.length, recordOffset: s.recordOffset });
+    objects.push({ name, label: s.nodeName, firstVertex: v, vertexCount: vc, firstIndex: ii, indexCount: s.indices.length, recordOffset: s.recordOffset, nodeMatrix: s.nodeMatrix ?? null });
     const ranges = s.subBatches || [{ firstIndex: 0, indexCount: s.indices.length, texture: s.texture, baseTexture: s.baseTexture, lightmap: s.lightmap }];
     for (const p of ranges) batches.push(colourAndLightmap(ii + p.firstIndex, p.indexCount, p.baseTexture, smUv2 ? p.lightmap : null, p.texture));
     v += vc;
     ii += s.indices.length;
   }
   if (objects.length === 1) objects[0].name = label;
-  return { name: label, kind: 'pack', positions, normals, uvs: anyUv ? uvs : null, uvs2: anyUv && anyUv2 ? uvs2 : null, indices, batches, objects };
+  return { name: label, kind: 'pack', sourceResource: objects.every((o) => o.recordOffset >= 0) ? label : null, positions, normals, uvs: anyUv ? uvs : null, uvs2: anyUv && anyUv2 ? uvs2 : null, indices, batches, objects };
 }
 
 function neededTextures(meshes) {
