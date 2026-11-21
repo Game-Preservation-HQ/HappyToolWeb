@@ -280,12 +280,12 @@ export const stageKey = (name) => name.replace(/\\/g, '/').split('/').pop().repl
  * The edits in the desktop sidecar's shape: {Version, Stage, Objects: {index: {Name, Translate, Rotate?, Scale?, Pivot?,
  * Deleted, Solid?}}, Sky?}; a sky makes it version 5, as the desktop writes it.
  */
-export function editsFile(stage, objects, sky = null, features = null) {
+export function editsFile(stage, objects, sky = null, features = null, gimmicks = null) {
   const Objects = {};
   let solid = false;
   for (const o of objects) {
     const st = o.state;
-    if (isEmpty(st)) continue;
+    if (o.gimmick || isEmpty(st)) continue; // gimmicks go in the Gimmicks list
     const e = { Name: o.name, Translate: st.t.slice() };
     if (!near0(st.r)) e.Rotate = st.r.slice();
     if (!near1(st.s)) e.Scale = st.s.slice();
@@ -295,8 +295,10 @@ export function editsFile(stage, objects, sky = null, features = null) {
     Objects[o.index] = e;
   }
   const hasFeatures = !!features && Object.keys(features).length > 0;
-  const file = { Version: hasFeatures ? 6 : sky ? 5 : solid ? 4 : 2, Stage: stage, Objects };
+  const hasGimmicks = Array.isArray(gimmicks) && gimmicks.length > 0;
+  const file = { Version: hasFeatures ? 6 : sky || hasGimmicks ? 5 : solid ? 4 : 2, Stage: stage, Objects };
   if (sky) file.Sky = sky;
+  if (hasGimmicks) file.Gimmicks = gimmicks;
   if (hasFeatures) file.Features = features;
   return file;
 }
@@ -309,9 +311,9 @@ const vec = (v, fallback) => (Array.isArray(v) && v.length === 3 && v.every(Numb
  */
 export function readEditsFile(json, objects) {
   const isObj = (v) => !!v && typeof v === 'object';
-  if (!isObj(json) || (!isObj(json.Objects) && !isObj(json.Sky) && !isObj(json.Features)))
+  if (!isObj(json) || (!isObj(json.Objects) && !isObj(json.Sky) && !isObj(json.Features) && !Array.isArray(json.Gimmicks)))
     throw new Error('This is not a HappyTool stage edits file.');
-  const byName = new Map(objects.map((o) => [o.name.toLowerCase(), o]));
+  const byName = new Map(objects.filter((o) => !o.gimmick).map((o) => [o.name.toLowerCase(), o]));
   const changed = [], unmatched = [];
   for (const e of Object.values(json.Objects || {})) {
     const o = e && typeof e.Name === 'string' ? byName.get(e.Name.toLowerCase()) : null;
@@ -324,7 +326,10 @@ export function readEditsFile(json, objects) {
     if (sameState(st, o.state) && pivot.every((x, k) => x === o.pivot[k])) continue;
     changed.push({ obj: o, before: o.state, after: st, pivot });
   }
-  return { changed, unmatched, sky: isObj(json.Sky) ? json.Sky : null, features: isObj(json.Features) ? json.Features : {} };
+  return {
+    changed, unmatched, sky: isObj(json.Sky) ? json.Sky : null, features: isObj(json.Features) ? json.Features : {},
+    gimmicks: Array.isArray(json.Gimmicks) ? json.Gimmicks.filter(isObj) : [],
+  };
 }
 
 export function loadStored(stage) {
@@ -336,11 +341,11 @@ export function loadStored(stage) {
   }
 }
 
-export function store(stage, objects, sky = null, features = null) {
-  const file = editsFile(stage, objects, sky, features);
+export function store(stage, objects, sky = null, features = null, gimmicks = null) {
+  const file = editsFile(stage, objects, sky, features, gimmicks);
   const key = STORE + stage.toLowerCase();
   try {
-    if (Object.keys(file.Objects).length || file.Sky || file.Features) localStorage.setItem(key, JSON.stringify(file));
+    if (Object.keys(file.Objects).length || file.Sky || file.Features || file.Gimmicks) localStorage.setItem(key, JSON.stringify(file));
     else localStorage.removeItem(key);
   } catch (e) {
     console.warn(`Map editor: edits could not be kept in this browser: ${e.message}`);

@@ -324,7 +324,7 @@ export function collectExportEdits(objects) {
   let skipped = 0;
   for (const o of objects) {
     const s = o.state;
-    if (!s.hidden && isIdentityTransform(s)) continue;
+    if (o.gimmick || (!s.hidden && isIdentityTransform(s))) continue; // gimmicks are written to their table
     const mesh = o.mesh;
     if (!mesh.sourceResource || o.recordOffset == null || o.recordOffset < 0) {
       skipped++;

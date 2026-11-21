@@ -406,6 +406,20 @@ function renderView() {
       files
         .filter((r) => stageIdFor(r.path))
         .map((r) => ({ id: stageIdFor(r.path), path: r.path, read: async () => new Uint8Array(await r.file.arrayBuffer()) })),
+    /** The open file's path (forward slashes). */
+    filePath: current?.path ?? null,
+    /**
+     * The files of a Data folder beside the open stage bundle's own (`gimmick`, `json/stage`: Data/stage/x.bres →
+     * Data/<dir>/…), not those in its subfolders, read from disk when asked.
+     */
+    dataFiles: (dir) => {
+      const parts = (current?.path ?? '').split('/');
+      if (parts.length < 2 || parts.at(-2).toLowerCase() !== 'stage') return [];
+      const base = [...parts.slice(0, -2), ...dir.split('/')].join('/').toLowerCase() + '/';
+      return files
+        .filter((r) => r.path.toLowerCase().startsWith(base) && !r.path.slice(base.length).includes('/'))
+        .map((r) => ({ name: r.path.slice(base.length), path: r.path, read: async () => new Uint8Array(await r.file.arrayBuffer()) }));
+    },
   };
   let view;
   try {

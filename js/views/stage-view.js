@@ -35,6 +35,10 @@ import {
   makeFog, sameFog, fogHex, withHex, metres, fogFromFeature, readFog, readFogFromFile, bakeFog, fogPreviewOn, setFogPreview, fogRgb,
 } from './stage-fog.js';
 import { readCollision, edgesOf } from './stage-collision.js';
+import {
+  loadGimmicks, stateOfPlacement, placementFromState, placementChanged, gimmickEdit, applyGimmickEdit, editedGimmickTable,
+  gimmickTableBytes,
+} from './stage-gimmicks.js';
 import { readNav, navLines, writeNavMesh, writePathGraph, is360Spd, spd360ToSteam } from '../formats/stage-nav.js';
 import { rebuildNav, Blocker, MIN_REF, nodeRefKey, navSummary, navChanged, pathChanged } from '../formats/stage-nav-edit.js';
 import {
@@ -54,6 +58,7 @@ const GROUPS = [
   ['terrain', 'Terrain'],
   ['pack', 'Object packs'],
   ['model', 'Models'],
+  ['gimmick', 'Gimmicks'],
   ['sky', 'Sky'],
 ];
 
@@ -84,7 +89,7 @@ export const looksLikeStage = (arc) => !!arc?.littleEndian && arc.entries.some((
 
 // ---------- scene ----------
 
-async function loadScene(model, report) {
+async function loadScene(model, report, source = null) {
   const rrm = [];
   for (const e of model.entries) {
     if (!/\.rrm$/i.test(e.name) || e.pointer || !e.data?.length) continue;
@@ -112,17 +117,32 @@ async function loadScene(model, report) {
   }
 
   const meshes = built.meshes.filter((m) => m.positions.length >= 9 && m.indices.length >= 3);
+  // The stage's gimmicks, after the stage's own meshes so those keep their object numbers.
+  let gimmicks = null;
+  if (source?.dataFiles) {
+    try {
+      gimmicks = await loadGimmicks({ ids: source.ids, dataFiles: source.dataFiles, textures, report });
+      if (gimmicks) {
+        for (const line of gimmicks.log) console.info(`Map viewer: ${line}`);
+        meshes.push(...gimmicks.meshes);
+      }
+    } catch (e) {
+      console.warn(`Map viewer: the gimmicks could not be read: ${e.message}`);
+      gimmicks = null;
+    }
+  }
   for (const m of meshes) {
-    m.sky = /sky/i.test(m.name);
+    m.sky = m.kind !== 'gimmick' && /sky/i.test(m.name);
     if (m.sky) m.kind = 'sky';
     m.normals = patchNormals(m.positions, m.indices, m.normals);
     if (m.sky) m.positions = unitDirections(m.positions);
     m.bounds = boundsOf(m.positions, 0, m.positions.length / 3);
     m.visible = true;
   }
-  const solid = meshes.filter((m) => !m.sky);
+  const solid = meshes.filter((m) => !m.sky && m.kind !== 'gimmick');
   return {
     meshes,
+    gimmicks,
     skipped: built.skipped,
     textures,
     missing: [...built.textures].filter((k) => !textures.has(k)),
@@ -449,13 +469,30 @@ function setUpEdits(scene, model) {
     colnav: readColNav(null), // collision erased by hand and pieces added (the "colnav" feature)
     fogPreview: fogPreviewOn(),
   };
+  // Gimmicks: pivot at the table's position, the stock state its rotation (and removal), so the state reads back as the
+  // placement. Their meshes are placed by their state when the view starts.
+  edit.gimmickOther = []; // Gimmicks entries of the edits file for other seasons or placements not shown, kept as read
+  for (const o of edit.objects) {
+    const g = o.mesh.gimmick;
+    if (!g) continue;
+    o.gimmick = g;
+    o.pivot = g.position0.slice();
+    o.label = `${g.type} · ${g.tag}`;
+    o.stock = stateOfPlacement({ ...g, position: g.position0, rotation: g.rotation0, removed: g.removed0 });
+    o.state = o.stock;
+  }
   const stored = loadStored(edit.stage);
   if (stored) {
     try {
-      for (const c of readEditsFile(stored, edit.objects).changed) {
+      const res = readEditsFile(stored, edit.objects);
+      for (const c of res.changed) {
         c.obj.pivot = c.pivot;
         c.obj.state = c.after;
         writeObject(c.obj);
+        edit.restored++;
+      }
+      for (const c of readGimmickEdits(edit, res.gimmicks)) {
+        c.obj.state = c.after;
         edit.restored++;
       }
     } catch (e) {
@@ -477,6 +514,45 @@ function setUpEdits(scene, model) {
   return edit;
 }
 
+/** Whether an object differs from the stage files (a gimmick: from its table). */
+const isEdited = (o) => (o.gimmick ? placementChanged(placementFromState(o)) : !isEmpty(o.state));
+
+/** The edits file's Gimmicks list: the placements that differ from the table, and the entries kept as read. */
+function gimmickEdits(edit) {
+  const out = [...(edit.gimmickOther ?? [])];
+  for (const o of edit.objects) {
+    if (!o.gimmick) continue;
+    const e = gimmickEdit(placementFromState(o));
+    if (e) out.push(e);
+  }
+  return out.length ? out : null;
+}
+
+/**
+ * Reads an edits file's Gimmicks entries onto the gimmicks (by tag, this season's only): returns the objects whose
+ * state changes; the others are kept as read (ApplyGimmickEdit).
+ */
+function readGimmickEdits(edit, list) {
+  const changes = [];
+  for (const s of list) {
+    if (typeof s.Tag !== 'string') continue;
+    const season = s.Season ?? null;
+    const objs = season == null ? edit.objects.filter((o) => o.gimmick && !o.gimmick.isNew && o.gimmick.tag === s.Tag) : [];
+    if (!objs.length) {
+      edit.gimmickOther = edit.gimmickOther.filter((x) => !(x.Tag === s.Tag && (x.Season ?? null) === season));
+      edit.gimmickOther.push(s);
+      continue;
+    }
+    for (const o of objs) {
+      const g = placementFromState(o), copy = { ...g, position: g.position.slice(), rotation: g.rotation.slice() };
+      applyGimmickEdit(copy, s);
+      const after = stateOfPlacement(copy);
+      if (!sameState(o.state, after)) changes.push({ obj: o, before: o.state, after });
+    }
+  }
+  return changes;
+}
+
 // ---------- view ----------
 
 /** The map view of a stage bundle node. ctx.back returns to the entry list. */
@@ -486,7 +562,9 @@ export function renderStage(node, ctx) {
   const status = el('span', { class: 'muted stage-status' }, 'Reading the stage…');
   if (!job) {
     job = { report: null, camera: null };
-    job.promise = loadScene(model, (t) => job.report?.(t));
+    const id = stageKey(model.name);
+    const ids = [...new Set([id, id.replace(/_harness$/i, ''), ctx.filePath ? stageKey(ctx.filePath) : null].filter(Boolean))];
+    job.promise = loadScene(model, (t) => job.report?.(t), { ids, dataFiles: ctx.dataFiles });
     jobs.set(model, job);
   }
   job.report = (t) => (status.textContent = t);
@@ -498,6 +576,7 @@ export function renderStage(node, ctx) {
   const fogBox = el('div', { class: 'stage-sky stage-fog' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const downloadBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const modelBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
+  const gimmickBox = el('div', { class: 'stage-gimmicks' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const cnBox = el('div', { class: 'stage-sky stage-cn' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const canvas = el('canvas', { class: 'stage-canvas', tabindex: '0', 'aria-label': 'Stage map' });
   const overlay = el('canvas', { class: 'stage-overlay', 'aria-hidden': 'true' });
@@ -534,7 +613,7 @@ export function renderStage(node, ctx) {
     el(
       'div',
       { class: 'stage-body' },
-      el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Collision edits'), cnBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Export 3D model'), modelBox, el('h3', {}, 'Layers'), layersBox),
+      el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Gimmicks'), gimmickBox, el('h3', {}, 'Collision edits'), cnBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Export 3D model'), modelBox, el('h3', {}, 'Layers'), layersBox),
       host,
     ),
   );
@@ -563,6 +642,11 @@ export function renderStage(node, ctx) {
     }
     const aniso = gl.getExtension('EXT_texture_filter_anisotropic');
     const edit = scene.edit || (scene.edit = setUpEdits(scene, model));
+    if (!edit.gimmicksPlaced) {
+      // The gimmick meshes hold their models unturned: place them by their state once.
+      edit.gimmicksPlaced = true;
+      for (const o of edit.objects) if (o.gimmick) writeObject(o);
+    }
     const gpu = new Map(scene.meshes.map((m) => [m, uploadMesh(gl, m)]));
     const glTex = new Map([...scene.textures].map(([k, img]) => [k, uploadTexture(gl, img, aniso)]));
     const tris = scene.meshes.reduce((s, m) => s + m.indices.length / 3, 0);
@@ -598,7 +682,7 @@ export function renderStage(node, ctx) {
     let vp = null, viewW = 1, viewH = 1;
     const keys = new Set();
     let last = performance.now();
-    const saveSoon = debounce(() => store(edit.stage, edit.objects, edit.sky, fogFeatures(edit)), 250);
+    const saveSoon = debounce(() => store(edit.stage, edit.objects, edit.sky, fogFeatures(edit), gimmickEdits(edit)), 250);
 
     function framed(b, from) {
       return { yaw: from.yaw, pitch: from.pitch, target: centre(b), dist: (radius(b) / Math.sin(FOV / 2)) * 1.05 };
@@ -940,7 +1024,10 @@ export function renderStage(node, ctx) {
     function change(list, fn, label, mergeKey = null) {
       const changes = [];
       for (const o of list) {
-        const before = o.state, after = fn(before, o);
+        const before = o.state;
+        let after = fn(before, o);
+        // A gimmick's table has no scale and no Solid.
+        if (after && o.gimmick && (after.solid || after.s.some((x) => x !== 1))) after = { ...after, s: [1, 1, 1], solid: false };
         if (!after || sameState(before, after)) continue;
         apply(o, after);
         changes.push({ obj: o, before, after });
@@ -949,11 +1036,12 @@ export function renderStage(node, ctx) {
       edit.history.push(changes, label, mergeKey);
       edited();
     }
-    let downloadRefresh = () => {};
+    let downloadRefresh = () => {}, gimmickRefresh = () => {};
     function edited() {
       saveSoon();
       syncPanel();
       downloadRefresh();
+      gimmickRefresh();
       dirty = true;
     }
     function undo() {
@@ -1001,7 +1089,7 @@ export function renderStage(node, ctx) {
         change([o], (st) => withState(st, { s: st.s.map((x) => (up ? x * f : x / f)) }), 'Scale', 'key-scale');
         return true;
       }
-      if (k === 'home') change([o], (st) => ({ ...IDENTITY, hidden: st.hidden, solid: st.solid }), 'Reset');
+      if (k === 'home') change([o], (st) => ({ ...(o.stock ?? IDENTITY), hidden: st.hidden, solid: st.solid }), 'Reset');
       else if (k === 'delete') change([o], (st) => ({ ...st, hidden: !st.hidden }), o.state.hidden ? 'Show' : 'Hide');
       else if (k === 'k') change([o], (st) => ({ ...st, solid: !st.solid }), 'Solid');
       else return false;
@@ -1109,7 +1197,7 @@ export function renderStage(node, ctx) {
     }
     /** Shows the selection's current placement and the edit count; force also rewrites the focused field. */
     function syncPanel(force = false) {
-      const n = edit.objects.reduce((s, o) => s + (isEmpty(o.state) ? 0 : 1), 0);
+      const n = edit.objects.reduce((s, o) => s + (isEdited(o) ? 1 : 0), 0);
       countLine.textContent = n ? `${n} object${n === 1 ? '' : 's'} edited · kept in this browser` : 'No edits yet.';
       undoBtn.disabled = !edit.history.undo.length;
       redoBtn.disabled = !edit.history.redo.length;
@@ -1125,8 +1213,8 @@ export function renderStage(node, ctx) {
     }
 
     function saveFile() {
-      const file = editsFile(edit.stage, edit.objects, edit.sky, fogFeatures(edit));
-      if (!Object.keys(file.Objects).length && !file.Sky && !file.Features) return toast('There are no edits to save yet.');
+      const file = editsFile(edit.stage, edit.objects, edit.sky, fogFeatures(edit), gimmickEdits(edit));
+      if (!Object.keys(file.Objects).length && !file.Sky && !file.Features && !file.Gimmicks) return toast('There are no edits to save yet.');
       downloadBlob(new Blob([JSON.stringify(file, null, 2)], { type: 'application/json' }), `${edit.stage}.json`);
     }
     async function loadFile() {
@@ -1139,8 +1227,8 @@ export function renderStage(node, ctx) {
         return toast(`${f.name} could not be read: ${e.message}`, 'error');
       }
       const changes = [];
-      for (const c of res.changed) {
-        c.obj.pivot = c.pivot;
+      for (const c of [...res.changed, ...readGimmickEdits(edit, res.gimmicks)]) {
+        if (c.pivot) c.obj.pivot = c.pivot;
         apply(c.obj, c.after);
         changes.push({ obj: c.obj, before: c.before, after: c.after });
       }
@@ -1188,10 +1276,10 @@ export function renderStage(node, ctx) {
       if (res.unmatched.length) console.info('Map editor: names in the edits file not on this stage:', res.unmatched);
     }
     async function clearAll() {
-      const list = edit.objects.filter((o) => !isEmpty(o.state));
+      const list = edit.objects.filter(isEdited);
       if (!list.length) return toast('There are no edits to clear.');
       if (!(await confirmBox(`Put all ${list.length} edited objects back where the stage file has them? Undo can bring the edits back.`, 'Clear all', true))) return;
-      change(list, () => IDENTITY, 'Clear all edits');
+      change(list, (st, o) => o.stock ?? IDENTITY, 'Clear all edits');
     }
 
     let stopped = false;
@@ -1211,7 +1299,7 @@ export function renderStage(node, ctx) {
     function stop() {
       stopped = true;
       resize.disconnect();
-      store(edit.stage, edit.objects, edit.sky, fogFeatures(edit));
+      store(edit.stage, edit.objects, edit.sky, fogFeatures(edit), gimmickEdits(edit));
       if (edit.navMatch && !edit.navMatch.done) {
         // Unfinished (the worker running, or the nav still being read): the next view starts it again.
         edit.navMatch.worker?.terminate();
@@ -1542,7 +1630,7 @@ export function renderStage(node, ctx) {
     });
     function bakeParts() {
       const parts = [];
-      if (edit.objects.some((o) => !isEmpty(o.state))) parts.push('objects');
+      if (edit.objects.some((o) => !o.gimmick && !isEmpty(o.state))) parts.push('objects');
       if (Object.keys(edit.colnav.RemovedCollision).length || edit.colnav.Volumes.length) parts.push('collision');
       if (navHandEdited()) parts.push('bot navigation');
       if (edit.sky && edit.sky.Mode !== 'dungeon') parts.push('sky');
@@ -2093,7 +2181,7 @@ export function renderStage(node, ctx) {
             meshes.push({ positions: o.mesh.baked?.positions ?? o.mesh.positions });
           }
           objects[i] = at.get(o.mesh);
-          triangles.push(o.triangles);
+          triangles.push(o.gimmick ? new Uint32Array(0) : o.triangles); // gimmicks own no stage collision
         });
         const layers = !col.live ? [] : col.layers.map((l) => ({
           groups: l.groups.map((g) => ({ vertices: g.vertices, triangles: g.triangles, minX: g.minX, minY: g.minY, minZ: g.minZ, maxX: g.maxX, maxY: g.maxY, maxZ: g.maxZ })),
@@ -3433,6 +3521,7 @@ export function renderStage(node, ctx) {
       canvas.style.cursor = '';
       renderInspect();
       renderPanel();
+      gimmickRefresh();
       dirty = true;
     }
     function cycle(dir) {
@@ -3485,6 +3574,78 @@ export function renderStage(node, ctx) {
       dirty = true;
     }
     renderPanel();
+
+    // ----- gimmicks: the stage's gimmick table (Data/json/stage/<id>_stage_gimmick.json) -----
+    const gimmickObjects = new Map(edit.objects.filter((o) => o.gimmick).map((o) => [o.gimmick, o]));
+    const gimmickNote = el('p', { class: 'muted stage-count' });
+    const gimmickBtn = button('Download gimmick table', downloadGimmickTable, {
+      title: "Write the moved, turned and removed gimmicks into a copy of the stage's gimmick table, as the desktop export does",
+    });
+    const gimmickList = el('div', { class: 'stage-gimmick-list' });
+    const byText = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+    function renderGimmicks() {
+      const gm = scene.gimmicks;
+      if (!gm) {
+        gimmickBox.replaceChildren(
+          el('p', { class: 'muted' }, ctx.dataFiles?.('json/stage').length
+            ? 'No gimmick table found for this stage'
+            : "Open the game's Data folder to see this stage's gimmicks (the table is in json/stage, the models in gimmick)."),
+        );
+        return;
+      }
+      for (const o of gimmickObjects.values()) placementFromState(o);
+      const changed = gm.placements.filter(placementChanged);
+      const removed = changed.filter((g) => g.removed && !g.removed0).length, moved = changed.length - removed;
+      gimmickNote.textContent =
+        `${gm.placements.length} placements in ${gm.table.name}; ${gimmickObjects.size} shown with their models. ` +
+        (changed.length ? `Edited: ${moved} moved, ${removed} removed.` : 'Select one to move, turn or remove (Del) it.');
+      gimmickBtn.disabled = !changed.length;
+      if (!gimmickBox.contains(gimmickList)) gimmickBox.replaceChildren(gimmickNote, el('div', { class: 'toolbar' }, gimmickBtn), gimmickList);
+      const sel = selected();
+      const rows = gm.placements
+        .filter((g) => !(g.isNew && g.removed))
+        .sort((a, b) => byText(a.type, b.type) || byText(a.tag, b.tag))
+        .map((g) => {
+          const o = gimmickObjects.get(g);
+          const value = !o ? 'no model' : g.removed ? 'removed' : placementChanged(g) ? (g.isNew ? 'new' : 'moved') : g.removed0 ? 'off' : '';
+          const row = el(
+            'div',
+            { class: `stage-layer stage-gimmick${o ? '' : ' nomodel'}${o && o === sel ? ' on' : ''}`, title: `${g.model} at ${g.position.map((x) => x.toFixed(2)).join(', ')}` },
+            el('span', { class: 'stage-layer-name' }, `${g.type} · ${g.tag}`),
+            el('span', { class: 'muted' }, value),
+          );
+          if (o) {
+            row.tabIndex = 0;
+            row.setAttribute('role', 'button');
+            const go = () => {
+              select(o);
+              frameSelection();
+              canvas.focus({ preventScroll: true }); // so Del, the arrows and the gizmo keys act on it at once
+            };
+            row.addEventListener('click', go);
+            row.addEventListener('keydown', (e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), go()));
+          }
+          return row;
+        });
+      gimmickList.replaceChildren(...rows);
+    }
+    async function downloadGimmickTable() {
+      const gm = scene.gimmicks;
+      if (!gm) return;
+      for (const o of gimmickObjects.values()) placementFromState(o);
+      let r;
+      try {
+        r = editedGimmickTable(gm.table.text, gm.placements);
+        if (!r) return toast('No gimmick has been moved, turned or removed yet.');
+        downloadBytes(await gimmickTableBytes(gm.table, r.text), gm.table.name, 'application/json');
+      } catch (e) {
+        console.error(e);
+        return toast(`The gimmick table could not be written: ${e.message}`, 'error');
+      }
+      toast(`Gimmicks: ${r.moved} moved, ${r.removed} removed, ${r.added} added — table written to ${gm.table.name}.`);
+    }
+    gimmickRefresh = renderGimmicks;
+    renderGimmicks();
 
     // ----- input -----
     const rayAt = (x, y) => {
