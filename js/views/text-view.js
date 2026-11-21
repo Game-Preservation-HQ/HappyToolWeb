@@ -1,4 +1,4 @@
-// Plain text and JSON editor. Keeps the file's original encoding (UTF-8, UTF-8 BOM, UTF-16 LE/BE BOM).
+// Plain text and JSON editor. Keeps the file's original encoding (UTF-8, UTF-8 BOM, UTF-16 LE/BE BOM, Shift-JIS).
 import { el, button, debounce, confirmBox, toast } from '../ui.js';
 import { parseGameJson, reindentJson } from '../formats/json.js';
 import { lineEndings, restoreLineEndings } from '../util.js';
@@ -8,6 +8,7 @@ const ENCODING_LABELS = {
   'utf-8-bom': 'UTF-8 with BOM',
   'utf-16le-bom': 'UTF-16 LE',
   'utf-16be-bom': 'UTF-16 BE',
+  shift_jis: 'Shift-JIS',
 };
 
 export function renderText(node, ctx) {

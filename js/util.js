@@ -71,7 +71,54 @@ export const utf8 = new TextEncoder();
 const utf8Decoder = new TextDecoder('utf-8');
 export const decodeUtf8 = (u8) => utf8Decoder.decode(u8);
 
-/** Decode text with a BOM-aware guess: UTF-8 (default), UTF-16 LE/BE when a BOM or a NUL pattern says so. */
+// Shift-JIS: the game's scripts (.nut) carry Japanese comments in it. Browsers decode it but have no encoder, so the
+// encoder is the decoder's table turned around (built once, on first use; ~7,000 double-byte codes).
+let sjisTable = null;
+function sjisEncoder() {
+  if (sjisTable) return sjisTable;
+  sjisTable = new Map();
+  const dec = new TextDecoder('shift_jis');
+  const pair = new Uint8Array(2);
+  for (let lead = 0x81; lead <= 0xfc; lead++) {
+    if (lead >= 0xa0 && lead <= 0xdf) continue;
+    pair[0] = lead;
+    for (let trail = 0x40; trail <= 0xfc; trail++) {
+      if (trail === 0x7f) continue;
+      pair[1] = trail;
+      const s = dec.decode(pair);
+      if (s.length === 1 && s !== '�' && !sjisTable.has(s)) sjisTable.set(s, (lead << 8) | trail);
+    }
+  }
+  return sjisTable;
+}
+/** Shift-JIS bytes for this text; a character it has no code for becomes '?'. */
+export function encodeShiftJis(text) {
+  const map = sjisEncoder();
+  const out = new Uint8Array(text.length * 2);
+  let n = 0;
+  for (const ch of text) {
+    const c = ch.codePointAt(0);
+    if (c < 0x80) out[n++] = c;
+    else if (c >= 0xff61 && c <= 0xff9f) out[n++] = c - 0xff61 + 0xa1; // half-width katakana
+    else {
+      const v = map.get(ch);
+      if (v === undefined) out[n++] = 0x3f;
+      else (out[n++] = v >> 8), (out[n++] = v & 0xff);
+    }
+  }
+  return out.slice(0, n);
+}
+const isUtf8 = (u8) => {
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(u8);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** Decode text with a BOM-aware guess: UTF-8 (default), UTF-16 LE/BE when a BOM says so, Shift-JIS when the bytes are
+ *  not UTF-8 but are Shift-JIS that writes back byte for byte. */
 export function decodeText(u8) {
   if (u8.length >= 3 && u8[0] === 0xef && u8[1] === 0xbb && u8[2] === 0xbf)
     return { text: decodeUtf8(u8.subarray(3)), encoding: 'utf-8-bom' };
@@ -79,6 +126,10 @@ export function decodeText(u8) {
     return { text: new TextDecoder('utf-16le').decode(u8.subarray(2)), encoding: 'utf-16le-bom' };
   if (u8.length >= 2 && u8[0] === 0xfe && u8[1] === 0xff)
     return { text: new TextDecoder('utf-16be').decode(u8.subarray(2)), encoding: 'utf-16be-bom' };
+  if (!isUtf8(u8)) {
+    const text = new TextDecoder('shift_jis').decode(u8);
+    if (bytesEqual(encodeShiftJis(text), u8)) return { text, encoding: 'shift_jis' };
+  }
   return { text: decodeUtf8(u8), encoding: 'utf-8' };
 }
 
@@ -99,6 +150,8 @@ export function encodeText(text, encoding) {
       }
       return out;
     }
+    case 'shift_jis':
+      return encodeShiftJis(text);
     default:
       return utf8.encode(text);
   }
