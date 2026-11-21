@@ -374,6 +374,24 @@ kbd {
 .stage-pad-help { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; max-width: 640px; }
 .stage-pad-help dt { font-weight: 600; }
 .stage-pad-help dd { margin: 0; }
+/* The map's menu (controller, keyboard or mouse), as the desktop's Forge menu. */
+.forge-menu { position: absolute; top: 12px; left: 12px; z-index: 3; width: min(380px, calc(100% - 24px)); max-height: calc(100% - 24px); display: flex; flex-direction: column; gap: 6px; padding: 10px; border-radius: var(--radius); background: rgb(14 17 21 / 0.94); color: #e3e7ee; box-shadow: 0 6px 24px rgb(0 0 0 / 0.45); outline: none; font-size: 14px; }
+.forge-menu[hidden] { display: none; }
+.forge-menu .muted { color: #98a1b2; }
+.forge-title { font-weight: 700; font-size: 15px; padding: 0 4px; }
+.forge-status { font-size: 12px; padding: 0 4px; }
+.forge-rows { overflow-y: auto; display: flex; flex-direction: column; gap: 1px; min-height: 0; }
+.forge-head { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #98a1b2; padding: 8px 8px 2px; }
+.forge-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 4px; cursor: pointer; }
+.forge-row.sel { background: #2f5fb3; color: #fff; }
+.forge-row.off { opacity: 0.45; }
+.forge-text { flex: 1; min-width: 0; }
+.forge-value { color: #c9d4e6; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.forge-row.sel .forge-value { color: #fff; }
+.forge-arrow { background: none; border: 0; color: inherit; font-size: 16px; line-height: 1; padding: 0 4px; cursor: pointer; opacity: 0.7; }
+.forge-arrow:hover { opacity: 1; }
+.forge-desc { font-size: 12px; min-height: 2.6em; padding: 0 4px; }
+.forge-hint { font-size: 11px; padding: 0 4px; }
 .toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 50; max-width: calc(100vw - 32px); }
 .toast { padding: 10px 14px; border-radius: var(--radius); background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow); max-width: 420px; }
 .toast-ok { border-left: 4px solid var(--ok); }
