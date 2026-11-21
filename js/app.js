@@ -56,6 +56,10 @@ function stagePicturesFor(dir) {
 }
 const expanded = new Set();
 let savedHandle = null;
+// Opera has showDirectoryPicker, but picking a folder with it can end with no permission prompt (so nothing opens), and
+// reopening a folder handle kept in IndexedDB can crash it; there the plain folder picker (an <input>) is used instead.
+const isOpera = /\bOPR\//.test(navigator.userAgent) || !!navigator.userAgentData?.brands?.some((b) => /opera/i.test(b.brand));
+const folderAccess = !!window.showDirectoryPicker && !isOpera;
 const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
 const usesTree = () => tree.root.dirs.size > 0;
 
@@ -456,6 +460,13 @@ function emptyState() {
       button('Open files…', openFilesPicker),
     ),
     el('p', { class: 'muted small' }, 'On Steam the Data folder is usually C:\\Program Files (x86)\\Steam\\steamapps\\common\\Happy Wars\\Data.'),
+    el(
+      'p',
+      { class: 'muted small' },
+      folderAccess
+        ? 'If the folder doesn’t open, drag the Data folder from File Explorer onto this page instead.'
+        : 'If the browser asks to “upload” the files, they still stay on your computer. You can also drag the Data folder onto this page.',
+    ),
     el('p', { class: 'muted small' }, 'Everything runs in this browser tab. Files are not uploaded anywhere; saving downloads a copy.'),
   );
 }
@@ -531,13 +542,14 @@ function addFiles(list) {
 }
 
 async function openDataFolder() {
-  if (!window.showDirectoryPicker) return openFolderPicker();
+  if (!folderAccess) return openFolderPicker();
   let handle;
   try {
     handle = await window.showDirectoryPicker({ id: 'happywars-data', mode: 'read' });
   } catch (e) {
-    if (e.name !== 'AbortError') toast(`Could not open the folder: ${e.message}`, 'error');
-    return;
+    if (e.name === 'AbortError') return;
+    toast(`The browser would not open the folder that way (${e.message}). Pick it again in this dialog.`, 'warn');
+    return openFolderPicker();
   }
   await loadDataFolder(handle);
 }
@@ -681,12 +693,13 @@ if (typeof DecompressionStream === 'undefined')
 if (problems.length) $('env-warning').replaceChildren(...problems.map((p) => el('p', { class: 'banner banner-error' }, p)));
 
 render();
-loadHandle().then((h) => {
-  if (h && !files.length) {
-    savedHandle = h;
-    render();
-  }
-});
+if (folderAccess)
+  loadHandle().then((h) => {
+    if (h && !files.length) {
+      savedHandle = h;
+      render();
+    }
+  });
 
 // ---------- about ----------
 
