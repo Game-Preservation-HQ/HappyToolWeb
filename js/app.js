@@ -14,6 +14,7 @@ import { renderHex } from './views/hex-view.js';
 import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictures } from './browser.js';
 import { loadHandle, saveHandle, readDirectory } from './data-folder.js';
 import { openPalette, setAppCommands } from './palette.js';
+import { startGamepad } from './gamepad.js';
 
 const $ = (id) => document.getElementById(id);
 const dom = {
@@ -709,6 +710,8 @@ window.addEventListener(
   true,
 );
 $('btn-find').addEventListener('click', openPalette);
+// Controller: moves around the page like the desktop's (stick/D-pad, A, B, X/Y); Menu opens Find a feature.
+startGamepad({ onMenu: openPalette });
 setAppCommands(() => [
   ...(stack().length > 1 ? [{ label: 'Back to the bundle this came from', keys: 'Alt+←', section: 'Location', run: () => popTo(stack().length - 2) }] : []),
 ]);

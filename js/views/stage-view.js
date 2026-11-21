@@ -4,7 +4,7 @@
 // Lighting, lightmap modes and sky placement follow HappyTool/GUI/StageViewerForm.cs (InitGl, DrawMesh, sky pass).
 // The sky can be swapped for another stage's, a picture or a colour preset (slice 3, see stage-sky.js).
 // The stage's collision can be erased by hand and added to with walls, blocks, floors and ramps (see stage-colnav.js).
-import { el, button, toast, downloadBlob, pickFiles, confirmBox, debounce } from '../ui.js';
+import { el, button, toast, downloadBlob, pickFiles, confirmBox, debounce, openDialog } from '../ui.js';
 import { decodeLayers, encodeLayers, writableLayers } from '../formats/wrappers.js';
 import { writeBres } from '../formats/bres.js';
 import {
@@ -18,7 +18,8 @@ import {
 } from '../formats/stage-bake.js';
 import { downloadBytes } from '../util.js';
 import { stageGlb, stageObjZip } from '../formats/model-export.js';
-import { setViewCommands } from '../palette.js';
+import { setViewCommands, openPalette } from '../palette.js';
+import { takePad, PAD } from '../gamepad.js';
 import { decodeDds } from '../formats/dds.js';
 import { buildSteamStage } from '../formats/steam-stage.js';
 import { stripTextureExtension } from '../formats/rrm.js';
@@ -414,12 +415,14 @@ function boxEnter(o, d, lo, hi) {
   }
   return t0;
 }
-function pick(scene, o, d) {
+function pick(scene, o, d, skip = null) {
   let best = null;
   for (const m of scene.meshes) {
     if (!m.visible || m.sky || !rayHitsBox(o, d, m.bounds)) continue;
     const p = m.positions, idx = m.indices;
+    const own = skip && m.triObject ? m.editObjects.indexOf(skip) : -1;
     for (let t = 0; t + 2 < idx.length; t += 3) {
+      if (own >= 0 && m.triObject[t / 3] === own) continue; // `skip` (an object being carried) is not hit
       const a = idx[t] * 3, b = idx[t + 1] * 3, c = idx[t + 2] * 3;
       const e1x = p[b] - p[a], e1y = p[b + 1] - p[a + 1], e1z = p[b + 2] - p[a + 2];
       const e2x = p[c] - p[a], e2y = p[c + 1] - p[a + 1], e2z = p[c + 2] - p[a + 2];
@@ -685,6 +688,9 @@ export function renderStage(node, ctx) {
     let dirty = true, overlayDirty = true;
     let vp = null, viewW = 1, viewH = 1;
     const keys = new Set();
+    let flyMul = 1; // the controller's fly speed (LB/RB), also for WASD
+    let carry = null; // the object the controller carries: {o, start, surface, lift, dist, offset, twisted, sig}
+    let releasePad = null;
     let last = performance.now();
     const saveSoon = debounce(() => store(edit.stage, edit.objects, edit.sky, fogFeatures(edit), gimmickEdits(edit)), 250);
 
@@ -1311,6 +1317,8 @@ export function renderStage(node, ctx) {
     function stop() {
       stopped = true;
       resize.disconnect();
+      releasePad?.();
+      if (carry) cancelCarry(); // a carried object goes back to where it was picked up
       store(edit.stage, edit.objects, edit.sky, fogFeatures(edit), gimmickEdits(edit));
       if (edit.navMatch && !edit.navMatch.done) {
         // Unfinished (the worker running, or the nav still being read): the next view starts it again.
@@ -1330,7 +1338,7 @@ export function renderStage(node, ctx) {
     function fly(dt) {
       if (!keys.size) return false;
       const { f, r } = basis();
-      const speed = Math.max(5, sceneRadius * 0.35) * (keys.has('shift') ? 4 : 1) * dt;
+      const speed = Math.max(5, sceneRadius * 0.35) * flyMul * (keys.has('shift') ? 4 : 1) * dt;
       const mv = [0, 0, 0];
       const add = (v, s) => v.forEach((x, k) => (mv[k] += x * s));
       if (keys.has('w') || keys.has('arrowup')) add(f, 1);
@@ -3528,6 +3536,7 @@ export function renderStage(node, ctx) {
     }
     function selectionChanged() {
       if (gdrag) cancelDrag();
+      if (carry && selected() !== carry.o) dropCarry();
       edit.history.breakMerge();
       hover = -1;
       canvas.style.cursor = '';
@@ -3927,6 +3936,267 @@ export function renderStage(node, ctx) {
       dirty = true;
     });
     texBox.addEventListener('change', () => (dirty = true));
+
+    // ----- controller (StageViewerForm.Forge.cs PollGamepad): fly, look, grab and carry -----
+    const PAD_HINT =
+      'Left stick: fly · Right stick: look · RT/LT: up/down · A: grab · B: deselect · X: add a gimmick · Y: placement panel · D-pad ←/→: undo/redo, ↓: collision · LB/RB: fly speed · R3: frame · View: controls · Menu: find a feature';
+    const CARRY_HINT =
+      'Carrying · A: drop · B: put back · X: stamp a copy · Y: surface/air · Hold LB or RB + sticks: turn (tap: 15°) · D-pad ←/→: size, ↑/↓: lift (in the air: distance) · R3: reset turn and size';
+    const PAD_HELP = [
+      ['Left stick', 'Fly (hold L3 to go faster)'],
+      ['Right stick', 'Look around'],
+      ['RT / LT', 'Fly up / down'],
+      ['A', 'Grab the object in the middle of the view; A again drops it there'],
+      ['B', 'Clear the selection; while carrying, put the object back'],
+      ['X', 'Add a gimmick; while carrying a gimmick, drop it and carry a copy'],
+      ['Y', 'Go to the placement panel (B comes back); while carrying, place on surfaces or in the air'],
+      ['LB / RB', 'Fly slower / faster; while carrying, hold one and use the sticks to turn it, tap to turn 15°'],
+      ['D-pad', 'Left / right: undo / redo, down: collision lines; while carrying, left / right: size, up / down: lift (in the air: distance)'],
+      ['R3', 'Frame the object in the middle of the view; while carrying, reset its turn and size'],
+      ['View', 'This list'],
+      ['Menu', 'Find a feature'],
+      ['Outside the map', 'Stick or D-pad: move between controls, A: press, B: back out, X / Y: next / previous control, View: back'],
+    ];
+    let padUsed = false;
+    const padDue = new Map();
+    /** True on the press, then after 0.35 s, then every 0.12 s while held (the desktop's Repeat). */
+    const padRepeat = (key, on) => {
+      const now = performance.now();
+      if (!on) return padDue.delete(key), false;
+      const t = padDue.get(key);
+      if (t === undefined) return padDue.set(key, now + 350), true;
+      if (now < t) return false;
+      padDue.set(key, now + 120);
+      return true;
+    };
+    const padClamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    /** What the middle of the view aims at (leaving out `skip`). */
+    const aimed = (skip = null) => {
+      const { o, d } = rayAt(canvas.clientWidth / 2, canvas.clientHeight / 2);
+      return pick(scene, o, d, skip);
+    };
+    const eyeTo = (p) => {
+      const { eye } = basis();
+      return Math.hypot(p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]);
+    };
+    function setPadHint() {
+      if (cnMode) return;
+      const t = padUsed ? (carry ? CARRY_HINT : PAD_HINT) : baseHint;
+      if (hint.textContent !== t) hint.textContent = t;
+    }
+    /** Picks an object up (the desktop's Grab): it keeps its place against the surface under the aim until moved. */
+    function startCarry(o) {
+      if (o.state.hidden) return false;
+      if (!o.bounds) apply(o, o.state);
+      const c = centre(o.bounds), hit = aimed(o);
+      carry = { o, start: o.state, surface: !!hit, lift: 0, dist: 0, offset: [0, 0, 0], twisted: false, sig: '' };
+      if (hit) {
+        carry.offset = [c[0] - hit.point[0], 0, c[2] - hit.point[2]];
+        carry.lift = padClamp(o.bounds.min[1] - hit.point[1], -2000, 4000);
+      } else carry.dist = padClamp(eyeTo(c), 150, 30000);
+      edit.history.breakMerge();
+      flash(`Carrying ${shortObjectName(o.name)}: A drops it, B puts it back`);
+      return true;
+    }
+    /** The carried object follows the aim: on the surface under it, or in the air ahead (UpdateHeld). */
+    function followCarry() {
+      const o = carry.o;
+      const sig = [cam.yaw, cam.pitch, cam.dist, ...cam.target, carry.surface, carry.lift, carry.dist, ...o.state.r, ...o.state.s].join();
+      if (sig === carry.sig || !o.bounds) return;
+      carry.sig = sig;
+      const b = o.bounds, c = centre(b);
+      let to;
+      if (carry.surface) {
+        const hit = aimed(o);
+        if (!hit) return;
+        to = [hit.point[0] + carry.offset[0], hit.point[1] + carry.lift + (c[1] - b.min[1]), hit.point[2] + carry.offset[2]];
+      } else {
+        const { f, eye } = basis();
+        to = eye.map((x, k) => x + f[k] * carry.dist);
+      }
+      const dt = to.map((x, k) => x - c[k]);
+      if (Math.abs(dt[0]) + Math.abs(dt[1]) + Math.abs(dt[2]) < 1e-6) return;
+      apply(o, withState(o.state, { t: o.state.t.map((x, k) => x + dt[k]) }));
+    }
+    /** Puts the carried object down where it is: one undo step from where it was picked up. */
+    function dropCarry() {
+      if (!carry) return;
+      const { o, start } = carry, final = o.state;
+      carry = null;
+      apply(o, start);
+      change([o], () => final, 'Carry');
+      edit.history.breakMerge();
+      setPadHint();
+    }
+    /** Puts the carried object back where it was picked up. */
+    function cancelCarry() {
+      if (!carry) return;
+      const { o, start } = carry;
+      carry = null;
+      apply(o, start);
+      setPadHint();
+    }
+    function twistCarry(d) {
+      const o = carry.o;
+      apply(o, withState(o.state, { r: o.state.r.map((x, i) => wrapDegrees(x + d[i])) }));
+    }
+    function padHelp() {
+      openDialog((dlg, done) => {
+        dlg.append(
+          el('h2', { class: 'dialog-title' }, 'Controller'),
+          el('dl', { class: 'stage-pad-help' }, PAD_HELP.flatMap(([k, v]) => [el('dt', {}, k), el('dd', {}, v)])),
+          el('div', { class: 'dialog-actions' }, button('Close', () => done(null), { autofocus: true })),
+        );
+      });
+    }
+    function padFlyLook(pad) {
+      const { f, r } = basis();
+      const speed = Math.max(5, sceneRadius * 0.35) * flyMul * (pad.held(PAD.L3) ? 4 : 1) * pad.dt;
+      const up = pad.rt - pad.lt;
+      if (pad.lx || pad.ly || up) {
+        cam.target = cam.target.map((x, k) => x + (f[k] * pad.ly + r[k] * pad.lx + (k === 1 ? up : 0)) * speed);
+        dirty = true;
+      }
+      if (pad.rx || pad.ry) {
+        // Turn the camera where it stands (the desktop looks from the eye, not about a centre).
+        const { eye } = basis();
+        cam.yaw += pad.rx * 2.6 * pad.dt;
+        cam.pitch = padClamp(cam.pitch + pad.ry * 2.6 * pad.dt, -1.55, 1.55);
+        const nf = basis().f;
+        cam.target = eye.map((x, k) => x + nf[k] * cam.dist);
+        dirty = true;
+      }
+    }
+    function padCarry(pad) {
+      const o = carry.o;
+      if (pad.edge(PAD.LB) || pad.edge(PAD.RB)) carry.twisted = false;
+      if (pad.held(PAD.LB) || pad.held(PAD.RB)) {
+        const k = 110 * pad.dt, d = [-(pad.ly + pad.ry) * k, pad.lx * k, -pad.rx * k]; // tilt, turn, lean (TwistRate)
+        if (d.some((x) => x)) {
+          carry.twisted = true;
+          twistCarry(d);
+        }
+      } else padFlyLook(pad);
+      for (const [b, s] of [[PAD.LB, -1], [PAD.RB, 1]]) if (pad.released(b) && !carry.twisted) twistCarry([0, 15 * s, 0]);
+      if (pad.edge(PAD.A)) return dropCarry();
+      if (pad.edge(PAD.B)) return cancelCarry(), flash('Put back');
+      if (pad.edge(PAD.X)) {
+        if (!o.gimmick) return toast('Only gimmicks can be copied here so far.');
+        dropCarry();
+        // Stamp: the copy comes in at the aim and is carried on (DuplicateGimmick).
+        return duplicateGimmick().then(() => {
+          const n = selected();
+          if (n && n !== o && !carry && !stopped) startCarry(n);
+          setPadHint();
+        });
+      }
+      if (pad.edge(PAD.Y)) {
+        carry.surface = !carry.surface;
+        if (carry.surface) (carry.lift = 0), (carry.offset = [0, 0, 0]);
+        else carry.dist = padClamp(eyeTo(centre(o.bounds)), 150, 30000);
+        toast(carry.surface ? 'Placing on surfaces' : 'Placing in the air (D-pad up / down: farther / closer)');
+      } else if (pad.edge(PAD.R3)) {
+        const s0 = o.stock ?? IDENTITY;
+        apply(o, withState(o.state, { r: s0.r.slice(), s: s0.s.slice() }));
+      }
+      const sl = padRepeat('left', pad.held(PAD.LEFT)), sr = padRepeat('right', pad.held(PAD.RIGHT));
+      if (sl || sr) {
+        if (!o.gimmick) apply(o, withState(o.state, { s: o.state.s.map((x) => padClamp(x * (sr ? 1.1 : 1 / 1.1), 0.01, 100)) }));
+        else if (pad.edge(PAD.LEFT) || pad.edge(PAD.RIGHT)) toast("A gimmick's table has no size.");
+      }
+      const lu = padRepeat('up', pad.held(PAD.UP)), ld = padRepeat('down', pad.held(PAD.DOWN));
+      if (lu || ld) {
+        if (carry.surface) carry.lift = padClamp(carry.lift + (lu ? 1 : -1) * nudgeStep, -2000, 4000);
+        else carry.dist = padClamp(carry.dist * (lu ? 1.12 : 1 / 1.12), 150, 30000);
+      }
+      followCarry();
+    }
+    function padFree(pad) {
+      padFlyLook(pad);
+      if (cnMode) {
+        // The collision & nav editor keeps its own keys; the pad flies, looks and can leave it with B.
+        if (pad.edge(PAD.B)) canvas.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+        return;
+      }
+      if (pad.edge(PAD.A)) {
+        const hit = aimed();
+        if (hit?.object && !hit.object.state.hidden) {
+          inspect(hit);
+          startCarry(hit.object);
+        } else toast('Aim at an object to grab it, or press X for new gimmicks.');
+      } else if (pad.edge(PAD.B)) {
+        if (selection) select(null), flash('Selection cleared');
+      } else if (pad.edge(PAD.X)) {
+        if (!scene.gimmicks) toast('This stage has no gimmick table.');
+        else toggleCatalog(true).then(() => (catalogBox.querySelector('.stage-gimmick') || catalogBox.querySelector('input'))?.focus());
+      } else if (pad.edge(PAD.Y)) {
+        const c = selected() && placeBox.querySelector('input, select, button');
+        if (c) c.focus();
+        else toast('Select an object first (A grabs the one you aim at).');
+      } else if (pad.edge(PAD.R3)) {
+        const hit = aimed();
+        if (hit?.object?.bounds) {
+          Object.assign(cam, framed(hit.object.bounds, cam));
+          dirty = true;
+        } else frameSelection();
+      }
+      if (pad.edge(PAD.LEFT)) undo();
+      else if (pad.edge(PAD.RIGHT)) redo();
+      else if (pad.edge(PAD.UP)) toast('The play test is not in the web version yet.');
+      else if (pad.edge(PAD.DOWN)) toggleCollision();
+      const sl = padRepeat('lb', pad.held(PAD.LB)), sr = padRepeat('rb', pad.held(PAD.RB));
+      if (sl || sr) {
+        flyMul = Math.round(padClamp(flyMul + (sr ? 0.1 : -0.1), 0.1, 5) * 10) / 10;
+        const t = `Fly speed ${flyMul.toFixed(1)}×`;
+        if (pad.edge(PAD.LB) || pad.edge(PAD.RB)) toast(t);
+        flash(t);
+      }
+    }
+    if (!stopped)
+      releasePad = takePad((pad) => {
+        if (stopped || !canvas.isConnected || document.querySelector('dialog[open]')) return false;
+        const a = document.activeElement;
+        if (a && a !== canvas && a !== document.body) {
+          if (carry) dropCarry();
+          // B in the map's side panels: Esc there first (closes the catalogue), else back to the map.
+          if (pad.edge(PAD.B) && view.contains(a)) {
+            if (a.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))) canvas.focus({ preventScroll: true });
+            return true;
+          }
+          return false;
+        }
+        if (pad.buttons || pad.lx || pad.ly || pad.rx || pad.ry || pad.lt || pad.rt) padUsed = true;
+        if (pad.edge(PAD.MENU)) openPalette();
+        else if (pad.edge(PAD.VIEW)) padHelp();
+        else if (carry) padCarry(pad);
+        else padFree(pad);
+        setPadHint();
+        return true;
+      });
+    // Keyboard or mouse on the map: the hint goes back to the keys, and a carried object is put down first
+    // (Ctrl+Z / Ctrl+Y put it back instead, then undo or redo as usual).
+    canvas.addEventListener(
+      'keydown',
+      (e) => {
+        padUsed = false;
+        if (carry) {
+          const k = e.key.toLowerCase();
+          if ((e.ctrlKey || e.metaKey) && (k === 'z' || k === 'y')) cancelCarry();
+          else dropCarry();
+        }
+        setPadHint();
+      },
+      true,
+    );
+    canvas.addEventListener(
+      'pointerdown',
+      () => {
+        padUsed = false;
+        dropCarry();
+        setPadHint();
+      },
+      true,
+    );
 
     // ----- Find a feature (Ctrl+K): the map's keyboard shortcuts, sent to the map as the key would be -----
     const press = (key, mods = {}) => () => {

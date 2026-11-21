@@ -371,6 +371,9 @@ kbd {
 .dialog-text { margin: 0 0 14px; }
 .dialog .input { width: 100%; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.stage-pad-help { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; max-width: 640px; }
+.stage-pad-help dt { font-weight: 600; }
+.stage-pad-help dd { margin: 0; }
 .toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 50; max-width: calc(100vw - 32px); }
 .toast { padding: 10px 14px; border-radius: var(--radius); background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow); max-width: 420px; }
 .toast-ok { border-left: 4px solid var(--ok); }
