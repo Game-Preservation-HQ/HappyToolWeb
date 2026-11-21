@@ -263,7 +263,7 @@ function mergeModel(meshes, keyOf) {
 }
 
 /** A placement's mesh: the model at the table's position (not turned: the object's rotation turns it). */
-function placementMesh(tpl, g) {
+export function placementMesh(tpl, g) {
   const P = g.position0, src = tpl.positions, positions = new Float32Array(src.length);
   for (let i = 0; i < src.length; i += 3) {
     positions[i] = src[i] + P[0];
@@ -277,12 +277,196 @@ function placementMesh(tpl, g) {
 }
 
 /**
- * Reads the stage's gimmick table and builds a mesh for every placement whose model is found (LoadGimmicks): returns
- * {table: {name, path, stageId, text, layers}, placements, meshes, log} or null when the stage has no table. Decoded
- * textures go into `textures` under `gimmick:<bundle>/<name>`.
- * @param {{ids: string[], dataFiles: (dir: string) => {name, path, read}[], textures: Map, report: (t: string) => void}} o
+ * The gimmick models of the Data folder, read and built when first wanted (the desktop's EnsureGimmickModel).
+ * `load(models)` returns lower model name → template (the model's meshes merged into one buffer), or null for a model
+ * with no bundle or no geometry. Decoded textures go into `textures` under `gimmick:<bundle>/<name>`; those a model
+ * lacks come from the other bundles (FindSharedGimmickTextures): gall01 first, then bundles named like a wanted
+ * texture, then the rest.
  */
-export async function loadGimmicks({ ids, dataFiles, textures, report = () => {} }) {
+export function gimmickKit({ dataFiles, textures, report = () => {} }) {
+  const bundles = dataFiles('gimmick')
+    .filter((f) => /\.bres$/i.test(f.name))
+    .sort((a, b) => (lower(a.name) < lower(b.name) ? -1 : lower(a.name) > lower(b.name) ? 1 : 0));
+  const byName = new Map(bundles.map((f) => [lower(f.name), f]));
+  const templates = new Map(); // lower model → template, null when it could not be built
+  const where = new Map(); // texture → the bundle that has it
+  const absent = new Set(); // textures no bundle has
+  const failed = new Set();
+
+  async function load(list, say = report) {
+    // Bundles are held only while one load runs: they are large, and the decoded pictures are what is kept.
+    const arcs = new Map();
+    const readArc = async (f) => {
+      if (!arcs.has(f)) {
+        let arc = null;
+        try {
+          arc = parseBres((await decodeLayers(await f.read())).payload);
+        } catch (e) {
+          console.warn(`Gimmicks: ${f.path} could not be read: ${e.message}`);
+        }
+        arcs.set(f, arc);
+      }
+      return arcs.get(f);
+    };
+
+    // The models (one per name), built as stages are.
+    const models = new Map();
+    const names = [...new Set(list.map(lower))].filter((m) => m && !templates.has(m));
+    for (const [i, m] of names.entries()) {
+      templates.set(m, null);
+      const f = bundleOf(byName, m);
+      if (!f) continue;
+      say(`Gimmick models (${i + 1} of ${names.length})…`);
+      await pause();
+      const arc = await readArc(f);
+      if (!arc) continue;
+      try {
+        models.set(m, { file: f, arc, own: ddsNames(arc), ...(await buildModel(arc)) });
+      } catch (e) {
+        console.warn(`Gimmicks: model ${m}: ${e.message}`);
+      }
+    }
+
+    // Textures a model lacks, from the other bundles.
+    const wanted = new Set();
+    for (const md of models.values()) for (const t of md.need) if (!md.own.has(t) && !where.has(t) && !absent.has(t)) wanted.add(t);
+    if (wanted.size) {
+      const rank = (f) => (stemOf(f) === 'gall01' ? 0 : [...wanted].some((w) => stemOf(f).startsWith(w.length > 3 ? w.slice(0, 4) : w)) ? 1 : 2);
+      const order = bundles.map((f, i) => ({ f, i, r: rank(f) })).sort((a, b) => a.r - b.r || a.i - b.i).map((x) => x.f);
+      for (const f of order) {
+        if ([...wanted].every((w) => where.has(w))) break;
+        const arc = await readArc(f);
+        if (!arc) continue;
+        for (const t of ddsNames(arc)) if (wanted.has(t) && !where.has(t)) where.set(t, f);
+      }
+      for (const w of wanted) if (!where.has(w)) absent.add(w);
+    }
+
+    // Decoded pictures, once per bundle and name.
+    const decode = async (file, arc, name) => {
+      const key = `gimmick:${stemOf(file)}/${name}`;
+      if (textures.has(key)) return key;
+      if (failed.has(key)) return null;
+      const e = arc.entries.find((x) => /\.dds$/i.test(x.name) && lower(stripTextureExtension(x.name)) === name && !x.pointer && x.data?.length);
+      try {
+        if (!e) throw new Error('not in the bundle');
+        textures.set(key, decodeDds((await decodeLayers(e.data)).payload));
+        return key;
+      } catch (err) {
+        console.warn(`Gimmicks: texture ${name} of ${file.name} could not be decoded: ${err.message}`);
+        failed.add(key);
+        return null;
+      }
+    };
+    for (const [m, md] of models) {
+      say(`Gimmick textures (${m})…`);
+      await pause();
+      const keys = new Map();
+      for (const t of md.need) {
+        const file = md.own.has(t) ? md.file : where.get(t);
+        const arc = !file ? null : file === md.file ? md.arc : await readArc(file);
+        keys.set(t, arc ? await decode(file, arc, t) : null);
+      }
+      templates.set(m, mergeModel(md.meshes, (n) => (n ? keys.get(lower(n)) ?? null : null)));
+    }
+    return new Map(list.map((m) => [lower(m), templates.get(lower(m)) ?? null]));
+  }
+
+  return { load, has: (model) => !!bundleOf(byName, lower(model)) };
+}
+
+const ordinal = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+/**
+ * Every kind of gimmick the game's stage tables place, with a record to copy (GimmickCatalog): one per model, an
+ * enabled record preferred, models without a bundle left out, sorted by type then model. This stage's table is read
+ * first, so a copy matches its neighbours. [{model, type, tag, stage, text, camera}]
+ */
+export async function gimmickCatalog({ dataFiles, stageId, has, report = () => {} }) {
+  const own = lower(`${stageId}_stage_gimmick.json`);
+  const files = dataFiles('json/stage')
+    .filter((f) => /_stage_gimmick\.json$/i.test(f.name))
+    .sort((a, b) => (lower(a.name) === own ? -1 : lower(b.name) === own ? 1 : ordinal(lower(a.name), lower(b.name))));
+  const kinds = new Map(); // lower model → kind
+  for (const [i, f] of files.entries()) {
+    if (i % 8 === 0) {
+      report(`Gimmick catalogue (${i + 1} of ${files.length})…`);
+      await pause();
+    }
+    let text;
+    try {
+      text = new TextDecoder('utf-8', { ignoreBOM: true }).decode((await decodeLayers(await f.read())).payload);
+    } catch (e) {
+      console.warn(`Gimmicks: ${f.path} could not be read: ${e.message}`);
+      continue;
+    }
+    const sec = findSection(text, SECTION);
+    if (!sec) continue;
+    const cams = new Map();
+    const cs = findSection(text, CAMERA_SECTION);
+    if (cs) for (const e of jsonEntries(text, cs.open, cs.close)) if (!cams.has(e.key)) cams.set(e.key, text.slice(e.open, e.close + 1));
+    const stage = f.name.replace(/_stage_gimmick\.json$/i, '');
+    for (const e of jsonEntries(text, sec.open, sec.close)) {
+      const record = text.slice(e.open, e.close + 1), fl = jsonFields(record);
+      if (!fl.has('transX_') || !fl.has('gimmickType_')) continue;
+      const model = gimmickModelName(e.key, fl), k = lower(model);
+      const disabled = fl.get('bodyKind_') === 'DISABLE' || fl.get('enable_') === 'false';
+      const had = kinds.get(k);
+      if (had ? !(had.disabled && !disabled) : !has(model)) continue;
+      kinds.set(k, { model, type: fl.get('gimmickType_'), tag: e.key, stage, text: record, camera: cams.get(e.key) ?? null, disabled });
+    }
+  }
+  return [...kinds.values()].sort((a, b) => ordinal(a.type, b.type) || ordinal(a.model, b.model));
+}
+
+/**
+ * A tag for a new placement of a kind (NewGimmick): the copied record's tag up to its last '_' (the model when that is
+ * empty), numbered from 901 past any tag in use or written in the table.
+ */
+export function newGimmickTag(kind, used, text = '') {
+  let stem = kind.tag.slice(0, Math.max(0, kind.tag.lastIndexOf('_')));
+  if (!stem) stem = kind.model;
+  for (let n = 901; ; n++) {
+    const tag = `${stem}_${n}`;
+    if (!used.has(tag) && !(text ?? '').includes(`"${tag}"`)) return tag;
+  }
+}
+
+/** A new placement of a kind (NewGimmick), hidden until it is placed; its mesh is built at `position`. */
+export function newPlacement(kind, tag, position, rotation = [0, 0, 0]) {
+  const p = position.map((x) => Math.fround(x)), r = rotation.map((x) => Math.fround(x));
+  return {
+    tag, type: kind.type, model: kind.model, season: null, isNew: true, templateText: kind.text, templateCamera: kind.camera,
+    templateTag: kind.tag, position: p, rotation: r, removed: true, position0: p.slice(), rotation0: r.slice(), removed0: true,
+  };
+}
+
+/**
+ * The edits file's new placements not yet on the stage (entries with a model, this season's, not removed, tag not
+ * placed yet), as hidden placements made from the catalogue's kind of their model; reading their entries onto them
+ * shows them (the desktop's restore in LoadGimmicks). Entries whose model is not in the catalogue are left out.
+ */
+export function newPlacementsOf(list, kinds, placed) {
+  const ok = (v) => Array.isArray(v) && v.length === 3 && v.every((x) => Number.isFinite(Number(x)));
+  const out = [], tags = new Set(placed);
+  for (const s of list ?? []) {
+    if (!s || typeof s.Tag !== 'string' || typeof s.Model !== 'string' || (s.Season ?? null) !== null || s.Removed) continue;
+    if (tags.has(s.Tag)) continue;
+    const kind = kinds.find((k) => lower(k.model) === lower(s.Model));
+    if (!kind) continue;
+    tags.add(s.Tag);
+    out.push(newPlacement(kind, s.Tag, ok(s.Position) ? s.Position.map(Number) : [0, 0, 0], ok(s.Rotation) ? s.Rotation.map(Number) : [0, 0, 0]));
+  }
+  return out;
+}
+
+/**
+ * Reads the stage's gimmick table and builds a mesh for every placement whose model is found (LoadGimmicks): returns
+ * {table: {name, path, stageId, text, layers}, placements, meshes, log, kit, catalogue(report)} or null when the stage
+ * has no table. `saved` is the Gimmicks list kept in this browser: its new placements are made (hidden) as well.
+ * @param {{ids: string[], dataFiles: (dir: string) => {name, path, read}[], textures: Map, report: (t: string) => void, saved?: object[]}} o
+ */
+export async function loadGimmicks({ ids, dataFiles, textures, report = () => {}, saved = [] }) {
   const tables = dataFiles('json/stage');
   let file = null, stageId = null;
   for (const id of ids) {
@@ -306,94 +490,33 @@ export async function loadGimmicks({ ids, dataFiles, textures, report = () => {}
   if (!placements) return null;
   const log = [`gimmicks: ${placements.length} placements in ${file.name}`];
   const table = { name: file.name, path: file.path, stageId, text, layers };
+  const kit = gimmickKit({ dataFiles, textures, report });
+  let catalog = null;
+  const catalogue = (say = () => {}) =>
+    (catalog ??= gimmickCatalog({ dataFiles, stageId, has: kit.has, report: say }).catch((e) => {
+      catalog = null;
+      throw e;
+    }));
 
-  const bundles = dataFiles('gimmick')
-    .filter((f) => /\.bres$/i.test(f.name))
-    .sort((a, b) => (lower(a.name) < lower(b.name) ? -1 : lower(a.name) > lower(b.name) ? 1 : 0));
-  const byName = new Map(bundles.map((f) => [lower(f.name), f]));
-  const arcs = new Map();
-  const readArc = async (f) => {
-    if (!arcs.has(f)) {
-      let arc = null;
-      try {
-        arc = parseBres((await decodeLayers(await f.read())).payload);
-      } catch (e) {
-        console.warn(`Gimmicks: ${f.path} could not be read: ${e.message}`);
-      }
-      arcs.set(f, arc);
-    }
-    return arcs.get(f);
-  };
-
-  // The models (one per name), built as stages are.
-  const models = new Map();
-  const names = [...new Set(placements.map((g) => lower(g.model)))];
-  for (const [i, m] of names.entries()) {
-    const f = bundleOf(byName, m);
-    if (!f) continue;
-    report(`Gimmick models (${i + 1} of ${names.length})…`);
-    await pause();
-    const arc = await readArc(f);
-    if (!arc) continue;
+  // New placements kept in this browser, made from the catalogue (it is read only when there are some).
+  if (Array.isArray(saved) && saved.some((s) => s && typeof s.Model === 'string' && !s.Removed)) {
     try {
-      models.set(m, { file: f, arc, own: ddsNames(arc), ...(await buildModel(arc)) });
+      const fresh = newPlacementsOf(saved, await catalogue(report), placements.map((g) => g.tag));
+      placements.push(...fresh);
+      if (fresh.length) log.push(`gimmicks: ${fresh.length} new placements kept in this browser`);
     } catch (e) {
-      console.warn(`Gimmicks: model ${m}: ${e.message}`);
+      console.warn(`Gimmicks: the catalogue could not be read: ${e.message}`);
     }
   }
 
-  // Textures a model lacks, from the other gimmick bundles (FindSharedGimmickTextures): gall01 first, then bundles
-  // named like a wanted texture, then the rest.
-  const wanted = new Set();
-  for (const md of models.values()) for (const t of md.need) if (!md.own.has(t)) wanted.add(t);
-  const where = new Map(); // texture → {file, arc}
-  if (wanted.size) {
-    const rank = (f) => (stemOf(f) === 'gall01' ? 0 : [...wanted].some((w) => stemOf(f).startsWith(w.length > 3 ? w.slice(0, 4) : w)) ? 1 : 2);
-    const order = bundles.map((f, i) => ({ f, i, r: rank(f) })).sort((a, b) => a.r - b.r || a.i - b.i).map((x) => x.f);
-    for (const f of order) {
-      if ([...wanted].every((w) => where.has(w))) break;
-      const arc = await readArc(f);
-      if (!arc) continue;
-      for (const t of ddsNames(arc)) if (wanted.has(t) && !where.has(t)) where.set(t, { file: f, arc });
-    }
-  }
-
-  // Decoded pictures, once per bundle and name.
-  const failed = new Set();
-  const decode = async (file, arc, name) => {
-    const key = `gimmick:${stemOf(file)}/${name}`;
-    if (textures.has(key)) return key;
-    if (failed.has(key)) return null;
-    const e = arc.entries.find((x) => /\.dds$/i.test(x.name) && lower(stripTextureExtension(x.name)) === name && !x.pointer && x.data?.length);
-    try {
-      if (!e) throw new Error('not in the bundle');
-      textures.set(key, decodeDds((await decodeLayers(e.data)).payload));
-      return key;
-    } catch (err) {
-      console.warn(`Gimmicks: texture ${name} of ${file.name} could not be decoded: ${err.message}`);
-      failed.add(key);
-      return null;
-    }
-  };
-  const templates = new Map();
-  for (const [m, md] of models) {
-    report(`Gimmick textures (${m})…`);
-    await pause();
-    const keys = new Map();
-    for (const t of md.need) {
-      const src = md.own.has(t) ? { file: md.file, arc: md.arc } : where.get(t);
-      keys.set(t, src ? await decode(src.file, src.arc, t) : null);
-    }
-    templates.set(m, mergeModel(md.meshes, (n) => (n ? keys.get(lower(n)) ?? null : null)));
-  }
-
+  const templates = await kit.load(placements.map((g) => g.model));
   const meshes = [];
   for (const g of placements) {
     const tpl = templates.get(lower(g.model));
     if (tpl) meshes.push(placementMesh(tpl, g));
   }
   log.push(`gimmicks: shown ${meshes.length} with their models`);
-  return { table, placements, meshes, log };
+  return { table, placements, meshes, log, kit, catalogue };
 }
 
 // ---------- the edited table ----------
@@ -459,8 +582,10 @@ export function editedGimmickTable(text, placements) {
   while (end > sec.open && /\s/.test(text[end - 1])) end--;
   out += text.slice(at, end);
   const fresh = placements.filter((g) => g.isNew && !g.removed);
+  let sep = seen.size ? ',' : '';
   for (const g of fresh) {
-    out += `,\n\t"${g.tag}":${placeRecord(g.templateText, g)}`;
+    out += `${sep}\n\t"${g.tag}":${placeRecord(g.templateText, g)}`;
+    sep = ',';
     added++;
   }
   let result = out + text.slice(end);
@@ -469,7 +594,8 @@ export function editedGimmickTable(text, placements) {
   if (cs) {
     let ce = cs.close;
     while (ce > cs.open && /\s/.test(result[ce - 1])) ce--;
-    result = result.slice(0, ce) + cams.map((g) => `,\n\t"${g.tag}":${g.templateCamera}`).join('') + result.slice(ce);
+    const first = jsonEntries(result, cs.open, cs.close).length ? ',' : '';
+    result = result.slice(0, ce) + cams.map((g, i) => `${i ? ',' : first}\n\t"${g.tag}":${g.templateCamera}`).join('') + result.slice(ce);
   }
   // Must still read back to the same placements (WriteGimmickTable).
   const back = findSection(result, SECTION);

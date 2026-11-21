@@ -474,6 +474,8 @@ span.twisty { cursor: default; }
 .stage-gimmick:hover, .stage-gimmick:focus-visible { background: rgba(127, 127, 127, 0.14); }
 .stage-gimmick.on { color: var(--accent); }
 .stage-gimmick.nomodel { cursor: default; opacity: 0.6; }
+.stage-gimmick-catalog { margin-top: 6px; }
+.stage-gimmick-filter { width: 100%; box-sizing: border-box; }
 .stage-inspect p { margin: 0; }
 .stage-inspect dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 0 0 8px; font-size: 13px; }
 .stage-inspect dt { color: var(--muted); }

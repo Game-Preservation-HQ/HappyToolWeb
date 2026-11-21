@@ -37,7 +37,7 @@ import {
 import { readCollision, edgesOf } from './stage-collision.js';
 import {
   loadGimmicks, stateOfPlacement, placementFromState, placementChanged, gimmickEdit, applyGimmickEdit, editedGimmickTable,
-  gimmickTableBytes,
+  gimmickTableBytes, placementMesh, newPlacement, newGimmickTag, newPlacementsOf,
 } from './stage-gimmicks.js';
 import { readNav, navLines, writeNavMesh, writePathGraph, is360Spd, spd360ToSteam } from '../formats/stage-nav.js';
 import { rebuildNav, Blocker, MIN_REF, nodeRefKey, navSummary, navChanged, pathChanged } from '../formats/stage-nav-edit.js';
@@ -121,7 +121,9 @@ async function loadScene(model, report, source = null) {
   let gimmicks = null;
   if (source?.dataFiles) {
     try {
-      gimmicks = await loadGimmicks({ ids: source.ids, dataFiles: source.dataFiles, textures, report });
+      const kept = loadStored(stageKey(model.name));
+      const saved = Array.isArray(kept?.Gimmicks) ? kept.Gimmicks : [];
+      gimmicks = await loadGimmicks({ ids: source.ids, dataFiles: source.dataFiles, textures, report, saved });
       if (gimmicks) {
         for (const line of gimmicks.log) console.info(`Map viewer: ${line}`);
         meshes.push(...gimmicks.meshes);
@@ -472,15 +474,7 @@ function setUpEdits(scene, model) {
   // Gimmicks: pivot at the table's position, the stock state its rotation (and removal), so the state reads back as the
   // placement. Their meshes are placed by their state when the view starts.
   edit.gimmickOther = []; // Gimmicks entries of the edits file for other seasons or placements not shown, kept as read
-  for (const o of edit.objects) {
-    const g = o.mesh.gimmick;
-    if (!g) continue;
-    o.gimmick = g;
-    o.pivot = g.position0.slice();
-    o.label = `${g.type} · ${g.tag}`;
-    o.stock = stateOfPlacement({ ...g, position: g.position0, rotation: g.rotation0, removed: g.removed0 });
-    o.state = o.stock;
-  }
+  for (const o of edit.objects) if (o.mesh.gimmick) setUpGimmick(o);
   const stored = loadStored(edit.stage);
   if (stored) {
     try {
@@ -514,6 +508,16 @@ function setUpEdits(scene, model) {
   return edit;
 }
 
+/** A gimmick object: pivot at the table's position, its stock state the table's rotation and removal. */
+function setUpGimmick(o) {
+  const g = o.mesh.gimmick;
+  o.gimmick = g;
+  o.pivot = g.position0.slice();
+  o.label = `${g.type} · ${g.tag}`;
+  o.stock = stateOfPlacement({ ...g, position: g.position0, rotation: g.rotation0, removed: g.removed0 });
+  o.state = o.stock;
+}
+
 /** Whether an object differs from the stage files (a gimmick: from its table). */
 const isEdited = (o) => (o.gimmick ? placementChanged(placementFromState(o)) : !isEmpty(o.state));
 
@@ -537,7 +541,7 @@ function readGimmickEdits(edit, list) {
   for (const s of list) {
     if (typeof s.Tag !== 'string') continue;
     const season = s.Season ?? null;
-    const objs = season == null ? edit.objects.filter((o) => o.gimmick && !o.gimmick.isNew && o.gimmick.tag === s.Tag) : [];
+    const objs = season == null ? edit.objects.filter((o) => o.gimmick && o.gimmick.tag === s.Tag) : [];
     if (!objs.length) {
       edit.gimmickOther = edit.gimmickOther.filter((x) => !(x.Tag === s.Tag && (x.Season ?? null) === season));
       edit.gimmickOther.push(s);
@@ -1225,6 +1229,14 @@ export function renderStage(node, ctx) {
         res = readEditsFile(JSON.parse((await f.text()).replace(/^﻿/, '')), edit.objects);
       } catch (e) {
         return toast(`${f.name} could not be read: ${e.message}`, 'error');
+      }
+      if (scene.gimmicks && res.gimmicks.some((s) => typeof s?.Model === 'string' && !s.Removed)) {
+        try {
+          const fresh = newPlacementsOf(res.gimmicks, await scene.gimmicks.catalogue(), scene.gimmicks.placements.map((g) => g.tag));
+          if (fresh.length) await addPlacements(fresh);
+        } catch (e) {
+          console.warn(`Map editor: the new gimmicks of ${f.name} could not be made: ${e.message}`);
+        }
       }
       const changes = [];
       for (const c of [...res.changed, ...readGimmickEdits(edit, res.gimmicks)]) {
@@ -3595,12 +3607,16 @@ export function renderStage(node, ctx) {
       }
       for (const o of gimmickObjects.values()) placementFromState(o);
       const changed = gm.placements.filter(placementChanged);
-      const removed = changed.filter((g) => g.removed && !g.removed0).length, moved = changed.length - removed;
+      const added = changed.filter((g) => g.isNew).length, removed = changed.filter((g) => g.removed && !g.removed0).length;
+      const moved = changed.length - removed - added, own = gm.placements.filter((g) => !g.isNew).length;
       gimmickNote.textContent =
-        `${gm.placements.length} placements in ${gm.table.name}; ${gimmickObjects.size} shown with their models. ` +
-        (changed.length ? `Edited: ${moved} moved, ${removed} removed.` : 'Select one to move, turn or remove (Del) it.');
+        `${own} placements in ${gm.table.name}; ${[...gimmickObjects.keys()].filter((g) => !g.isNew).length} shown with their models. ` +
+        (changed.length
+          ? `Edited: ${moved} moved, ${removed} removed${added ? `, ${added} added` : ''}.`
+          : 'Select one to move, turn or remove (Del) it.');
       gimmickBtn.disabled = !changed.length;
-      if (!gimmickBox.contains(gimmickList)) gimmickBox.replaceChildren(gimmickNote, el('div', { class: 'toolbar' }, gimmickBtn), gimmickList);
+      if (!gimmickBox.contains(gimmickList))
+        gimmickBox.replaceChildren(gimmickNote, el('div', { class: 'toolbar' }, gimmickBtn, addBtn), catalogBox, gimmickList);
       const sel = selected();
       const rows = gm.placements
         .filter((g) => !(g.isNew && g.removed))
@@ -3628,6 +3644,128 @@ export function renderStage(node, ctx) {
           return row;
         });
       gimmickList.replaceChildren(...rows);
+    }
+    // New gimmicks: a kind from the catalogue (every model the game's stage tables place), or a copy of the selected one.
+    const addBtn = button('Add a gimmick…', () => toggleCatalog(), {
+      title: "Place a new gimmick, set up like one from any stage's table (the game decides how it behaves from its type)",
+    });
+    const catalogBox = el('div', { class: 'stage-gimmick-catalog' });
+    catalogBox.hidden = true;
+    let catalogKinds = null, adding = false;
+    async function toggleCatalog(show = catalogBox.hidden) {
+      catalogBox.hidden = !show;
+      addBtn.setAttribute('aria-expanded', String(show));
+      if (!show) return;
+      if (!catalogKinds) {
+        catalogBox.replaceChildren(el('p', { class: 'muted' }, "Reading every stage's gimmick table…"));
+        try {
+          catalogKinds = await scene.gimmicks.catalogue();
+        } catch (e) {
+          catalogBox.replaceChildren(el('p', { class: 'muted' }, `The gimmick catalogue could not be read: ${e.message}`));
+          return;
+        }
+      }
+      const filter = el('input', { type: 'search', class: 'stage-gimmick-filter', placeholder: 'Filter by type or model', 'aria-label': 'Filter the gimmicks to add' });
+      const list = el('div', { class: 'stage-gimmick-list' });
+      const fill = () => {
+        const q = filter.value.trim().toLowerCase();
+        const kinds = catalogKinds.filter((k) => !q || `${k.type} ${k.model} ${k.stage}`.toLowerCase().includes(q));
+        list.replaceChildren(
+          ...(kinds.length
+            ? kinds.map((k) => {
+                const row = el(
+                  'div',
+                  { class: 'stage-layer stage-gimmick', tabindex: '0', role: 'button', title: `Set up like ${k.tag} in ${k.stage}. The game decides how it behaves from its type.` },
+                  el('span', { class: 'stage-layer-name' }, `${k.type} · ${k.model}`),
+                  el('span', { class: 'muted' }, k.stage),
+                );
+                row.addEventListener('click', () => addGimmick(k));
+                row.addEventListener('keydown', (e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), addGimmick(k)));
+                return row;
+              })
+            : [el('p', { class: 'muted' }, catalogKinds.length ? 'No gimmick matches the filter' : 'No gimmick models found')]),
+        );
+      };
+      filter.addEventListener('input', fill);
+      filter.addEventListener('keydown', (e) => e.key === 'Escape' && (e.preventDefault(), toggleCatalog(false), addBtn.focus()));
+      catalogBox.replaceChildren(filter, list);
+      fill();
+      filter.focus();
+    }
+    /** Makes hidden new placements objects of the map (their models loaded first); returns their objects. */
+    async function addPlacements(list) {
+      const gm = scene.gimmicks, was = status.textContent;
+      let templates;
+      try {
+        templates = await gm.kit.load(list.map((g) => g.model), (t) => (status.textContent = t));
+      } finally {
+        status.textContent = was;
+      }
+      for (const [k, img] of scene.textures) if (!glTex.has(k)) glTex.set(k, uploadTexture(gl, img, aniso));
+      const out = [];
+      for (const g of list) {
+        const tpl = templates.get(lower(g.model));
+        if (!tpl) continue;
+        const m = placementMesh(tpl, g);
+        m.normals = patchNormals(m.positions, m.indices, m.normals);
+        m.bounds = boundsOf(m.positions, 0, m.positions.length / 3);
+        m.visible = true;
+        m.sky = false;
+        const [o] = collectObjects([m]);
+        o.index = edit.objects.length; // after the stage's: its collision and nav owners are numbered by object
+        setUpGimmick(o);
+        writeObject(o);
+        scene.meshes.push(m);
+        meshGpu(m);
+        edit.objects.push(o);
+        gimmickObjects.set(g, o);
+        gm.placements.push(g);
+        out.push(o);
+      }
+      return out;
+    }
+    /** Where a new gimmick goes: the ground under the middle of the view, else the point the camera turns about. */
+    function groundAhead() {
+      const { o, d } = rayAt(canvas.clientWidth / 2, canvas.clientHeight / 2);
+      const hit = pick(scene, o, d);
+      return hit ? hit.point : cam.target.slice();
+    }
+    async function addGimmick(kind, at = null, turn = [0, 0, 0]) {
+      const gm = scene.gimmicks;
+      if (!gm || adding) return;
+      adding = true;
+      try {
+        const used = new Set([...gm.placements.map((g) => g.tag), ...edit.gimmickOther.map((x) => x.Tag)]);
+        const g = newPlacement(kind, newGimmickTag(kind, used, gm.table.text), at ?? groundAhead(), turn);
+        const [o] = await addPlacements([g]);
+        if (!o) return toast(`The model ${kind.model} could not be built.`, 'error');
+        change([o], () => stateOfPlacement({ ...g, removed: false }), `Add ${kind.type}`);
+        edit.history.breakMerge();
+        select(o);
+        canvas.focus({ preventScroll: true });
+        toast(`Added ${kind.type} · ${g.tag}. Move it into place; Del removes it, Ctrl+Z takes it back.`);
+      } catch (e) {
+        console.error(e);
+        toast(`The gimmick could not be added: ${e.message}`, 'error');
+      } finally {
+        adding = false;
+      }
+    }
+    /** Ctrl+D: a new placement of the selected gimmick's model, turned as it is, beside it (DuplicateGimmick). */
+    async function duplicateGimmick() {
+      const o = selected();
+      if (!o?.gimmick) return toast(o ? 'Only gimmicks can be duplicated here so far.' : 'Select a gimmick to duplicate it.');
+      const gm = scene.gimmicks, g = placementFromState(o);
+      let kinds;
+      try {
+        kinds = catalogKinds ?? (catalogKinds = await gm.catalogue((t) => (status.textContent = t)));
+      } catch (e) {
+        return toast(`The gimmick catalogue could not be read: ${e.message}`, 'error');
+      }
+      const kind = kinds.find((k) => lower(k.model) === lower(g.model));
+      if (!kind) return toast('No gimmick of this model to copy settings from.');
+      // Like the desktop: the copy keeps the turn and goes where the view aims.
+      await addGimmick(kind, null, g.rotation.slice());
     }
     async function downloadGimmickTable() {
       const gm = scene.gimmicks;
@@ -3748,6 +3886,10 @@ export function renderStage(node, ctx) {
       if (k === 'f3' && !ctrl) {
         e.preventDefault();
         return setCnMode(cnMode ? 0 : colRead?.live ? 1 : 2);
+      }
+      if (ctrl && !e.altKey && !e.shiftKey && k === 'd') {
+        e.preventDefault();
+        return duplicateGimmick();
       }
       if (cnMode && !ctrl && cnKey(e, k)) return e.preventDefault();
       if (k === 'escape') return gdrag ? cancelDrag() : select(null);
