@@ -690,7 +690,7 @@ export function renderNut(node, ctx) {
     }
     // 4. the Data folder's other scripts: top-level definitions first, then the same folder, then by path
     const idx = scriptIndex(ctx, indexProgress);
-    if (!idx.done) say(`Looking through the Data folder's scripts (${idx.count} of ${idx.total})…`);
+    if (!idx.done) say(`Indexing the Data folder's scripts (${idx.count} of ${idx.total})…`);
     await idx.ready;
     const dir = (ctx.filePath || '').replace(/[^/]*$/, '').toLowerCase();
     const hits = (idx.byName.get(name) || []).filter((h) => h.path !== ctx.filePath);
@@ -708,8 +708,8 @@ export function renderNut(node, ctx) {
     say(`No definition of ${name} found.`, 'bad');
   }
   function indexProgress(idx) {
-    if (!message.startsWith('Looking through') && !message.startsWith('Index')) return;
-    say(idx.done ? `Index: ${idx.total.toLocaleString()} scripts.` : `Looking through the Data folder's scripts (${idx.count} of ${idx.total})…`);
+    if (!message.startsWith('Index')) return;
+    say(idx.done ? `Index: ${idx.total.toLocaleString()} scripts.` : `Indexing the Data folder's scripts (${idx.count} of ${idx.total})…`);
   }
 
   // ---- code assist (completion and call tips) ----
@@ -1038,7 +1038,7 @@ export function renderNut(node, ctx) {
     updateCaret();
     // Index the Data folder's scripts in the background, for go to definition and code assist.
     const idx = scriptIndex(ctx, indexProgress);
-    if (!idx.done && idx.total) say(`Index: reading ${idx.total.toLocaleString()} scripts…`), (message = 'Index');
+    if (!idx.done && idx.total) say(`Indexing the Data folder's scripts (${idx.count} of ${idx.total})…`);
   });
   return root;
 }
