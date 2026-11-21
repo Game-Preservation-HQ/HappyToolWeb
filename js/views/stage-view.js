@@ -923,7 +923,8 @@ export function renderStage(node, ctx) {
       g2.clearRect(0, 0, w, h);
       g2.setTransform(dpr, 0, 0, dpr, 0, 0);
       if (cnMode) drawCnOverlay(g2);
-      if (grid.axes) drawAxisIndicator(g2, overlay.clientHeight, basis());
+      // The axis indicator sits in the bottom-left corner, above the hint line that runs along the bottom.
+      if (grid.axes) drawAxisIndicator(g2, hint.offsetParent ? hint.offsetTop - overlay.offsetTop : overlay.clientHeight, basis());
       if (boxDrag?.moved) {
         const x = Math.min(boxDrag.x0, boxDrag.x1), y = Math.min(boxDrag.y0, boxDrag.y1);
         const bw = Math.abs(boxDrag.x1 - boxDrag.x0), bh = Math.abs(boxDrag.y1 - boxDrag.y0);
