@@ -17,6 +17,8 @@ import {
   placementMatrix,
 } from '../formats/stage-bake.js';
 import { downloadBytes } from '../util.js';
+import { stageGlb, stageObjZip } from '../formats/model-export.js';
+import { setViewCommands } from '../palette.js';
 import { decodeDds } from '../formats/dds.js';
 import { buildSteamStage } from '../formats/steam-stage.js';
 import { stripTextureExtension } from '../formats/rrm.js';
@@ -495,6 +497,7 @@ export function renderStage(node, ctx) {
   const skyBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const fogBox = el('div', { class: 'stage-sky stage-fog' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const downloadBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
+  const modelBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const cnBox = el('div', { class: 'stage-sky stage-cn' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const canvas = el('canvas', { class: 'stage-canvas', tabindex: '0', 'aria-label': 'Stage map' });
   const overlay = el('canvas', { class: 'stage-overlay', 'aria-hidden': 'true' });
@@ -531,7 +534,7 @@ export function renderStage(node, ctx) {
     el(
       'div',
       { class: 'stage-body' },
-      el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Collision edits'), cnBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Layers'), layersBox),
+      el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Collision edits'), cnBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Export 3D model'), modelBox, el('h3', {}, 'Layers'), layersBox),
       host,
     ),
   );
@@ -1755,6 +1758,43 @@ export function renderStage(node, ctx) {
     renderFog();
     renderDownload();
     downloadRefresh = renderDownload;
+
+    // ----- 3D model (.glb for Blender, Unity, Godot and others; OBJ + MTL + PNG as the desktop's Export stage as OBJ) -----
+    const glbBtn = button('Download .glb', () => exportModel('glb'), {
+      title: 'glTF 2.0 binary with the textures inside. Blender: File > Import > glTF 2.0. Also opens in Unity, Godot, Unreal, 3ds Max, Maya and most 3D apps',
+    });
+    const objBtn = button('Download .obj (zip)', () => exportModel('obj'), {
+      title: 'Wavefront OBJ + MTL + PNG textures in a zip, as the desktop app writes them. Blender: unzip, then File > Import > Wavefront (.obj)',
+    });
+    modelBox.replaceChildren(
+      el(
+        'p',
+        { class: 'muted stage-count' },
+        'Saves the stage as it is shown, in metres: the layers that are on, moved objects where they are now, hidden objects left out, with its textures. ' +
+          (scene.missing.length ? `${scene.missing.length} textures are not in this bundle and come out grey.` : ''),
+      ),
+      el('div', { class: 'toolbar' }, glbBtn, objBtn),
+    );
+    async function exportModel(kind) {
+      glbBtn.disabled = objBtn.disabled = true;
+      const was = status.textContent;
+      const progress = (t) => (status.textContent = t);
+      try {
+        await pause();
+        const r = kind === 'glb'
+          ? await stageGlb(scene.meshes, scene.textures, edit.stage, progress)
+          : await stageObjZip(scene.meshes, scene.textures, edit.stage, progress);
+        const name = kind === 'glb' ? `${edit.stage}.glb` : `${edit.stage}-obj.zip`;
+        if (kind === 'glb') downloadBytes(r.bytes, name, 'model/gltf-binary');
+        else downloadBlob(r.blob, name);
+        toast(`${name} downloaded: ${r.meshes} meshes, ${Math.round(r.triangles).toLocaleString()} triangles, ${r.textures} textures.`, 'ok', 8000);
+      } catch (e) {
+        toast(`The 3D model could not be written: ${e.message}`, 'error', 10000);
+      } finally {
+        status.textContent = was;
+        glbBtn.disabled = objBtn.disabled = false;
+      }
+    }
 
     // ----- collision (CcpCollisionParser: every .ccp layer, drawn as lines; key H) -----
     let lineProg = null;
@@ -3584,6 +3624,42 @@ export function renderStage(node, ctx) {
       dirty = true;
     });
     texBox.addEventListener('change', () => (dirty = true));
+
+    // ----- Find a feature (Ctrl+K): the map's keyboard shortcuts, sent to the map as the key would be -----
+    const press = (key, mods = {}) => () => {
+      canvas.focus();
+      canvas.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...mods }));
+      canvas.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true, cancelable: true, ...mods }));
+    };
+    setViewCommands(() => {
+      if (!view.isConnected) return null;
+      const cmd = (label, keys, run, hint = '') => ({ label, keys, run, hint, section: 'Map shortcuts' });
+      const list = [
+        cmd('Undo', 'Ctrl+Z', press('z', { ctrlKey: true })),
+        cmd('Redo', 'Ctrl+Y', press('y', { ctrlKey: true })),
+        cmd(cnMode ? 'Leave the collision & nav editor' : 'Collision & nav editor', 'F3', press('F3'), 'Erase or add collision, paint nav, edit waypoints'),
+        cmd('Collision lines on or off', 'H', press('h')),
+        cmd('Nav lines on or off', 'P', press('p')),
+        cmd('Frame the selected object', 'F', press('f')),
+        cmd('Fly the camera', 'W A S D  Q E', () => canvas.focus(), 'Click the map, then hold the keys; drag to look, wheel to zoom'),
+      ];
+      if (cnMode) {
+        CN_NAMES.slice(1).forEach((n, i) => list.push(cmd(`${n} tool`, String(i + 1), press(String(i + 1)))));
+        list.push(cmd('Next tool', 'Tab', press('Tab')), cmd('Leave the tool or deselect', 'Esc', press('Escape')));
+      } else {
+        ['Move', 'Rotate', 'Scale'].forEach((n, i) => list.push(cmd(`${n} tool`, String(i + 1), press(String(i + 1)))));
+        if (selected())
+          list.push(
+            cmd('Hide or show the selected object', 'Delete', press('Delete')),
+            cmd('Make the selected object Solid or not', 'K', press('k')),
+            cmd('Put the selected object back where it was', 'Home', press('Home')),
+            cmd('Select the next object', 'Tab', press('Tab')),
+            cmd('Nudge the selected object', 'Arrows, Page Up/Down', () => canvas.focus(), 'Shift for bigger steps, Ctrl to turn it'),
+            cmd('Deselect', 'Esc', press('Escape')),
+          );
+      }
+      return list;
+    });
   }
 
   return view;

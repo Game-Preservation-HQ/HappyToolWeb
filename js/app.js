@@ -13,6 +13,7 @@ import { renderMedia } from './views/media-view.js';
 import { renderHex } from './views/hex-view.js';
 import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictures } from './browser.js';
 import { loadHandle, saveHandle, readDirectory } from './data-folder.js';
+import { openPalette, setAppCommands } from './palette.js';
 
 const $ = (id) => document.getElementById(id);
 const dom = {
@@ -680,6 +681,23 @@ window.addEventListener('keydown', (e) => {
     if (current?.dirty) save();
   }
 });
+
+// Find a feature: Ctrl+K anywhere (caught before the map viewer's own keys, where K toggles Solid).
+window.addEventListener(
+  'keydown',
+  (e) => {
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      e.stopPropagation();
+      openPalette();
+    }
+  },
+  true,
+);
+$('btn-find').addEventListener('click', openPalette);
+setAppCommands(() => [
+  ...(stack().length > 1 ? [{ label: 'Back to the bundle this came from', keys: 'Alt+←', section: 'Location', run: () => popTo(stack().length - 2) }] : []),
+]);
 
 window.addEventListener('beforeunload', (e) => {
   if (files.some((r) => r.dirty)) e.preventDefault();
