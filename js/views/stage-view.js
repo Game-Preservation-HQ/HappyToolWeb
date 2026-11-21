@@ -33,11 +33,11 @@ import {
   makeFog, sameFog, fogHex, withHex, metres, fogFromFeature, readFog, readFogFromFile, bakeFog, fogPreviewOn, setFogPreview, fogRgb,
 } from './stage-fog.js';
 import { readCollision, edgesOf } from './stage-collision.js';
-import { readNav, navLines } from '../formats/stage-nav.js';
-import { rebuildNav, Blocker, nodeRefKey, navSummary, navChanged, pathChanged } from '../formats/stage-nav-edit.js';
+import { readNav, navLines, writeNavMesh, writePathGraph, is360Spd, spd360ToSteam } from '../formats/stage-nav.js';
+import { rebuildNav, Blocker, MIN_REF, nodeRefKey, navSummary, navChanged, pathChanged } from '../formats/stage-nav-edit.js';
 import {
   COLNAV_KEY, CN_SHAPES, CN_SIZES, CN_MIN_BRUSH, CN_MAX_BRUSH, readColNav, cloneColNav, colNavFeature, removedFlags,
-  setRemovedFlags, volumeTriangles, rayLayer, rayTris, eraseAt,
+  setRemovedFlags, volumeTriangles, rayTriangle, rayTris, eraseAt,
 } from '../formats/stage-colnav.js';
 
 const FOV = Math.PI / 4;
@@ -374,6 +374,22 @@ function rayHitsBox(o, d, b) {
   return true;
 }
 
+/** Where a ray enters a box {lo, hi} (0 when it starts inside), or -1 when it misses (RayHitsBox). */
+function boxEnter(o, d, lo, hi) {
+  let t0 = 0, t1 = Infinity;
+  for (let k = 0; k < 3; k++) {
+    if (Math.abs(d[k]) < 1e-12) {
+      if (o[k] < lo[k] || o[k] > hi[k]) return -1;
+      continue;
+    }
+    let a = (lo[k] - o[k]) / d[k], c = (hi[k] - o[k]) / d[k];
+    if (a > c) [a, c] = [c, a];
+    if (a > t0) t0 = a;
+    if (c < t1) t1 = c;
+    if (t0 > t1) return -1;
+  }
+  return t0;
+}
 function pick(scene, o, d) {
   let best = null;
   for (const m of scene.meshes) {
@@ -1525,9 +1541,45 @@ export function renderStage(node, ctx) {
       const parts = [];
       if (edit.objects.some((o) => !isEmpty(o.state))) parts.push('objects');
       if (Object.keys(edit.colnav.RemovedCollision).length || edit.colnav.Volumes.length) parts.push('collision');
+      if (navHandEdited()) parts.push('bot navigation');
       if (edit.sky && edit.sky.Mode !== 'dungeon') parts.push('sky');
       if (fogChanged(edit)) parts.push('fog');
       return parts;
+    }
+    /** Nav painted or erased, or waypoints added, deleted, linked or unlinked by hand. */
+    function navHandEdited() {
+      const c = edit.colnav;
+      return !!(c.NavCells.length || c.NavErase.length || c.Waypoints.length || c.RemovedWaypoints.length || c.Links.length || c.Cuts.length);
+    }
+    /**
+     * The nav files rewritten as the live nav stands (CollectExportNav, StageNavBaker.Apply): the nav mesh and the
+     * waypoint graph each only when it changed, a 360 file written back in its own byte order. Returns the summary
+     * line, or null when the stage has no nav or nothing in the bundle can change it.
+     */
+    async function bakeNav(archive, touched) {
+      const r = navRead;
+      if (!r || (!r.nav && !r.path) || (!touched && !navHandEdited())) return null;
+      for (let nm = edit.navMatch; nm && !nm.done && !stopped; nm = edit.navMatch) {
+        status.textContent = 'Matching the nav to the objects…';
+        await new Promise((ok) => setTimeout(ok, 250));
+      }
+      const nm = edit.navMatch;
+      if (!nm?.done) return "Bot navigation was left as it was (matching wasn't finished when you exported).";
+      if (nm.error) return `Bot navigation was left as it was (it couldn't be matched to the objects: ${nm.error}).`;
+      navNow(true);
+      const live = navLive;
+      if (!live) return "Bot navigation was left as it was (the rebuild failed; the console has why).";
+      const put = async (name, bytes) => {
+        const i = archive.entries.findIndex((e) => e.name.toLowerCase() === name.toLowerCase());
+        if (i < 0) return;
+        const e = archive.entries[i], was = e.pointer || !e.data?.length ? null : (await decodeLayers(e.data)).payload;
+        if (is360Spd(was)) bytes = spd360ToSteam(bytes); // the same lane swap both ways
+        archive.entries[i] = { ...e, pointer: false, size: bytes.length, data: bytes };
+        console.info(`Map editor export: ${name}: rewritten (${bytes.length} bytes)`);
+      };
+      if (live.nav && r.navName && navChanged(live)) await put(r.navName, writeNavMesh(live.nav));
+      if (live.path && r.pathName && pathChanged(live)) await put(r.pathName, writePathGraph(live.path));
+      return navChanged(live) || pathChanged(live) ? navSummary(live) : null;
     }
     const listOf = (a) => (a.length > 1 ? `${a.slice(0, -1).join(', ')} and ${a[a.length - 1]}` : a[0]);
     function renderDownload() {
@@ -1664,6 +1716,12 @@ export function renderStage(node, ctx) {
           const c = edits.length || solids.length || added.length || erased ? await bakeCollision(edits, solids, added, entries, at) : null;
           if (c) lines.push(c.line);
           archive = { ...archive, entries: c ? c.entries : entries };
+        }
+        {
+          const touched = parts.includes('objects') || parts.includes('collision');
+          archive = { ...archive, entries: archive.entries.slice() };
+          const line = await bakeNav(archive, touched);
+          if (line) lines.push(line);
         }
         if (parts.includes('sky')) {
           const s = edit.sky;
@@ -2004,6 +2062,7 @@ export function renderStage(node, ctx) {
           nm.worker?.terminate();
           nm.worker = null;
           nm.done = true;
+          nm.error = msg;
           if (m) {
             m.worker = null;
             m.error = msg;
@@ -2133,6 +2192,7 @@ export function renderStage(node, ctx) {
     let navRead = null; // {nav, navName, path, pathName, unread} once read
     // The live nav (EnsureNavRebuilt): rebuilt from the stage's when what it follows changes, at most every 120 ms.
     let navKey = null, navLive = null, navAt = 0, navTimer = 0, navWinding = 0;
+    let navRev = 0; // bumped when a brush stroke changes edit.colnav in place
     const navWorlds = [], navBlockers = [], navBefore = []; // per object, cached by its state and collision
     navBox.checked = !!job.showNav;
     /** Uploads the nav cells, drop links, waypoint links and waypoint rings as one line list (UploadLiveNav). */
@@ -2265,7 +2325,7 @@ export function renderStage(node, ctx) {
       const r = navRead;
       if (!r || (!r.nav && !r.path)) return;
       const nm = edit.navMatch, m = edit.colMatch;
-      const key = [edit.colnav, nm?.cellOwner, nm?.nodeOwner, m?.objTris];
+      const key = [edit.colnav, navRev, nm?.cellOwner, nm?.nodeOwner, m?.objTris];
       for (const o of edit.objects) key.push(o.state);
       if (navKey && sameList(key, navKey)) return;
       const now = performance.now();
@@ -2285,7 +2345,13 @@ export function renderStage(node, ctx) {
         console.warn(`Map editor: live nav: rebuild failed: ${e?.message ?? e}`);
         uploadNav(r.nav, r.path);
       }
+      if (cnMode >= 3) overlayDirty = true;
       renderNav();
+    }
+    /** Rebuilds the live nav now if anything it follows changed (force: even within 120 ms of the last rebuild). */
+    function navNow(force = false) {
+      if (force) navAt = -Infinity;
+      syncNav();
     }
     /** The selected object's nav line (NavSummaryLine): how many nav cells and waypoints move with it. */
     function navSummaryLine(i) {
@@ -2361,6 +2427,7 @@ export function renderStage(node, ctx) {
         navKey = null;
         if (lineProg) uploadNav(r.nav, r.path);
         renderNav();
+        renderColNav();
         dirty = true;
       },
       (e) => {
@@ -2368,29 +2435,48 @@ export function renderStage(node, ctx) {
         navRead = { nav: null, path: null, unread: [] };
         console.warn(`Map editor: the nav mesh of ${edit.stage} could not be read: ${e.message}`);
         renderNav();
+        renderColNav();
       },
     );
     renderNav();
 
     // ----- collision edits: erase collision by hand, add pieces (StageViewerForm.ColNav.cs) -----
-    let cnMode = 0; // 0 off, 1 erase collision, 2 add collision
+    let cnMode = 0; // 0 off, 1 erase collision, 2 add collision, 3 paint nav, 4 waypoints
     let cnBrush = 300, cnShape = 'Wall', cnYaw = 0, cnSel = -1, cnStroke = null, cnAim = null, cnShift = false;
-    let cnFlags = null, cnColWas = false, cnPending = null;
+    let cnFlags = null, cnColWas = false, cnNavWas = false, cnPending = null;
+    let cnCell = 100, cnNode = MIN_REF, cnHover = MIN_REF; // nav square size; the selected and the hovered waypoint
     const cnSizes = Object.fromEntries(CN_SHAPES.map((s) => [s, CN_SIZES[s].slice()]));
     /** Layers whose erased triangles changed since their lines were last built (-1: all of them). */
     const cnTouched = new Set(Object.keys(edit.colnav.RemovedCollision).length ? [-1] : []);
     const pieces = { vao: null, buf: null, a: 0, b: 0, key: null }; // unselected pieces, then the selected one
     const CN_REACH = 80000;
-    const CN_NAMES = ['Off', 'Erase collision', 'Add collision'];
+    const CN_NAMES = ['Off', 'Erase collision', 'Add collision', 'Paint nav', 'Waypoints'];
     const CN_HINTS = [
       null,
-      'Erase collision · Drag: erase · Shift+drag: bring back · Wheel or [ ]: brush size · Right-drag: orbit · Middle-drag: pan · 2: add · F3/Esc: leave · Ctrl+Z/Y: undo/redo',
-      'Add collision · Click: place or select a piece · Shift+click: delete it · Wheel: turn (Shift: 5°) · R: shape · [ ]: width (Shift: height) · - +: depth · Arrows, PgUp/PgDn: move (Shift: ×8) · Del: delete · Right-drag: orbit · 1: erase · F3/Esc: leave',
+      'Erase collision · Drag: erase · Shift+drag: bring back · Wheel or [ ]: brush size · Right-drag: orbit · Middle-drag: pan · 2-4, Tab: other tools · F3/Esc: leave · Ctrl+Z/Y: undo/redo',
+      'Add collision · Click: place or select a piece · Shift+click: delete it · Wheel: turn (Shift: 5°) · R: shape · [ ]: width (Shift: height) · - +: depth · Arrows, PgUp/PgDn: move (Shift: ×8) · Del: delete · Right-drag: orbit · 1, 3, 4, Tab: other tools · F3/Esc: leave',
+      'Paint nav · Drag: paint where bots walk · Shift+drag: erase nav · Wheel or [ ]: brush size · Right-drag: orbit · Middle-drag: pan · 1, 2, 4, Tab: other tools · F3/Esc: leave · Ctrl+Z/Y: undo/redo',
+      'Waypoints · Click a waypoint: select it · Click another: link or unlink them · Click the map: add one (linked to the selected one) · Shift+click or Del: delete · Esc: let go · Wheel: zoom · 1-3, Tab: other tools · F3: leave',
     ];
     const baseHint = hint.textContent;
     const fmtM = (u) => String(Math.round(u) / 100);
     const flash = (t) => (status.textContent = t);
-    const plural = (n, w) => `${n.toLocaleString()} ${w}${n === 1 ? '' : 's'}`;
+    const plural = (n, w, ws = `${w}s`) => `${n.toLocaleString()} ${n === 1 ? w : ws}`;
+    const f32 = Math.fround;
+    /** C#'s Math.Round: halves go to the even neighbour. */
+    const roundEven = (x) => {
+      const r = Math.round(x);
+      return r - x === 0.5 && r % 2 !== 0 ? r - 1 : r;
+    };
+    /** The shortest decimal that reads back as the same single-precision number (what the saved file keeps). */
+    const f32Num = (x) => {
+      const v = f32(x);
+      for (let p = 1; p < 10; p++) {
+        const s = Number(v.toPrecision(p));
+        if (f32(s) === v) return s;
+      }
+      return v;
+    };
 
     /** Each live collision layer's triangles erased by hand (null where none); [] until the collision is live. */
     function erasedFlags() {
@@ -2478,8 +2564,69 @@ export function renderStage(node, ctx) {
         gl.enable(gl.DEPTH_TEST);
       }
     }
+    /** A horizontal circle in the world, split where it goes behind the camera. */
+    function cnRing(g2, x, y, z, r, segs) {
+      g2.beginPath();
+      let open = false;
+      for (let i = 0; i <= segs; i++) {
+        const a = (i / segs) * 2 * Math.PI, p = project([x + Math.cos(a) * r, y, z + Math.sin(a) * r]);
+        if (!p) {
+          open = false;
+          continue;
+        }
+        if (open) g2.lineTo(p.x, p.y);
+        else g2.moveTo(p.x, p.y);
+        open = true;
+      }
+      g2.stroke();
+    }
+    /** Waypoints (DrawCnWaypoints): green posts on yours, the selected and hovered rings, and the link the next click makes or breaks. */
+    function drawCnWaypoints(g2) {
+      const live = navLive;
+      if (!live?.path || !live.nodeRef) return;
+      const nodes = live.path.nodes;
+      g2.strokeStyle = 'rgb(102 255 115 / 0.95)';
+      g2.lineWidth = 2;
+      g2.beginPath();
+      for (let i = 0; i < nodes.length && i < live.nodeRef.length; i++) {
+        const ref = live.nodeRef[i];
+        if (ref >= 0 || ref === MIN_REF) continue;
+        const n = nodes[i], a = project([n.x, n.y, n.z]), b = project([n.x, n.y + 140, n.z]);
+        if (!a || !b) continue;
+        g2.moveTo(a.x, a.y);
+        g2.lineTo(b.x, b.y);
+      }
+      g2.stroke();
+      const sel = cnNodeOf(cnNode), hov = cnHover !== cnNode ? cnNodeOf(cnHover) : null;
+      const ring = (n, colour, width) => {
+        g2.strokeStyle = colour;
+        g2.lineWidth = width;
+        cnRing(g2, n.x, n.y + 18, n.z, Math.max(40, n.radius) * 1.15, 32);
+      };
+      if (sel && hov) {
+        const a = project([sel.x, sel.y + 18, sel.z]), b = project([hov.x, hov.y + 18, hov.z]);
+        if (a && b) {
+          g2.strokeStyle = cnLinked(cnNode, cnHover) ? 'rgb(255 89 77 / 0.95)' : 'rgb(102 255 115 / 0.95)';
+          g2.lineWidth = 3;
+          g2.beginPath();
+          g2.moveTo(a.x, a.y);
+          g2.lineTo(b.x, b.y);
+          g2.stroke();
+        }
+      }
+      if (hov) ring(hov, 'rgb(255 255 255 / 0.95)', 2);
+      if (sel) ring(sel, 'rgb(255 255 115 / 0.95)', 3);
+    }
     function drawCnOverlay(g2) {
+      if (cnMode === 4) return drawCnWaypoints(g2);
       if (!cnAim) return;
+      if (cnMode === 3) {
+        const erase = cnStroke ? cnStroke.dir < 0 : cnShift;
+        g2.strokeStyle = erase ? 'rgb(255 115 89 / 0.95)' : 'rgb(77 230 255 / 0.95)';
+        g2.lineWidth = 2.5;
+        cnRing(g2, cnAim[0], cnAim[1] + 8, cnAim[2], cnBrush, 64);
+        return;
+      }
       if (cnMode === 1) {
         const restore = cnStroke ? cnStroke.dir < 0 : cnShift;
         g2.strokeStyle = restore ? 'rgb(115 255 128 / 0.9)' : 'rgb(255 102 89 / 0.9)';
@@ -2521,19 +2668,57 @@ export function renderStage(node, ctx) {
     /** How far a ray looks: the desktop's 800 m, or as far as the map reaches when the view is pulled back to see it all. */
     const cnReach = (o) =>
       Math.max(CN_REACH, Math.hypot(o[0] - sceneCentre[0], o[1] - sceneCentre[1], o[2] - sceneCentre[2]) + sceneRadius);
-    function cnRay(o, d) {
-      const reach = cnReach(o);
-      let best = Math.min(reach, pick(scene, o, d)?.dist ?? reach);
+    /**
+     * The nearest hit along a ray within maxT (CnRay): objects as drawn, the collision where it stands (not erased, not
+     * carried off by its object), and added pieces; maxT when nothing is hit. Collision groups are tested by their box
+     * first (1 unit wider), as on the desktop.
+     */
+    function cnCast(o, d, maxT) {
+      let best = Math.min(maxT, pick(scene, o, d)?.dist ?? maxT);
       if (colRead?.live) {
         const m = matchDone(), flags = erasedFlags();
         colRead.layers.forEach((l, li) => {
-          const f = flags[li], own = m?.owners[li];
-          const skip = f || own ? (t) => !!(f && f[t]) || (!!own && own[t] >= 0 && displaced(edit.objects[own[t]].state)) : null;
-          best = rayLayer(o, d, l.positions, l.indices, best, skip);
+          const f = flags[li], own = m?.owners[li], P = l.positions, I = l.indices;
+          for (const s of cnSpans(l)) {
+            if (s.lo) {
+              const enter = boxEnter(o, d, s.lo, s.hi);
+              if (enter < 0 || enter >= best) continue;
+            }
+            for (let t = s.first, end = s.first + s.n; t < end; t++) {
+              if ((f && f[t]) || (own && own[t] >= 0 && displaced(edit.objects[own[t]].state))) continue;
+              const a = I[t * 3] * 3, b = I[t * 3 + 1] * 3, c = I[t * 3 + 2] * 3;
+              const h = rayTriangle(o, d, P[a], P[a + 1], P[a + 2], P[b], P[b + 1], P[b + 2], P[c], P[c + 1], P[c + 2]);
+              if (h >= 0 && h < best) best = h;
+            }
+          }
         });
       }
       for (const v of edit.colnav.Volumes) best = rayTris(o, d, volumeTriangles(v), best);
-      return best < reach ? o.map((x, k) => x + d[k] * best) : null;
+      return best;
+    }
+    /**
+     * A layer's triangles in runs with the box around each (its collision groups, 1 unit wider); one unboxed run when
+     * the groups don't number the triangles the same way (no groups, or a triangle the reader dropped).
+     */
+    function cnSpans(l) {
+      if (l.cnSpans) return l.cnSpans;
+      const total = l.indices.length / 3;
+      let first = 0;
+      const spans = (l.groups ?? []).map((g) => {
+        const s = { first, n: g.triangles.length / 3, lo: [g.minX - 1, g.minY - 1, g.minZ - 1], hi: [g.maxX + 1, g.maxY + 1, g.maxZ + 1] };
+        first += s.n;
+        return s;
+      });
+      return (l.cnSpans = spans.length && first === total ? spans : [{ first: 0, n: total, lo: null, hi: null }]);
+    }
+    function cnRay(o, d) {
+      const reach = cnReach(o), t = cnCast(o, d, reach);
+      return t < reach ? o.map((x, k) => x + d[k] * t) : null;
+    }
+    /** The surface height under (x, z) looking down from `from` (CnSurfaceBelow, single precision); null when none. */
+    function cnSurfaceBelow(x, from, z, depth) {
+      const t = cnCast([x, from, z], [0, -1, 0], depth);
+      return t < depth ? f32(from - f32(t)) : null;
     }
     function cnRayAt(p) {
       const { o, d } = rayAt(p.x, p.y);
@@ -2542,6 +2727,13 @@ export function renderStage(node, ctx) {
 
     // Erase collision: a brush stroke is one undo step.
     function cnStrokeStart(restore) {
+      if (cnMode === 3) {
+        if (!cnAim) return; // a stroke starts on a surface (BeginColNavStroke)
+        cnStroke = { dir: restore ? -1 : 1, before: cloneColNav(edit.colnav), n: 0, nav: true };
+        cnDab();
+        overlayDirty = true;
+        return;
+      }
       if (!colRead?.live) return flash("The collision can't be erased here (it isn't read yet, or has an unfamiliar layout)");
       cnStroke = { dir: restore ? -1 : 1, before: cloneColNav(edit.colnav), n: 0, layers: new Set() };
       cnDab();
@@ -2549,6 +2741,10 @@ export function renderStage(node, ctx) {
     }
     function cnDab() {
       if (!cnStroke || !cnAim) return;
+      if (cnStroke.nav) {
+        cnStroke.n += cnStroke.dir > 0 ? paintNavAt(cnAim, cnBrush) : eraseNavAt(cnAim, cnBrush);
+        return;
+      }
       const m = matchDone(), flags = erasedFlags(), erase = cnStroke.dir > 0;
       colRead.layers.forEach((l, li) => {
         const own = m?.owners[li];
@@ -2569,6 +2765,18 @@ export function renderStage(node, ctx) {
       cnStroke = null;
       overlayDirty = true;
       if (!s.n) return;
+      if (s.nav) {
+        const before = s.before, after = cloneColNav(edit.colnav);
+        edit.history.push([], s.dir > 0 ? 'Paint nav' : 'Erase nav', null, {
+          undo: () => applyColNav(cloneColNav(before)),
+          redo: () => applyColNav(cloneColNav(after)),
+        });
+        edit.history.breakMerge();
+        flash(s.dir > 0 ? `Painted ${plural(s.n, 'square')} where bots walk` : 'Erased nav');
+        edited();
+        renderColNav();
+        return;
+      }
       const flags = erasedFlags();
       for (const li of s.layers) setRemovedFlags(edit.colnav, colRead.layers[li].name, flags[li]);
       const before = s.before, after = cloneColNav(edit.colnav);
@@ -2584,6 +2792,182 @@ export function renderStage(node, ctx) {
       flash(`${s.dir > 0 ? 'Erased' : 'Brought back'} ${plural(s.n, 'triangle')}`);
       edited();
       renderColNav();
+    }
+
+    // Paint nav (PaintNavAt / EraseNavAt): single precision where the desktop is float.
+    const cnCen = (v, k) => f32(f32(f32(f32(v[k]) + f32(v[k + 3])) + f32(v[k + 6])) / 3);
+    /** Whether a live nav cell already covers (x, z) at about this height (WalkableAlready, InsideXz). */
+    function walkableAlready(x, y, z) {
+      for (const c of navLive?.nav?.cells ?? []) {
+        const v = c.v;
+        if (Math.abs(f32(cnCen(v, 1) - y)) > 150) continue;
+        const d1 = f32(f32(f32(x - v[3]) * f32(v[2] - v[5])) - f32(f32(v[0] - v[3]) * f32(z - v[5])));
+        const d2 = f32(f32(f32(x - v[6]) * f32(v[5] - v[8])) - f32(f32(v[3] - v[6]) * f32(z - v[8])));
+        const d3 = f32(f32(f32(x - v[0]) * f32(v[8] - v[2])) - f32(f32(v[6] - v[0]) * f32(z - v[2])));
+        if (!((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0))) return true;
+      }
+      return false;
+    }
+    /**
+     * Lays walkable squares (two cells each, on a cnCell grid) on the surface under the brush, leaving out steep or
+     * broken ground and squares that are walkable already; returns how many were laid.
+     */
+    function paintNavAt(at, radius) {
+      navNow(); // what is walkable already (throttled while the brush moves)
+      const s = f32(cnCell), X = f32(at[0]), Y = f32(at[1]), Z = f32(at[2]), r = f32(radius);
+      // CnCellKey: a long of ix's low 24 bits, iz's low 20 and the height in 2.5 m steps' low 20.
+      const key = (ix, iz, y) => `${ix & 0xffffff},${iz & 0xfffff},${roundEven(f32(y / 250)) & 0xfffff}`;
+      const have = new Set();
+      for (const v of edit.colnav.NavCells)
+        if (Array.isArray(v) && v.length >= 9) have.add(key(Math.floor(f32(cnCen(v, 0) / s)), Math.floor(f32(cnCen(v, 2) / s)), cnCen(v, 1)));
+      const x0 = Math.floor(f32(f32(X - r) / s)), x1 = Math.floor(f32(f32(X + r) / s));
+      const z0 = Math.floor(f32(f32(Z - r) / s)), z1 = Math.floor(f32(f32(Z + r) / s));
+      const top = f32(Y + Math.max(300, f32(s * 3))), depth = Math.max(900, f32(s * 9)), r2 = f32(r * r), steep = f32(s * f32(1.2));
+      const heights = new Map(); // a corner's height, shared by the squares round it (same ray each time)
+      const below = (gx, gz) => {
+        const k = `${gx},${gz}`;
+        if (!heights.has(k)) heights.set(k, cnSurfaceBelow(f32(gx * s), top, f32(gz * s), depth));
+        return heights.get(k);
+      };
+      let added = 0;
+      for (let ix = x0; ix <= x1; ix++)
+        for (let iz = z0; iz <= z1; iz++) {
+          const cx = f32(f32(ix + 0.5) * s), cz = f32(f32(iz + 0.5) * s), dx = f32(cx - X), dz = f32(cz - Z);
+          if (f32(f32(dx * dx) + f32(dz * dz)) > r2) continue;
+          const y = [];
+          for (let k = 0; k < 4; k++) {
+            const h = below(ix + (k & 1), iz + (k >> 1));
+            if (h === null) break;
+            y.push(h);
+          }
+          if (y.length < 4 || f32(Math.max(...y) - Math.min(...y)) > steep) continue; // steeper than ~50°, or a ledge
+          const cy = f32(f32(f32(f32(y[0] + y[1]) + y[2]) + y[3]) / 4), k = key(ix, iz, cy);
+          if (have.has(k)) continue;
+          have.add(k);
+          if (walkableAlready(cx, cy, cz)) continue;
+          const p = [0, 1, 2, 3].map((k) => [f32((ix + (k & 1)) * s), f32(y[k] + 2), f32((iz + (k >> 1)) * s)]);
+          for (const [a, b, c] of [[0, 1, 3], [0, 3, 2]])
+            edit.colnav.NavCells.push(Array.from(navCellFrom(Float32Array.from([...p[a], ...p[b], ...p[c]]), 0), f32Num));
+          added++;
+        }
+      if (added) {
+        navRev++;
+        dirty = true;
+      }
+      return added;
+    }
+    /** Takes painted cells under the brush out, and stamps out the stage's nav there; 1 when anything changed. */
+    function eraseNavAt(at, radius) {
+      const X = f32(at[0]), Y = f32(at[1]), Z = f32(at[2]), r = f32(radius), r2 = f32(r * r);
+      const near = (v) => {
+        const dx = f32(cnCen(v, 0) - X), dz = f32(cnCen(v, 2) - Z);
+        return f32(f32(dx * dx) + f32(dz * dz)) <= r2 && Math.abs(f32(cnCen(v, 1) - Y)) <= 300;
+      };
+      const c = edit.colnav, before = c.NavCells.length;
+      c.NavCells = c.NavCells.filter((v) => !(Array.isArray(v) && v.length >= 9 && near(v)));
+      let any = c.NavCells.length !== before;
+      // A stamp only where there is other nav to erase (and not right on top of the last one).
+      if ((navLive?.nav?.cells ?? []).some((cell) => near(cell.v))) {
+        const last = c.NavErase.length ? c.NavErase[c.NavErase.length - 1] : null, round1 = (x) => roundEven(x * 10) / 10;
+        if (!last || Math.abs(last[0] - X) + Math.abs(last[2] - Z) > r * 0.25 || Math.abs(last[3] - r) > 1)
+          c.NavErase.push([round1(X), round1(Y), round1(Z), round1(r)]);
+        any = true;
+      }
+      if (!any) return 0;
+      navRev++;
+      navNow(true);
+      dirty = true;
+      return 1;
+    }
+
+    // Waypoints: select, link / unlink, add, delete (CnWaypointAt, CnWaypointClick, CnDeleteWaypoint).
+    /** The live waypoint drawn nearest p on screen (within 22 pixels): its reference, or MIN_REF. */
+    function cnWaypointAt(p) {
+      const live = navLive;
+      if (!live?.path || !live.nodeRef || !p) return MIN_REF;
+      let best = 22 * 22, found = MIN_REF;
+      for (let i = 0; i < live.path.nodes.length && i < live.nodeRef.length; i++) {
+        if (live.nodeRef[i] === MIN_REF) continue; // a copy's waypoint follows its object
+        const n = live.path.nodes[i], q = project([n.x, n.y + 15, n.z]);
+        if (!q) continue;
+        const d = (q.x - p.x) ** 2 + (q.y - p.y) ** 2;
+        if (d < best) [best, found] = [d, live.nodeRef[i]];
+      }
+      return found;
+    }
+    const cnNodeIndex = (ref) => (ref === MIN_REF || !navLive?.nodeRef ? -1 : navLive.nodeRef.indexOf(ref));
+    const cnNodeOf = (ref) => navLive?.path?.nodes[cnNodeIndex(ref)] ?? null;
+    function cnLinked(a, b) {
+      const ia = cnNodeIndex(a), ib = cnNodeIndex(b);
+      return ia >= 0 && ib >= 0 && navLive.path.links.some((l) => (l.a === ia && l.b === ib) || (l.a === ib && l.b === ia));
+    }
+    function typicalWaypointRadius() {
+      const radii = (navRead?.path?.nodes ?? []).map((n) => n.radius).filter((r) => r > 0).sort((a, b) => a - b);
+      return radii.length ? radii[radii.length >> 1] : 150;
+    }
+    function cnWaypointClick(p) {
+      navNow(true);
+      const hit = cnWaypointAt(p);
+      overlayDirty = true;
+      if (hit !== MIN_REF) {
+        if (cnNode === MIN_REF || cnNode === hit) {
+          cnNode = cnNode === hit ? MIN_REF : hit;
+          flash(cnNode === MIN_REF ? 'Deselected' : 'Waypoint selected — click another to link / unlink, Delete removes it');
+        } else {
+          const a = cnNode, b = hit, linked = cnLinked(a, b), key = nodeRefKey(a, b);
+          colNavChange(linked ? 'Unlink waypoints' : 'Link waypoints', (c) => {
+            c.Links = c.Links.filter((l) => nodeRefKey(l[0], l[1]) !== key);
+            c.Cuts = c.Cuts.filter((l) => nodeRefKey(l[0], l[1]) !== key);
+            (linked ? c.Cuts : c.Links).push([a, b]);
+          });
+          flash(linked ? "Unlinked — bots won't go straight between these two" : 'Linked');
+          cnNode = b; // keep chaining
+        }
+        return renderColNav();
+      }
+      const at = cnRayAt(p);
+      if (!at) return flash('Point at a surface to add a waypoint');
+      const id = edit.colnav.NextWaypointId, prev = cnNode;
+      const w = { Id: id, X: f32Num(at[0]), Y: f32Num(f32(f32(at[1]) + 20)), Z: f32Num(at[2]), Radius: f32Num(typicalWaypointRadius()) };
+      colNavChange('Add waypoint', (c) => {
+        c.NextWaypointId++;
+        c.Waypoints.push(w);
+        if (prev !== MIN_REF) c.Links.push([prev, -(id + 1)]);
+      });
+      cnNode = -(id + 1);
+      renderColNav();
+      flash(prev !== MIN_REF ? 'Waypoint added, linked to the selected one' : 'Waypoint added — linked to its nearest neighbours');
+    }
+    function cnDeleteWaypoint(ref) {
+      if (ref === MIN_REF) return flash('Select a waypoint first (click it)');
+      colNavChange('Delete waypoint', (c) => {
+        if (ref < 0) {
+          const id = -ref - 1, other = (l) => l[0] !== ref && l[1] !== ref;
+          c.Waypoints = c.Waypoints.filter((w) => w.Id !== id);
+          c.Links = c.Links.filter(other);
+          c.Cuts = c.Cuts.filter(other);
+        } else if (!c.RemovedWaypoints.includes(ref)) c.RemovedWaypoints.push(ref);
+      });
+      if (cnNode === ref) cnNode = MIN_REF;
+      cnHover = MIN_REF;
+      overlayDirty = true;
+      renderColNav();
+      flash('Waypoint deleted');
+    }
+    function cnClearNav() {
+      colNavChange('Clear nav edits', (c) => {
+        c.NavCells = [];
+        c.NavErase = [];
+      });
+    }
+    function cnClearWaypoints() {
+      cnNode = MIN_REF;
+      colNavChange('Clear waypoint edits', (c) => {
+        c.Waypoints = [];
+        c.RemovedWaypoints = [];
+        c.Links = [];
+        c.Cuts = [];
+      });
     }
 
     // Add collision: pieces standing where the pointer meets the map.
@@ -2695,15 +3079,46 @@ export function renderStage(node, ctx) {
       if (colNavChange('Bring back erased collision', (c) => void (c.RemovedCollision = {}))) flash('Brought back all erased collision');
     }
 
-    /** Turns the tool on (1 erase, 2 add) or off (0); the collision lines show while it is on. */
+    /** Why a tool can't be used on this stage (null when it can). */
+    function cnBlocked(mode) {
+      if (mode === 1 && !colRead?.live)
+        return colRead ? "The collision can't be erased here: it isn't read, or has an unfamiliar layout" : 'Reading the collision…';
+      if (mode === 2 && !colRead?.layers.length) return colRead ? 'This stage has no collision (.ccp) to add to' : 'Reading the collision…';
+      if (mode === 3 && !navRead?.nav) return navRead ? 'This stage has no nav mesh (navi .spd) to paint' : 'Reading the nav mesh…';
+      if (mode === 4 && !navRead?.path) return navRead ? 'This stage has no waypoints (path .spd) to edit' : 'Reading the waypoints…';
+      return null;
+    }
+    /** Tab: the next tool this stage can use. */
+    function cnCycle(dir) {
+      for (let k = 1, m = cnMode; k <= 4; k++) {
+        m = ((m - 1 + dir + 4) % 4) + 1;
+        if (!cnBlocked(m)) return setCnMode(m);
+      }
+    }
+    /**
+     * Turns the tool on (1 erase or 2 add collision, 3 paint nav, 4 waypoints) or off (0); the collision lines show
+     * while it is on, and the nav while painting it or editing waypoints.
+     */
     function setCnMode(mode) {
       if (mode === cnMode) return;
-      if (mode === 1 && !colRead?.live)
-        return flash(colRead ? "The collision can't be erased here: it isn't read, or has an unfamiliar layout" : 'Reading the collision…');
-      if (mode === 2 && !colRead?.layers.length) return flash(colRead ? 'This stage has no collision (.ccp) to add to' : 'Reading the collision…');
+      const why = mode ? cnBlocked(mode) : null;
+      if (why) return flash(why);
       cnStrokeEnd();
       const was = cnMode;
       cnMode = mode;
+      cnNode = cnHover = MIN_REF;
+      const navTool = (m) => m === 3 || m === 4;
+      if (navTool(mode) && !navTool(was)) {
+        cnNavWas = navBox.checked;
+        if (!navBox.disabled && !navBox.checked) {
+          navBox.checked = true;
+          showNav();
+        }
+        navNow(true);
+      } else if (!navTool(mode) && navTool(was) && navBox.checked !== cnNavWas) {
+        navBox.checked = cnNavWas;
+        showNav();
+      }
       if (!was) {
         select(null);
         cnColWas = colBox.checked;
@@ -2720,13 +3135,19 @@ export function renderStage(node, ctx) {
       edit.history.breakMerge();
       hint.textContent = mode ? CN_HINTS[mode] : baseHint;
       canvas.style.cursor = mode ? 'crosshair' : '';
-      flash(mode ? `Collision & nav: ${CN_NAMES[mode]} — 1-2 / Tab switch tools, F3 done` : 'Left the collision tool');
+      flash(mode ? `Collision & nav: ${CN_NAMES[mode]} — 1-4 / Tab switch tools, F3 done` : 'Left the collision tool');
       renderColNav();
       dirty = overlayDirty = true;
     }
     function cnPointerDown(p, shift) {
       cnShift = shift;
       if (cnMode === 2) return cnClick(p, shift);
+      if (cnMode === 4) {
+        if (!shift) return cnWaypointClick(p);
+        navNow(true);
+        const hit = cnWaypointAt(p);
+        return hit === MIN_REF ? flash('Shift+click a waypoint to delete it') : cnDeleteWaypoint(hit);
+      }
       cnAim = cnRayAt(p);
       cnStrokeStart(shift);
     }
@@ -2739,7 +3160,8 @@ export function renderStage(node, ctx) {
           const q = cnPending;
           cnPending = null;
           if (stopped || !cnMode) return;
-          cnAim = cnRayAt(q);
+          if (cnMode === 4) cnHover = cnWaypointAt(q);
+          else cnAim = cnRayAt(q);
           overlayDirty = true;
           if (cnStroke) cnDab();
         });
@@ -2754,7 +3176,7 @@ export function renderStage(node, ctx) {
       const delta = e.deltaY || e.deltaX;
       if (!delta) return;
       const notches = -delta / (e.deltaMode === 1 ? 3 : e.deltaMode === 2 ? 1 : 100);
-      if (cnMode === 1) return cnSetBrush(cnBrush * Math.pow(1.15, notches));
+      if (cnMode === 1 || cnMode === 3) return cnSetBrush(cnBrush * Math.pow(1.15, notches));
       cnWheelAcc += notches;
       const n = Math.trunc(cnWheelAcc + Math.sign(cnWheelAcc) * 1e-6); // 0.3 + 0.3 + 0.3 + 0.1 is a whole notch
       if (!n) return;
@@ -2766,18 +3188,26 @@ export function renderStage(node, ctx) {
       const shift = e.shiftKey;
       if (k === 'escape') {
         cnStrokeEnd();
-        if (cnSel >= 0) cnSelect(-1);
+        if (cnMode === 4 && cnNode !== MIN_REF) {
+          cnNode = MIN_REF;
+          overlayDirty = true;
+          flash('Deselected');
+          renderColNav();
+        } else if (cnSel >= 0) cnSelect(-1);
         else setCnMode(0);
         return true;
       }
       if (e.altKey) return false;
-      if (k === '1' || k === '2') return setCnMode(Number(k)), true;
-      if (k === '3' || k === '4') return flash(`${k === '3' ? 'Paint nav' : 'Waypoints'} isn't in the web version yet`), true;
-      if (k === 'tab') return setCnMode(cnMode === 1 ? 2 : 1), true;
+      if (['1', '2', '3', '4'].includes(k)) return setCnMode(Number(k)), true;
+      if (k === 'tab') return cnCycle(shift ? -1 : 1), true;
       if (['g', 'b', 'n', 'k', 'home'].includes(k)) return true;
-      if (cnMode === 1) {
+      if (cnMode === 1 || cnMode === 3) {
         if (k === '[' || k === '{') return cnSetBrush(cnBrush / 1.15), true;
         if (k === ']' || k === '}') return cnSetBrush(cnBrush * 1.15), true;
+        return false;
+      }
+      if (cnMode === 4) {
+        if (k === 'delete' || k === 'backspace') return cnDeleteWaypoint(cnNode !== MIN_REF ? cnNode : cnHover), true;
         return false;
       }
       if (k === 'delete' || k === 'backspace') return cnDelete(), true;
@@ -2795,6 +3225,8 @@ export function renderStage(node, ctx) {
       button('Off', () => setCnMode(0), { 'aria-pressed': 'true', title: 'Leave the collision tool (F3, Esc)' }),
       button('Erase', () => setCnMode(1), { 'aria-pressed': 'false', title: 'Erase collision by hand: drag over it (F3, 1)' }),
       button('Add', () => setCnMode(2), { 'aria-pressed': 'false', title: 'Add collision: walls, blocks, floors and ramps (2)' }),
+      button('Paint nav', () => setCnMode(3), { 'aria-pressed': 'false', title: 'Paint where bots can walk, or Shift+drag to erase it (3)' }),
+      button('Waypoints', () => setCnMode(4), { 'aria-pressed': 'false', title: 'Add, link, unlink and delete the waypoints bots head for (4)' }),
     ];
     const cnNum = (label, min, max, step) => el('input', { type: 'number', class: 'input input-sm', min, max, step, 'aria-label': label });
     const cnBrushIn = cnNum('Brush radius, in metres', String(CN_MIN_BRUSH / 100), String(CN_MAX_BRUSH / 100), '0.5');
@@ -2812,7 +3244,13 @@ export function renderStage(node, ctx) {
       cnRow('Depth', cnDims[2], 'm', 'Along; a ramp rises this way (- +)'),
       cnRow('Turn', cnYawIn, '°', 'About the vertical (wheel)'),
     ];
-    const cnTools = el('div', { class: 'toolbar' }, cnDelBtn, cnRestoreBtn);
+    const cnCellIn = cnNum('Nav square size, in metres', '0.5', '4', '0.25');
+    const cnCellRow = cnRow('Squares', cnCellIn, 'm', 'Each dab lays nav squares this size on the surface under the brush');
+    const cnClearNavBtn = button('Clear nav edits', cnClearNav, { title: 'Take back every square painted and every patch erased (one undo step)' });
+    const cnClearWpBtn = button('Clear waypoint edits', cnClearWaypoints, {
+      title: 'Take back every waypoint added or deleted and every link made or cut (one undo step)',
+    });
+    const cnTools = el('div', { class: 'toolbar' }, cnDelBtn, cnRestoreBtn, cnClearNavBtn, cnClearWpBtn);
     const cnLine = el('p', { class: 'muted stage-count' });
     const cnNote = el('p', { class: 'muted' });
     const cnInput = (inp, fn) =>
@@ -2822,6 +3260,11 @@ export function renderStage(node, ctx) {
         fn(x);
       });
     cnInput(cnBrushIn, (m) => cnSetBrush(m * 100));
+    cnInput(cnCellIn, (m) => {
+      cnCell = Math.max(50, Math.min(400, Math.round((m * 100) / 25) * 25));
+      overlayDirty = true;
+      renderColNav();
+    });
     cnShapeSel.addEventListener('change', () => cnSetShape(cnShapeSel.value));
     cnDims.forEach((inp, axis) =>
       cnInput(inp, (m) => {
@@ -2841,25 +3284,49 @@ export function renderStage(node, ctx) {
       renderColNav();
     });
     function renderColNav() {
-      if (!cnBox.contains(cnLine)) cnBox.replaceChildren(el('div', { class: 'toolbar' }, cnBtns), cnBrushRow, ...cnPieceRows, cnTools, cnLine, cnNote);
+      if (!cnBox.contains(cnLine))
+        cnBox.replaceChildren(el('div', { class: 'toolbar' }, cnBtns), cnBrushRow, cnCellRow, ...cnPieceRows, cnTools, cnLine, cnNote);
       const live = !!colRead?.live, layers = colRead?.layers.length ?? 0;
       cnBtns.forEach((b, i) => b.setAttribute('aria-pressed', String(i === cnMode)));
       cnBtns[1].disabled = !live;
       cnBtns[2].disabled = !layers;
+      cnBtns[3].disabled = !navRead?.nav;
+      cnBtns[4].disabled = !navRead?.path;
+      const c = edit.colnav;
+      const navEdits = c.NavCells.length + c.NavErase.length, wpEdits = c.Waypoints.length + c.RemovedWaypoints.length + c.Links.length + c.Cuts.length;
+      cnCellIn.value = fmtM(cnCell);
+      cnCellRow.hidden = cnMode !== 3;
+      cnClearNavBtn.hidden = cnMode !== 3 || !navEdits;
+      cnClearWpBtn.hidden = cnMode !== 4 || !wpEdits;
+      cnBrushRow.title = cnMode === 3 ? 'Nav is painted, or erased, within this distance of the pointer' : 'Triangles whose centre is this close to the pointer are erased';
       const v = edit.colnav.Volumes[cnSel] || null, shape = v ? v.Shape : cnShape, dims = v ? [v.W, v.H, v.D] : cnSizes[shape];
       cnBrushIn.value = fmtM(cnBrush);
       cnShapeSel.value = shape;
       cnDims.forEach((inp, k) => (inp.value = fmtM(dims[k])));
       cnYawIn.value = String(Math.round((v ? v.Yaw : cnYaw) * 10) / 10);
-      cnBrushRow.hidden = cnMode !== 1;
+      cnBrushRow.hidden = cnMode !== 1 && cnMode !== 3;
       cnPieceRows.forEach((r) => (r.hidden = cnMode !== 2));
       cnDelBtn.hidden = cnMode !== 2;
       cnDelBtn.disabled = !v;
       const erased = cnErasedCount(), n = edit.colnav.Volumes.length;
-      cnRestoreBtn.hidden = !erased;
-      cnTools.hidden = cnDelBtn.hidden && cnRestoreBtn.hidden;
-      cnLine.textContent = `${plural(erased, 'triangle')} erased · ${plural(n, 'piece')} added${v ? ` · piece ${cnSel + 1} selected` : ''}`;
-      cnNote.textContent = !colRead
+      cnRestoreBtn.hidden = !erased || cnMode >= 3;
+      cnTools.hidden = cnDelBtn.hidden && cnRestoreBtn.hidden && cnClearNavBtn.hidden && cnClearWpBtn.hidden;
+      const sq = Math.ceil(c.NavCells.length / 2), hand = c.Waypoints.length;
+      cnLine.textContent =
+        cnMode === 3
+          ? `${plural(sq, 'square')} painted · ${plural(c.NavErase.length, 'patch', 'patches')} erased`
+          : cnMode === 4
+            ? `${plural(hand, 'waypoint')} added · ${c.RemovedWaypoints.length} deleted · ${plural(c.Links.length, 'link')} made · ${c.Cuts.length} cut${cnNode !== MIN_REF ? ' · one selected' : ''}`
+            : `${plural(erased, 'triangle')} erased · ${plural(n, 'piece')} added${v ? ` · piece ${cnSel + 1} selected` : ''}`;
+      cnNote.textContent =
+        cnMode === 3
+          ? 'Drag over the ground to paint where bots walk (cyan); Shift+drag erases it (red). Bots use it once it joins the nav they already walk on.'
+          : cnMode === 4
+            ? 'Click empty ground to add a waypoint; click one to select it, then another to link or unlink them; Shift+click or Del deletes one. Your waypoints have green posts.'
+            : cnNoteText(v, shape, live, layers);
+    }
+    function cnNoteText(v, shape, live, layers) {
+      return !colRead
         ? 'Reading the collision…'
         : !layers
           ? 'This stage has no collision (.ccp) to edit.'
@@ -2869,7 +3336,7 @@ export function renderStage(node, ctx) {
               ? v
                 ? 'Arrows and PgUp/PgDn move it, the wheel turns it, Del deletes it; click it again or Esc to let go.'
                 : `Click the map to place a ${shape.toLowerCase()}; click a piece to select it.`
-              : `F3, Erase or Add: change the collision the download writes; the changes are saved with the edits.${live ? '' : " This collision has an unfamiliar layout, so it can't be erased here."}`;
+              : `F3, Erase, Add, Paint nav or Waypoints: change the collision and the bot navigation the download writes; the changes are saved with the edits.${live ? '' : " This collision has an unfamiliar layout, so it can't be erased here."}`;
     }
     renderColNav();
     renderSky();
@@ -3061,7 +3528,7 @@ export function renderStage(node, ctx) {
       'wheel',
       (e) => {
         e.preventDefault();
-        if (cnMode && !e.altKey) return cnWheel(e);
+        if (cnMode && cnMode !== 4 && !e.altKey) return cnWheel(e);
         cam.dist = Math.max(near(), cam.dist * Math.exp(e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0015)));
         dirty = true;
       },
