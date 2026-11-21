@@ -9,6 +9,7 @@ import { renderBres } from './views/bres-view.js';
 import { renderStage } from './views/stage-view.js';
 import { renderLng } from './views/lng-view.js';
 import { renderText } from './views/text-view.js';
+import { renderNut } from './views/nut-view.js';
 import { renderMedia } from './views/media-view.js';
 import { renderHex } from './views/hex-view.js';
 import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictures } from './browser.js';
@@ -32,6 +33,7 @@ const dom = {
 /** @type {{path: string, file: File, stack: any[] | null, dirty: boolean, li?: HTMLElement}[]} */
 let files = [];
 let current = null;
+let pendingJump = null; // where a script opened from go to definition should put the caret
 const stack = () => current?.stack ?? [];
 const top = () => stack().at(-1);
 
@@ -421,6 +423,20 @@ function renderView() {
         .filter((r) => r.path.toLowerCase().startsWith(base) && !r.path.slice(base.length).includes('/'))
         .map((r) => ({ name: r.path.slice(base.length), path: r.path, read: async () => new Uint8Array(await r.file.arrayBuffer()) }));
     },
+    /** Every .nut script among the open files (the script editor's go to definition and code assist), read when asked. */
+    scripts: () => files.filter((r) => /\.nut$/i.test(r.path)).map((r) => ({ path: r.path, read: async () => new Uint8Array(await r.file.arrayBuffer()) })),
+    /** Opens an open file by path and hands the script editor where to put the caret ({line, name} or {pos, end}). */
+    openScript: (path, jump) => {
+      const rec = files.find((r) => r.path === path);
+      if (!rec) return toast(`${path} is not open`, 'warn');
+      pendingJump = jump ?? null;
+      openFile(rec);
+    },
+    takeJump: () => {
+      const j = pendingJump;
+      pendingJump = null;
+      return j;
+    },
   };
   let view;
   try {
@@ -451,6 +467,7 @@ function pickView(node, ctx) {
       return renderLng(node, ctx);
     case 'json':
     case 'text':
+      if (/\.nut$/i.test(node.name)) return renderNut(node, ctx);
       return renderText(node, ctx);
     case 'dds':
     case 'image':

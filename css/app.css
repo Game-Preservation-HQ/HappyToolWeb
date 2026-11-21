@@ -538,3 +538,98 @@ span.twisty { cursor: default; }
   .stage-body { flex-direction: column; }
   .stage-side { width: auto; max-height: 34vh; }
 }
+
+/* Squirrel script editor (.nut): the desktop's script editor colours, light and dark */
+.nut-view {
+  --nut-bg: #ffffff; --nut-text: #1f1f1f; --nut-kw: #0000ff; --nut-comment: #008000; --nut-string: #a31515;
+  --nut-number: #098658; --nut-engine: #267f99; --nut-const: #0070c1; --nut-bad: #e51400; --nut-line: #f3f3f3;
+  --nut-sel: #add6ff; --nut-gutter: #237893; --nut-brace: #dcdcdc; --nut-word: #c8c8c8; --nut-find: #f5c6a8;
+  --nut-cur: #0070c1;
+}
+:root[data-theme='dark'] .nut-view {
+  --nut-bg: #1e1e1e; --nut-text: #d4d4d4; --nut-kw: #569cd6; --nut-comment: #6a9955; --nut-string: #ce9178;
+  --nut-number: #b5cea8; --nut-engine: #4ec9b0; --nut-const: #4fc1ff; --nut-bad: #ff6666; --nut-line: #252526;
+  --nut-sel: #264f78; --nut-gutter: #969696; --nut-brace: #353535; --nut-word: #57575c; --nut-find: #623315;
+  --nut-cur: #4fc1ff;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) .nut-view {
+    --nut-bg: #1e1e1e; --nut-text: #d4d4d4; --nut-kw: #569cd6; --nut-comment: #6a9955; --nut-string: #ce9178;
+    --nut-number: #b5cea8; --nut-engine: #4ec9b0; --nut-const: #4fc1ff; --nut-bad: #ff6666; --nut-line: #252526;
+    --nut-sel: #264f78; --nut-gutter: #969696; --nut-brace: #353535; --nut-word: #57575c; --nut-find: #623315;
+    --nut-cur: #4fc1ff;
+  }
+}
+.nut-main { flex: 1; min-height: 0; display: flex; gap: 8px; }
+.nut-code {
+  position: relative; flex: 1; min-width: 0; display: flex; overflow: hidden;
+  background: var(--nut-bg); color: var(--nut-text); border: 1px solid var(--border); border-radius: var(--radius);
+  font-family: 'Cascadia Mono', var(--mono); font-size: 14px; line-height: 20px; tab-size: 4;
+}
+.nut-gutter {
+  flex: none; overflow: hidden; padding: 8px 10px 8px 8px; text-align: right; color: var(--nut-gutter);
+  border-right: 1px solid var(--border); user-select: none; min-width: 3.5em;
+}
+.nut-gutter pre, .nut-layer pre, .nut-ta { margin: 0; font: inherit; line-height: inherit; tab-size: inherit; }
+.nut-area { position: relative; flex: 1; min-width: 0; overflow: hidden; }
+.nut-layer { position: absolute; inset: 0 auto auto 0; pointer-events: none; will-change: transform; }
+.nut-layer pre { position: absolute; top: 0; left: 0; padding: 8px 12px; white-space: pre; }
+.nut-marks, .nut-marks mark { color: transparent; }
+.nut-marks mark { border-radius: 2px; }
+.nut-marks .m-find { background: var(--nut-find); }
+.nut-marks .m-cur { background: var(--nut-find); outline: 1px solid var(--nut-cur); }
+.nut-marks .m-word { background: var(--nut-word); }
+.nut-marks .m-brace { background: var(--nut-brace); outline: 1px solid var(--nut-gutter); }
+.nut-curline { position: absolute; left: 0; width: 100000px; background: var(--nut-line); }
+.nut-ta {
+  position: absolute; inset: 0; width: 100%; height: 100%; padding: 8px 12px; border: 0; outline: 0; resize: none;
+  white-space: pre; overflow: auto; background: transparent; color: transparent; caret-color: var(--nut-text);
+}
+.nut-ta::selection { background: var(--nut-sel); color: transparent; }
+.nut-measure { position: absolute; visibility: hidden; white-space: pre; font: inherit; top: 0; left: 0; }
+.sq-keyword { color: var(--nut-kw); }
+.sq-comment { color: var(--nut-comment); }
+.sq-string { color: var(--nut-string); }
+.sq-number { color: var(--nut-number); }
+.sq-engine { color: var(--nut-engine); }
+.sq-const { color: var(--nut-const); }
+.sq-bad { color: var(--nut-bad); font-weight: 700; text-decoration: underline wavy; }
+.nut-select { padding: 4px 6px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--text); font: inherit; font-size: 13px; }
+.nut-functions { max-width: 340px; font-family: var(--mono); }
+.nut-find { display: flex; flex-direction: column; gap: 4px; padding: 6px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
+.nut-find[hidden], .nut-find-row[hidden] { display: none; }
+.nut-find-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.nut-find-in { flex: 0 1 320px; padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--text); font-family: var(--mono); }
+.nut-toggle { font-family: var(--mono); min-width: 2.4em; }
+.nut-toggle[aria-pressed='true'] { background: var(--accent-soft); border-color: var(--accent); }
+.nut-count { min-width: 7em; font-size: 12px; }
+.nut-status { display: flex; align-items: center; gap: 6px 12px; flex-wrap: wrap; font-size: 12px; }
+.nut-status .spacer { flex: 1; }
+.nut-msg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
+.nut-assist {
+  position: absolute; z-index: 5; width: 360px; max-height: 220px; overflow: auto; font-size: 13px; line-height: 1.5;
+  background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
+}
+.nut-assist[hidden], .nut-tip[hidden], .nut-toolbox[hidden] { display: none; }
+.nut-assist-row { display: flex; gap: 6px; align-items: center; padding: 1px 6px; cursor: pointer; white-space: nowrap; }
+.nut-assist-row.sel { background: var(--sel); }
+.nut-assist-name { flex: none; }
+.nut-assist-detail { overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
+.nut-kind { flex: none; display: inline-block; width: 1.4em; text-align: center; border-radius: 3px; font-size: 11px; font-weight: 700; background: var(--surface-2); }
+.nut-kind.k-N, .nut-kind.k-K { color: var(--nut-engine); }
+.nut-kind.k-C { color: var(--nut-const); }
+.nut-kind.k-kw { color: var(--nut-kw); }
+.nut-kind.k-S, .nut-kind.k-here, .nut-kind.k-index { color: var(--accent); }
+.nut-tip {
+  position: absolute; z-index: 6; max-width: 70%; padding: 3px 8px; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
+}
+.nut-tip-name { font-weight: 600; }
+.nut-tip-cur { color: var(--nut-cur); font-weight: 700; }
+.nut-toolbox { flex: none; width: 260px; display: flex; flex-direction: column; gap: 6px; min-height: 0; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: 6px; }
+.nut-tb-head { display: flex; flex-direction: column; gap: 4px; }
+.nut-tb-filter { padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--text); }
+.nut-tb-list { flex: 1; min-height: 0; overflow: auto; font-size: 13px; }
+.nut-tb-list summary { cursor: pointer; padding: 2px 0; font-weight: 600; }
+.nut-tb-item { display: flex; gap: 6px; align-items: center; padding: 1px 4px 1px 12px; cursor: grab; font-family: var(--mono); font-size: 12px; white-space: nowrap; border-radius: 3px; }
+.nut-tb-item:hover, .nut-tb-item:focus { background: var(--sel); outline: none; }
