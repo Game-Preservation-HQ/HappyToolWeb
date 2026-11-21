@@ -26,8 +26,13 @@ import { stripTextureExtension } from '../formats/rrm.js';
 import {
   IDENTITY, AXES, UNIFORM, History, collectObjects, writeObject, withState, sameState, isEmpty, wrapDegrees, niceStep,
   shortObjectName, editsFile, readEditsFile, loadStored, store, stageKey, ringPoint, distanceToSegment,
-  closestParamOnAxis, screenAngle, screenTurnSign, turnAbout, isIdentityTransform, rotation,
+  closestParamOnAxis, screenAngle, screenTurnSign, turnAbout, isIdentityTransform, rotation, turnState, turnStateBy,
+  scaleState, rotationDelta,
 } from './stage-edit.js';
+import {
+  GRID_SHOW, loadGrid, saveGrid, sizeText, gridSummary, stepSize, snapAxisMove, snapCarryMove, gridDrawer, drawAxisIndicator,
+} from './stage-grid.js';
+import { forgeMenu } from '../forge-menu.js';
 import {
   SKY_PRESETS, cloneSky, sameSky, skyLabel, presetSky, pictureSky, textureRoles, readSkyPack, bakeSky, encodeDxt1Dds,
   storePicture, loadPicture,
@@ -48,6 +53,7 @@ import {
 } from '../formats/stage-colnav.js';
 
 const FOV = Math.PI / 4;
+const MAX_GRAB = 3000; // cm: a box select leaves out objects this wide or tall (MaxGrabSize), gimmicks excepted
 const SKY_RADIUS = 920; // ClipFar 1000 * 0.92 when StageCameraParam.json isn't read (ComputeSkyRenderRadius)
 const LM_KEY = 'happytool-web-lightmap';
 const LM_MODES = [
@@ -80,6 +86,10 @@ function fogFeatures(e) {
   if (fog) out.fog = { Enable: fog.Enable, Near: fog.Near, Far: fog.Far, Color: fog.Color };
   const cn = colNavFeature(e.colnav);
   if (cn) out[COLNAV_KEY] = cn;
+  // Linked objects (StageViewerForm.Linking.cs LinkEdits): groups of object names; as read until the map reads them.
+  if (e.links) {
+    if (e.links.length) out.links = { Groups: e.links.map((l) => l.map((o) => o.name)) };
+  } else if (e.storedLinks) out.links = e.storedLinks;
   return Object.keys(out).length ? out : null;
 }
 const lower = (s) => (s ? s.toLowerCase() : s);
@@ -417,12 +427,14 @@ function boxEnter(o, d, lo, hi) {
 }
 function pick(scene, o, d, skip = null) {
   let best = null;
+  const skipped = skip ? new Set(Array.isArray(skip) ? skip : [skip]) : null;
   for (const m of scene.meshes) {
     if (!m.visible || m.sky || !rayHitsBox(o, d, m.bounds)) continue;
     const p = m.positions, idx = m.indices;
-    const own = skip && m.triObject ? m.editObjects.indexOf(skip) : -1;
+    const own = new Set();
+    if (skipped && m.triObject) m.editObjects.forEach((x, i) => skipped.has(x) && own.add(i));
     for (let t = 0; t + 2 < idx.length; t += 3) {
-      if (own >= 0 && m.triObject[t / 3] === own) continue; // `skip` (an object being carried) is not hit
+      if (own.size && own.has(m.triObject[t / 3])) continue; // `skip` (objects being carried) is not hit
       const a = idx[t] * 3, b = idx[t + 1] * 3, c = idx[t + 2] * 3;
       const e1x = p[b] - p[a], e1y = p[b + 1] - p[a + 1], e1z = p[b + 2] - p[a + 2];
       const e2x = p[c] - p[a], e2y = p[c + 1] - p[a + 1], e2z = p[c + 2] - p[a + 2];
@@ -471,6 +483,8 @@ function setUpEdits(scene, model) {
     fogStock: null,
     storedFog: null, // the fog kept in this browser, until the stage's own is read
     otherFeatures: {}, // edits-file features this page doesn't edit, kept as read
+    links: null, // linked objects [[object, ...], ...] once the map has read them (Ctrl+G)
+    storedLinks: null, // the stored "links" feature, until then
     colnav: readColNav(null), // collision erased by hand and pieces added (the "colnav" feature)
     fogPreview: fogPreviewOn(),
   };
@@ -497,8 +511,9 @@ function setUpEdits(scene, model) {
     }
     edit.sky = cloneSky(stored.Sky);
     if (stored.Features && typeof stored.Features === 'object' && !Array.isArray(stored.Features)) {
-      const { fog, [COLNAV_KEY]: cn, ...rest } = stored.Features;
+      const { fog, [COLNAV_KEY]: cn, links, ...rest } = stored.Features;
       edit.storedFog = fogFromFeature(fog);
+      edit.storedLinks = links ?? null;
       edit.colnav = readColNav(cn);
       edit.otherFeatures = rest;
     }
@@ -670,16 +685,22 @@ export function renderStage(node, ctx) {
     const sceneCentre = centre(scene.bounds), sceneRadius = radius(scene.bounds);
     const nudgeStep = niceStep(Math.max(1, sceneRadius * 0.01)); // NudgeStep
     const cam = job.camera || (job.camera = framed(scene.bounds, { yaw: 0.6, pitch: -0.55 }));
-    let selection = null; // {mesh, object, hit}
-    // The selected object's triangles as an index buffer, for its tinted copy (made when the object is first drawn).
-    let selEbo = null;
+    let selection = null; // {mesh, object, hit}: the main selected object
+    let extra = []; // more selected objects (Ctrl+click, Ctrl+drag), after the main one
+    let linkOf = new Map(); // object → the link it is in (Ctrl+G)
+    let boxDrag = null; // a Ctrl+drag box: {x0, y0, x1, y1, remove, moved}
+    let menu = null; // the controller menu, made with the map's other controls further down
+    const grid = loadGrid();
+    const drawGrid = gridDrawer(gl);
+    // Selected objects' triangles as index buffers, for their tinted copies (made when an object is first drawn tinted).
+    const selEbos = new Map();
     const selectionEbo = (o) => {
-      if (selEbo?.object === o) return selEbo.buffer;
-      if (selEbo) gl.deleteBuffer(selEbo.buffer);
-      const buffer = gl.createBuffer();
+      let buffer = selEbos.get(o);
+      if (buffer) return buffer;
+      buffer = gl.createBuffer();
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffer);
       gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, o.triangles, gl.STATIC_DRAW);
-      selEbo = { object: o, buffer };
+      selEbos.set(o, buffer);
       return buffer;
     };
     let tool = 0; // 0 move, 1 rotate, 2 scale
@@ -748,6 +769,8 @@ export function renderStage(node, ctx) {
         gl.uniform4f(U.uTint, 1, 0.78, 0.2, tinted ? 0.35 : 0);
         gl.drawElements(gl.TRIANGLES, z - a, gl.UNSIGNED_INT, a * 4);
       };
+      const tintOf = new Map(); // mesh → its selected objects
+      for (const o of selectedAll()) tintOf.has(o.mesh) ? tintOf.get(o.mesh).push(o) : tintOf.set(o.mesh, [o]);
       for (const pass of ['sky', 'solid']) {
         const skyPass = pass === 'sky';
         if (skyPass) {
@@ -782,17 +805,20 @@ export function renderStage(node, ctx) {
             useBatch(b);
             range(b.firstIndex, b.firstIndex + b.indexCount, whole);
           }
-          // The selected object's triangles (spread through the mesh's batches) drawn again tinted, from its own
+          // The selected objects' triangles (spread through the mesh's batches) drawn again tinted, each from its own
           // index buffer, per batch span, pulled just in front of the untinted copy.
-          const so = selection?.mesh === m ? selection.object : null;
-          if (so?.spans.length) {
-            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, selectionEbo(so));
+          const tinted = tintOf.get(m);
+          if (tinted) {
             gl.depthFunc(gl.LEQUAL);
             gl.enable(gl.POLYGON_OFFSET_FILL);
             gl.polygonOffset(-1, -1);
-            for (let k = 0; k + 2 < so.spans.length; k += 3) {
-              useBatch(m.batches[so.spans[k]]);
-              range(so.spans[k + 1], so.spans[k + 1] + so.spans[k + 2], true);
+            for (const so of tinted) {
+              if (!so.spans.length) continue;
+              gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, selectionEbo(so));
+              for (let k = 0; k + 2 < so.spans.length; k += 3) {
+                useBatch(m.batches[so.spans[k]]);
+                range(so.spans[k + 1], so.spans[k + 1] + so.spans[k + 2], true);
+              }
             }
             gl.disable(gl.POLYGON_OFFSET_FILL);
             gl.depthFunc(gl.LESS);
@@ -802,6 +828,7 @@ export function renderStage(node, ctx) {
       }
       if (lineProg) drawCollision(vp, eye);
       if (lineProg) drawNav(vp, eye);
+      if (drawGrid) drawGrid(grid, { vp, eye, f, viewH, fov: FOV, far });
       gl.bindVertexArray(null);
       overlayDirty = true;
     }
@@ -813,6 +840,30 @@ export function renderStage(node, ctx) {
     const RING = 64;
     const BOX_EDGES = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
     const selected = () => selection?.object || null;
+    /** Everything selected: the main object first, then the others, each with the objects linked to it. */
+    function selectedAll() {
+      const o = selected();
+      if (!o) return [];
+      const out = [], seen = new Set();
+      for (const x of [o, ...extra]) for (const y of [x, ...(linkOf.get(x) || [])]) if (!seen.has(y)) seen.add(y), out.push(y);
+      return out;
+    }
+    /** The box round objects' world bounds (null when none has any). */
+    function unionBounds(list) {
+      let b = null;
+      for (const o of list) {
+        if (!o.bounds) continue;
+        if (!b) b = { min: o.bounds.min.slice(), max: o.bounds.max.slice() };
+        else
+          for (let k = 0; k < 3; k++) {
+            b.min[k] = Math.min(b.min[k], o.bounds.min[k]);
+            b.max[k] = Math.max(b.max[k], o.bounds.max[k]);
+          }
+      }
+      return b;
+    }
+    /** A gimmick's table has no scale and no Solid. */
+    const fit = (o, st) => (st && o.gimmick && (st.solid || st.s.some((x) => x !== 1)) ? { ...st, s: [1, 1, 1], solid: false } : st);
 
     /** World point → CSS pixels in the canvas, or null behind the eye. */
     function project(p) {
@@ -823,13 +874,17 @@ export function renderStage(node, ctx) {
       if (w <= 1e-6) return null;
       return { x: ((x / w) * 0.5 + 0.5) * viewW, y: (0.5 - (y / w) * 0.5) * viewH };
     }
-    /** The selected object's gizmo: origin at pivot + offset, arms 12% of the distance to the eye (GizmoLength). */
+    /**
+     * The selection's gizmo: origin at the object's pivot + offset (several objects: the middle of their bounds), arms
+     * 12% of the distance to the eye (GizmoLength).
+     */
     function gizmo() {
-      const o = selected();
+      const all = selectedAll(), o = all[0];
       if (!o) return null;
-      const origin = o.pivot.map((x, k) => x + o.state.t[k]);
+      const b = all.length > 1 ? unionBounds(all) : null;
+      const origin = b ? centre(b) : o.pivot.map((x, k) => x + o.state.t[k]);
       const { eye } = basis();
-      return { o, origin, len: Math.max(1e-3, Math.hypot(origin[0] - eye[0], origin[1] - eye[1], origin[2] - eye[2]) * 0.12) };
+      return { o, all, origin, len: Math.max(1e-3, Math.hypot(origin[0] - eye[0], origin[1] - eye[1], origin[2] - eye[2]) * 0.12) };
     }
     const tipOf = (g, a) => project(g.origin.map((x, k) => x + AXES[a][k] * g.len));
     const ringOf = (g, a) => Array.from({ length: RING + 1 }, (_, i) => project(ringPoint(g.origin, a, g.len, (i / RING) * 2 * Math.PI)));
@@ -868,21 +923,34 @@ export function renderStage(node, ctx) {
       g2.clearRect(0, 0, w, h);
       g2.setTransform(dpr, 0, 0, dpr, 0, 0);
       if (cnMode) drawCnOverlay(g2);
+      if (grid.axes) drawAxisIndicator(g2, overlay.clientHeight, basis());
+      if (boxDrag?.moved) {
+        const x = Math.min(boxDrag.x0, boxDrag.x1), y = Math.min(boxDrag.y0, boxDrag.y1);
+        const bw = Math.abs(boxDrag.x1 - boxDrag.x0), bh = Math.abs(boxDrag.y1 - boxDrag.y0);
+        g2.fillStyle = boxDrag.remove ? 'rgb(240 82 95 / 0.08)' : 'rgb(255 212 59 / 0.08)';
+        g2.fillRect(x, y, bw, bh);
+        g2.strokeStyle = boxDrag.remove ? '#f0525f' : '#ffd43b';
+        g2.lineWidth = 1;
+        g2.setLineDash([5, 4]);
+        g2.strokeRect(x + 0.5, y + 0.5, bw, bh);
+        g2.setLineDash([]);
+      }
       const g = gizmo();
       if (!g) return;
-      const b = g.o.bounds;
-      if (b) {
+      g2.strokeStyle = 'rgb(255 212 59 / 0.7)';
+      g2.lineWidth = 1;
+      g2.beginPath();
+      for (const o of g.all.slice(0, 500)) {
+        const b = o.bounds;
+        if (!b) continue;
         const corner = Array.from({ length: 8 }, (_, i) => project([0, 1, 2].map((k) => ((i >> k) & 1 ? b.max[k] : b.min[k]))));
-        g2.strokeStyle = 'rgb(255 212 59 / 0.7)';
-        g2.lineWidth = 1;
-        g2.beginPath();
         for (const [i, j] of BOX_EDGES)
           if (corner[i] && corner[j]) {
             g2.moveTo(corner[i].x, corner[i].y);
             g2.lineTo(corner[j].x, corner[j].y);
           }
-        g2.stroke();
       }
+      g2.stroke();
       const c = project(g.origin);
       if (!c) return;
       const active = gdrag ? gdrag.axis : hover;
@@ -935,6 +1003,8 @@ export function renderStage(node, ctx) {
     function startGizmo(handle, p) {
       const g = gizmo();
       const d = { axis: handle, tool, o: g.o, before: g.o.state, origin: g.origin, len: g.len, startY: p.y };
+      d.all = g.all.map((o) => ({ o, before: o.state }));
+      d.b0 = unionBounds(g.all);
       if (tool === 0 || (tool === 2 && handle !== UNIFORM)) {
         const { o: ro, d: rd } = rayAt(p.x, p.y);
         const s0 = closestParamOnAxis(g.origin, AXES[handle], ro, rd);
@@ -963,16 +1033,17 @@ export function renderStage(node, ctx) {
     }
 
     function moveGizmo(p, e) {
-      const d = gdrag, st = d.before, snap = e.ctrlKey || e.metaKey;
-      let next;
+      // Snapping to the grid when it is on, or while Ctrl is held when it is off (the desktop's SnapActive).
+      const d = gdrag, multi = d.all.length > 1, snap = grid.snap !== (e.ctrlKey || e.metaKey);
+      let fn;
       if (d.tool === 0) {
         const { o: ro, d: rd } = rayAt(p.x, p.y);
         const s = closestParamOnAxis(d.origin, AXES[d.axis], ro, rd);
         if (s == null) return;
         const lim = Math.max(1, sceneRadius * 4);
         let delta = Math.max(-lim, Math.min(lim, s - d.s0));
-        if (snap) delta = Math.round(delta / nudgeStep) * nudgeStep;
-        next = withState(st, { t: st.t.map((x, k) => (k === d.axis ? x + delta : x)) });
+        if (snap) delta = d.b0 ? snapAxisMove(grid, d.axis, delta, centre(d.b0), d.b0.min[1]) : Math.round(delta / grid.size) * grid.size;
+        fn = (st) => withState(st, { t: st.t.map((x, k) => (k === d.axis ? x + delta : x)) });
       } else if (d.tool === 1) {
         const a = screenAngle(d.c, p);
         let da = a - d.prev;
@@ -982,7 +1053,9 @@ export function renderStage(node, ctx) {
         d.acc += da;
         let deg = ((d.acc * 180) / Math.PI) * d.sign;
         if (snap) deg = Math.round(deg / 15) * 15;
-        next = withState(st, { r: st.r.map((x, k) => (k === d.axis ? wrapDegrees(x + deg) : x)) });
+        fn = multi
+          ? (st, o) => turnState(st, o.pivot, d.origin, d.axis, deg)
+          : (st) => withState(st, { r: st.r.map((x, k) => (k === d.axis ? wrapDegrees(x + deg) : x)) });
       } else {
         let f;
         if (d.axis === UNIFORM) f = Math.pow(2, (d.startY - p.y) / 120);
@@ -994,16 +1067,18 @@ export function renderStage(node, ctx) {
         }
         if (snap) f = Math.max(0.1, Math.round(f * 10) / 10);
         const all = d.axis === UNIFORM || (uniformBox.checked && !e.shiftKey);
-        next = withState(st, { s: st.s.map((x, k) => (all || k === d.axis ? x * f : x)) });
+        fn = multi
+          ? (st, o) => scaleState(st, o.pivot, d.origin, f, [0, 1, 2].map((k) => all || k === d.axis))
+          : (st) => withState(st, { s: st.s.map((x, k) => (all || k === d.axis ? x * f : x)) });
       }
-      apply(d.o, next);
+      for (const { o, before } of d.all) apply(o, fit(o, fn(before, o)));
       syncPanel();
     }
 
     function endGizmo() {
       const d = gdrag;
       gdrag = null;
-      edit.history.push([{ obj: d.o, before: d.before, after: d.o.state }], ['Move', 'Rotate', 'Scale'][d.tool]);
+      edit.history.push(d.all.map(({ o, before }) => ({ obj: o, before, after: o.state })), ['Move', 'Rotate', 'Scale'][d.tool]);
       edit.history.breakMerge();
       edited();
     }
@@ -1011,7 +1086,7 @@ export function renderStage(node, ctx) {
     function cancelDrag() {
       const d = gdrag;
       gdrag = null;
-      apply(d.o, d.before);
+      for (const { o, before } of d.all) apply(o, before);
       syncPanel();
     }
 
@@ -1035,9 +1110,7 @@ export function renderStage(node, ctx) {
       const changes = [];
       for (const o of list) {
         const before = o.state;
-        let after = fn(before, o);
-        // A gimmick's table has no scale and no Solid.
-        if (after && o.gimmick && (after.solid || after.s.some((x) => x !== 1))) after = { ...after, s: [1, 1, 1], solid: false };
+        const after = fit(o, fn(before, o));
         if (!after || sameState(before, after)) continue;
         apply(o, after);
         changes.push({ obj: o, before, after });
@@ -1080,28 +1153,37 @@ export function renderStage(node, ctx) {
       const o = selected();
       if (!o) return false;
       const ctrl = e.ctrlKey || e.metaKey, coarse = e.shiftKey;
+      // Several objects (or a link) turn and size about the middle of their bounds, as one.
+      const list = selectedAll(), multi = list.length > 1, mid = multi && unionBounds(list), origin = mid ? centre(mid) : null;
       const MOVE = { arrowleft: [0, -1], arrowright: [0, 1], arrowup: [2, -1], arrowdown: [2, 1], pageup: [1, 1], pagedown: [1, -1] };
       const TURN = { arrowleft: [1, -1], arrowright: [1, 1], arrowup: [0, 1], arrowdown: [0, -1], pageup: [2, 1], pagedown: [2, -1] };
       if (MOVE[k]) {
         if (ctrl) {
-          const [axis, sign] = TURN[k];
-          change([o], (st) => withState(st, { r: st.r.map((x, i) => (i === axis ? wrapDegrees(x + sign * (coarse ? 45 : 5)) : x)) }), 'Rotate', 'key-rotate');
+          const [axis, sign] = TURN[k], deg = sign * (coarse ? 45 : 5);
+          change(
+            list,
+            origin ? (st, x) => turnState(st, x.pivot, origin, axis, deg) : (st) => withState(st, { r: st.r.map((x, i) => (i === axis ? wrapDegrees(x + deg) : x)) }),
+            'Rotate',
+            'key-rotate',
+          );
         } else {
           const [axis, sign] = MOVE[k];
-          change([o], (st) => withState(st, { t: st.t.map((x, i) => (i === axis ? x + sign * nudgeStep * (coarse ? 5 : 1) : x)) }), 'Move', 'key-move');
+          change(list, (st) => withState(st, { t: st.t.map((x, i) => (i === axis ? x + sign * nudgeStep * (coarse ? 5 : 1) : x)) }), 'Move', 'key-move');
         }
         return true;
       }
       if (ctrl) return false;
       const up = [']', '}', '+', '='].includes(k), down = ['[', '{', '-', '_'].includes(k);
       if (up || down) {
-        const f = coarse ? 1.25 : 1.05;
-        change([o], (st) => withState(st, { s: st.s.map((x) => (up ? x * f : x / f)) }), 'Scale', 'key-scale');
+        const f = (coarse ? 1.25 : 1.05) ** (up ? 1 : -1);
+        change(list, origin ? (st, x) => scaleState(st, x.pivot, origin, f) : (st) => withState(st, { s: st.s.map((x) => x * f) }), 'Scale', 'key-scale');
         return true;
       }
-      if (k === 'home') change([o], (st) => ({ ...(o.stock ?? IDENTITY), hidden: st.hidden, solid: st.solid }), 'Reset');
-      else if (k === 'delete') change([o], (st) => ({ ...st, hidden: !st.hidden }), o.state.hidden ? 'Show' : 'Hide');
-      else if (k === 'k') change([o], (st) => ({ ...st, solid: !st.solid }), 'Solid');
+      // Hide and Solid follow the main object, so a mixed selection ends up all one way.
+      const hide = !o.state.hidden, solid = !o.state.solid;
+      if (k === 'home') change(list, (st, x) => ({ ...(x.stock ?? IDENTITY), hidden: st.hidden, solid: st.solid }), 'Reset');
+      else if (k === 'delete') change(list, (st) => ({ ...st, hidden: hide }), hide ? 'Hide' : 'Show');
+      else if (k === 'k') change(list, (st) => ({ ...st, solid }), 'Solid');
       else return false;
       return true;
     }
@@ -1166,7 +1248,14 @@ export function renderStage(node, ctx) {
       };
       const head = (t) => el('span', { class: 'stage-xyz-head' }, t);
       placeBox.replaceChildren(
-        el('div', { class: 'stage-place-name', title: o.name }, shortObjectName(o.name)),
+        el(
+          'div',
+          { class: 'stage-place-name', title: o.name },
+          shortObjectName(o.name),
+          selectedAll().length > 1
+            ? el('span', { class: 'muted', title: 'The gizmo and the keys move them all; the boxes here are the first one\'s' }, ` + ${selectedAll().length - 1} more`)
+            : null,
+        ),
         el(
           'p',
           { class: 'muted stage-place-info' },
@@ -1263,7 +1352,14 @@ export function renderStage(node, ctx) {
         if (sky?.Mode === 'picture' && !picture) skyNote += ' Choose the picture again in the Sky panel to see it.';
       }
       // The file's fog (a "fog" feature), and the features this page doesn't edit, kept as they are.
-      const { fog: fileFog, [COLNAV_KEY]: fileCn, ...rest } = res.features;
+      const { fog: fileFog, [COLNAV_KEY]: fileCn, links: fileLinks, ...rest } = res.features;
+      // The file's linked objects (a "links" feature) replace these.
+      if (fileLinks && typeof fileLinks === 'object') {
+        const before = edit.links || [], after = readLinks(fileLinks);
+        setLinks(after);
+        acts.push({ undo: () => setLinks(before), redo: () => setLinks(after) });
+        if (after.length) skyNote += ` ${after.length} link${after.length === 1 ? '' : 's'}.`;
+      }
       Object.assign(edit.otherFeatures, rest);
       const fog = fogFromFeature(fileFog);
       if (fog && edit.fogStock && !sameFog(fog, edit.fog)) {
@@ -1318,6 +1414,7 @@ export function renderStage(node, ctx) {
       stopped = true;
       resize.disconnect();
       releasePad?.();
+      menu?.dispose();
       if (carry) cancelCarry(); // a carried object goes back to where it was picked up
       store(edit.stage, edit.objects, edit.sky, fogFeatures(edit), gimmickEdits(edit));
       if (edit.navMatch && !edit.navMatch.done) {
@@ -3528,15 +3625,121 @@ export function renderStage(node, ctx) {
       if (!hit) return select(null);
       const ob = hit.object, m = hit.mesh;
       selection = { mesh: m, object: ob || null, hit };
+      extra = [];
       selectionChanged();
     }
     function select(o) {
       selection = o ? { mesh: o.mesh, object: o, hit: null } : null;
+      extra = [];
       selectionChanged();
+    }
+    /** Selects these objects, the first the main one (the gizmo's and the panel's). */
+    function setSelectionList(list) {
+      if (!list.length) return select(null);
+      selection = { mesh: list[0].mesh, object: list[0], hit: null };
+      extra = list.slice(1);
+      selectionChanged();
+    }
+    /** Ctrl+click: adds the object (with what is linked to it) or takes it out; empty space keeps the selection (ToggleSelectAt). */
+    function toggleSelect(hit) {
+      const o = hit?.object;
+      if (!o) return;
+      const mates = linkOf.get(o) || [o], now = selectedAll();
+      if (now.includes(o)) {
+        setSelectionList(now.filter((x) => !mates.includes(x)));
+        toast(`Took ${shortObjectName(o.name)} out of the selection`);
+      } else {
+        setSelectionList([...now, ...mates]);
+        toast(`Added ${shortObjectName(o.name)} — ${selectedAll().length} objects selected`);
+      }
+    }
+    /** Ctrl+drag: adds the objects whose middle is in the box; with Shift, takes them out (BoxSelect). */
+    function boxSelect(r, remove) {
+      const x0 = Math.min(r.x0, r.x1), x1 = Math.max(r.x0, r.x1), y0 = Math.min(r.y0, r.y1), y1 = Math.max(r.y0, r.y1);
+      const hits = new Set();
+      for (const o of edit.objects) {
+        if (!o.mesh.visible || o.state.hidden || !o.bounds) continue;
+        if (!o.gimmick) {
+          if (o.mesh.kind === 'terrain') continue;
+          const s = [0, 1, 2].map((k) => o.bounds.max[k] - o.bounds.min[k]);
+          if (Math.max(s[0], s[2]) >= MAX_GRAB || s[1] >= MAX_GRAB) continue;
+        }
+        const c = project(centre(o.bounds));
+        if (c && c.x >= x0 && c.x <= x1 && c.y >= y0 && c.y <= y1) for (const y of linkOf.get(o) || [o]) hits.add(y);
+      }
+      if (!hits.size) return toast('Nothing in the box (the ground and very large objects are left out)');
+      const now = selectedAll();
+      let next, n;
+      if (remove) {
+        next = now.filter((x) => !hits.has(x));
+        n = now.length - next.length;
+      } else {
+        const add = [...hits].filter((x) => !now.includes(x));
+        next = [...now, ...add];
+        n = add.length;
+      }
+      setSelectionList(next);
+      toast(`${remove ? `Took ${n} out` : `Added ${n}`} — ${next.length} object${next.length === 1 ? '' : 's'} selected`);
+    }
+    function setLinks(list) {
+      edit.links = list;
+      linkOf = new Map();
+      for (const l of list) for (const o of l) linkOf.set(o, l);
+      dirty = overlayDirty = true;
+    }
+    function pushLinks(next, label) {
+      const before = edit.links || [];
+      setLinks(next);
+      edit.history.push([], label, null, { undo: () => setLinks(before), redo: () => setLinks(next) });
+      edit.history.breakMerge();
+      edited();
+    }
+    /** Ctrl+G: the selected objects become one object that is selected, moved and carried together (LinkSelection). */
+    function linkSelection() {
+      const list = selectedAll();
+      if (!list.length) return toast('Select the objects to link first (Ctrl+click or Ctrl+drag)');
+      if (list.length < 2) return toast('Select two or more objects to link (Ctrl+click adds one)');
+      const chosen = new Set(list), next = [];
+      for (const l of edit.links || []) {
+        const rest = l.filter((o) => !chosen.has(o)); // links that lose pieces keep the rest when two or more are left
+        if (rest.length >= 2) next.push(rest);
+      }
+      next.push(list);
+      pushLinks(next, 'Link');
+      toast(`Linked ${list.length} pieces into one object — Ctrl+Shift+G unlinks`);
+    }
+    /** Ctrl+Shift+G: the links in the selection come apart (UnlinkSelection). */
+    function unlinkSelection() {
+      const chosen = new Set(selectedAll()), links = edit.links || [];
+      const hit = links.filter((l) => l.some((o) => chosen.has(o)));
+      if (!hit.length) return toast('Nothing linked is selected');
+      pushLinks(links.filter((l) => !hit.includes(l)), 'Unlink');
+      toast('Unlinked — each piece is its own object again');
+    }
+    /** The objects of a "links" feature ({Groups: [[name, ...], ...]}), matched by exact name; links of two or more. */
+    function readLinks(feature) {
+      const groups = feature?.Groups;
+      if (!Array.isArray(groups)) return [];
+      const byName = new Map();
+      for (const o of edit.objects) if (!byName.has(o.name)) byName.set(o.name, o);
+      const used = new Set(), out = [];
+      for (const names of groups) {
+        if (!Array.isArray(names)) continue;
+        const l = [];
+        for (const n of names) {
+          const o = typeof n === 'string' ? byName.get(n) : null;
+          if (o && !used.has(o)) used.add(o), l.push(o);
+        }
+        if (l.length >= 2) out.push(l);
+      }
+      return out;
     }
     function selectionChanged() {
       if (gdrag) cancelDrag();
       if (carry && selected() !== carry.o) dropCarry();
+      const keep = new Set(selectedAll());
+      for (const [o, b] of selEbos) if (!keep.has(o)) gl.deleteBuffer(b), selEbos.delete(o);
+      menu?.refresh();
       edit.history.breakMerge();
       hover = -1;
       canvas.style.cursor = '';
@@ -3793,6 +3996,7 @@ export function renderStage(node, ctx) {
     }
     gimmickRefresh = renderGimmicks;
     renderGimmicks();
+    setLinks(edit.links ?? readLinks(edit.storedLinks));
 
     // ----- input -----
     const rayAt = (x, y) => {
@@ -3814,11 +4018,22 @@ export function renderStage(node, ctx) {
       if (e.button === 0 && !gdrag) {
         const p = local(e), handle = gizmoHit(p);
         if (handle >= 0 && startGizmo(handle, p)) return;
+        if (!cnMode && (e.ctrlKey || e.metaKey)) {
+          boxDrag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, remove: e.shiftKey, moved: false };
+          return;
+        }
       }
       drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, pan: cnMode ? e.button === 1 : e.button !== 0 || e.shiftKey, moved: false };
     });
     canvas.addEventListener('pointermove', (e) => {
       if (gdrag) return moveGizmo(local(e), e);
+      if (boxDrag) {
+        const p = local(e);
+        Object.assign(boxDrag, { x1: p.x, y1: p.y });
+        if (Math.hypot(p.x - boxDrag.x0, p.y - boxDrag.y0) > 5) boxDrag.moved = true;
+        overlayDirty = true;
+        return;
+      }
       if (cnMode && !drag) return cnPointerMove(local(e), e.shiftKey);
       if (!drag) {
         const h = gizmoHit(local(e));
@@ -3846,6 +4061,14 @@ export function renderStage(node, ctx) {
     canvas.addEventListener('pointerup', (e) => {
       if (gdrag) return endGizmo();
       if (cnStroke) return cnStrokeEnd();
+      if (boxDrag) {
+        const b = boxDrag;
+        boxDrag = null;
+        overlayDirty = true;
+        if (b.moved) return boxSelect(b, b.remove);
+        const { o, d: dir } = rayAt(b.x0, b.y0);
+        return toggleSelect(pick(scene, o, dir));
+      }
       const d = drag;
       drag = null;
       if (!d || d.moved || e.button !== 0) return;
@@ -3857,6 +4080,8 @@ export function renderStage(node, ctx) {
       if (gdrag) cancelDrag();
       cnStrokeEnd();
       drag = null;
+      boxDrag = null;
+      overlayDirty = true;
     });
     canvas.addEventListener('dblclick', (e) => {
       if (cnMode) return;
@@ -3900,8 +4125,21 @@ export function renderStage(node, ctx) {
         e.preventDefault();
         return duplicateGimmick();
       }
+      if (ctrl && !e.altKey && k === 'g') {
+        e.preventDefault();
+        return e.shiftKey ? unlinkSelection() : linkSelection();
+      }
+      if (k === 'f10') {
+        e.preventDefault();
+        return openMenu();
+      }
       if (cnMode && !ctrl && cnKey(e, k)) return e.preventDefault();
-      if (k === 'escape') return gdrag ? cancelDrag() : select(null);
+      if (k === 'u' && !e.altKey) {
+        e.preventDefault();
+        return gridKey(ctrl, e.shiftKey);
+      }
+      // Esc: lets go of a drag, then of the selection; with nothing selected it opens the menu (as the desktop's).
+      if (k === 'escape') return gdrag ? cancelDrag() : selection ? select(null) : openMenu();
       // Tab cycles the selection once there is one; with nothing selected it moves focus as usual.
       if (k === 'tab' && selected() && !ctrl && !e.altKey) {
         e.preventDefault();
@@ -3939,7 +4177,7 @@ export function renderStage(node, ctx) {
 
     // ----- controller (StageViewerForm.Forge.cs PollGamepad): fly, look, grab and carry -----
     const PAD_HINT =
-      'Left stick: fly · Right stick: look · RT/LT: up/down · A: grab · B: deselect · X: add a gimmick · Y: placement panel · D-pad ←/→: undo/redo, ↓: collision · LB/RB: fly speed · R3: frame · View: controls · Menu: find a feature';
+      'Left stick: fly · Right stick: look · RT/LT: up/down · A: grab · B: deselect · X: add a gimmick · Y: placement panel · D-pad ←/→: undo/redo, ↓: collision · LB/RB: fly speed · R3: frame · View: controls · Menu: menu';
     const CARRY_HINT =
       'Carrying · A: drop · B: put back · X: stamp a copy · Y: surface/air · Hold LB or RB + sticks: turn (tap: 15°) · D-pad ←/→: size, ↑/↓: lift (in the air: distance) · R3: reset turn and size';
     const PAD_HELP = [
@@ -3954,7 +4192,7 @@ export function renderStage(node, ctx) {
       ['D-pad', 'Left / right: undo / redo, down: collision lines; while carrying, left / right: size, up / down: lift (in the air: distance)'],
       ['R3', 'Frame the object in the middle of the view; while carrying, reset its turn and size'],
       ['View', 'This list'],
-      ['Menu', 'Find a feature'],
+      ['Menu', 'The menu: undo, link, grid and snapping, layers, save and more (B: back, Menu: close)'],
       ['Outside the map', 'Stick or D-pad: move between controls, A: press, B: back out, X / Y: next / previous control, View: back'],
     ];
     let padUsed = false;
@@ -3984,61 +4222,76 @@ export function renderStage(node, ctx) {
       const t = padUsed ? (carry ? CARRY_HINT : PAD_HINT) : baseHint;
       if (hint.textContent !== t) hint.textContent = t;
     }
-    /** Picks an object up (the desktop's Grab): it keeps its place against the surface under the aim until moved. */
+    /** The carried objects: the one grabbed first, then the rest of the selection or its link. */
+    const carried = () => [carry.o, ...carry.mates.map((m) => m.o)];
+    /**
+     * Picks an object up (the desktop's Grab) with the rest of the selection when it is in it: they keep their place
+     * against the surface under the aim until moved.
+     */
     function startCarry(o) {
       if (o.state.hidden) return false;
       if (!o.bounds) apply(o, o.state);
-      const c = centre(o.bounds), hit = aimed(o);
-      carry = { o, start: o.state, surface: !!hit, lift: 0, dist: 0, offset: [0, 0, 0], twisted: false, sig: '' };
+      const sel = selectedAll(), list = sel.includes(o) ? [o, ...sel.filter((x) => x !== o)] : [o];
+      const b = unionBounds(list) || o.bounds, c = centre(b), hit = aimed(list);
+      const mates = list.slice(1).map((x) => ({ o: x, start: x.state }));
+      carry = { o, start: o.state, mates, surface: !!hit, lift: 0, dist: 0, offset: [0, 0, 0], twisted: false, sig: '' };
       if (hit) {
         carry.offset = [c[0] - hit.point[0], 0, c[2] - hit.point[2]];
-        carry.lift = padClamp(o.bounds.min[1] - hit.point[1], -2000, 4000);
+        carry.lift = padClamp(b.min[1] - hit.point[1], -2000, 4000);
       } else carry.dist = padClamp(eyeTo(c), 150, 30000);
       edit.history.breakMerge();
-      flash(`Carrying ${shortObjectName(o.name)}: A drops it, B puts it back`);
+      const what = mates.length ? `${list.length} objects` : shortObjectName(o.name);
+      flash(`Carrying ${what}: A drops ${mates.length ? 'them' : 'it'}, B puts ${mates.length ? 'them' : 'it'} back`);
       return true;
     }
     /** The carried object follows the aim: on the surface under it, or in the air ahead (UpdateHeld). */
     function followCarry() {
       const o = carry.o;
-      const sig = [cam.yaw, cam.pitch, cam.dist, ...cam.target, carry.surface, carry.lift, carry.dist, ...o.state.r, ...o.state.s].join();
-      if (sig === carry.sig || !o.bounds) return;
+      const sig = [cam.yaw, cam.pitch, cam.dist, ...cam.target, carry.surface, carry.lift, carry.dist, ...o.state.r, ...o.state.s, grid.snap, grid.size, grid.height].join();
+      const all = carried(), b = unionBounds(all);
+      if (sig === carry.sig || !b) return;
       carry.sig = sig;
-      const b = o.bounds, c = centre(b);
+      const c = centre(b);
       let to;
       if (carry.surface) {
-        const hit = aimed(o);
+        const hit = aimed(all);
         if (!hit) return;
         to = [hit.point[0] + carry.offset[0], hit.point[1] + carry.lift + (c[1] - b.min[1]), hit.point[2] + carry.offset[2]];
       } else {
         const { f, eye } = basis();
         to = eye.map((x, k) => x + f[k] * carry.dist);
       }
-      const dt = to.map((x, k) => x - c[k]);
+      let dt = to.map((x, k) => x - c[k]);
+      if (grid.snap) dt = snapCarryMove(grid, dt, c, b.min[1], carry.surface);
       if (Math.abs(dt[0]) + Math.abs(dt[1]) + Math.abs(dt[2]) < 1e-6) return;
-      apply(o, withState(o.state, { t: o.state.t.map((x, k) => x + dt[k]) }));
+      for (const x of all) apply(x, withState(x.state, { t: x.state.t.map((v, k) => v + dt[k]) }));
     }
     /** Puts the carried object down where it is: one undo step from where it was picked up. */
     function dropCarry() {
       if (!carry) return;
-      const { o, start } = carry, final = o.state;
+      const items = [{ o: carry.o, start: carry.start }, ...carry.mates];
+      const final = new Map(items.map(({ o }) => [o, o.state]));
       carry = null;
-      apply(o, start);
-      change([o], () => final, 'Carry');
+      for (const { o, start } of items) apply(o, start);
+      change(items.map(({ o }) => o), (st, o) => final.get(o), 'Carry');
       edit.history.breakMerge();
       setPadHint();
     }
     /** Puts the carried object back where it was picked up. */
     function cancelCarry() {
       if (!carry) return;
-      const { o, start } = carry;
+      const items = [{ o: carry.o, start: carry.start }, ...carry.mates];
       carry = null;
-      apply(o, start);
+      for (const { o, start } of items) apply(o, start);
       setPadHint();
     }
+    /** Turns the carried object; the rest of a carried group turns the same way about it. */
     function twistCarry(d) {
-      const o = carry.o;
-      apply(o, withState(o.state, { r: o.state.r.map((x, i) => wrapDegrees(x + d[i])) }));
+      const o = carry.o, r0 = o.state.r, r1 = r0.map((x, i) => wrapDegrees(x + d[i]));
+      apply(o, withState(o.state, { r: r1 }));
+      if (!carry.mates.length) return;
+      const M = rotationDelta(r0, r1), about = o.pivot.map((x, k) => x + o.state.t[k]);
+      for (const { o: x } of carry.mates) apply(x, turnStateBy(x.state, x.pivot, about, M));
     }
     function padHelp() {
       openDialog((dlg, done) => {
@@ -4081,7 +4334,7 @@ export function renderStage(node, ctx) {
       if (pad.edge(PAD.A)) return dropCarry();
       if (pad.edge(PAD.B)) return cancelCarry(), flash('Put back');
       if (pad.edge(PAD.X)) {
-        if (!o.gimmick) return toast('Only gimmicks can be copied here so far.');
+        if (!o.gimmick || carry.mates.length) return toast('Only a single gimmick can be copied here so far.');
         dropCarry();
         // Stamp: the copy comes in at the aim and is carried on (DuplicateGimmick).
         return duplicateGimmick().then(() => {
@@ -4093,15 +4346,24 @@ export function renderStage(node, ctx) {
       if (pad.edge(PAD.Y)) {
         carry.surface = !carry.surface;
         if (carry.surface) (carry.lift = 0), (carry.offset = [0, 0, 0]);
-        else carry.dist = padClamp(eyeTo(centre(o.bounds)), 150, 30000);
+        else carry.dist = padClamp(eyeTo(centre(unionBounds(carried()) || o.bounds)), 150, 30000);
         toast(carry.surface ? 'Placing on surfaces' : 'Placing in the air (D-pad up / down: farther / closer)');
       } else if (pad.edge(PAD.R3)) {
-        const s0 = o.stock ?? IDENTITY;
-        apply(o, withState(o.state, { r: s0.r.slice(), s: s0.s.slice() }));
+        if (carry.mates.length) {
+          // A group goes back to how it was picked up, where it is now.
+          const dt = o.state.t.map((x, k) => x - carry.start.t[k]);
+          for (const { o: x, start } of [{ o, start: carry.start }, ...carry.mates]) apply(x, withState(start, { t: start.t.map((v, k) => v + dt[k]) }));
+        } else {
+          const s0 = o.stock ?? IDENTITY;
+          apply(o, withState(o.state, { r: s0.r.slice(), s: s0.s.slice() }));
+        }
       }
       const sl = padRepeat('left', pad.held(PAD.LEFT)), sr = padRepeat('right', pad.held(PAD.RIGHT));
       if (sl || sr) {
-        if (!o.gimmick) apply(o, withState(o.state, { s: o.state.s.map((x) => padClamp(x * (sr ? 1.1 : 1 / 1.1), 0.01, 100)) }));
+        if (carry.mates.length) {
+          const all = carried(), b = unionBounds(all), f = sr ? 1.1 : 1 / 1.1;
+          if (b) for (const x of all) apply(x, fit(x, scaleState(x.state, x.pivot, centre(b), f)));
+        } else if (!o.gimmick) apply(o, withState(o.state, { s: o.state.s.map((x) => padClamp(x * (sr ? 1.1 : 1 / 1.1), 0.01, 100)) }));
         else if (pad.edge(PAD.LEFT) || pad.edge(PAD.RIGHT)) toast("A gimmick's table has no size.");
       }
       const lu = padRepeat('up', pad.held(PAD.UP)), ld = padRepeat('down', pad.held(PAD.DOWN));
@@ -4121,7 +4383,8 @@ export function renderStage(node, ctx) {
       if (pad.edge(PAD.A)) {
         const hit = aimed();
         if (hit?.object && !hit.object.state.hidden) {
-          inspect(hit);
+          // Aiming at part of the selection carries all of it; anything else is selected first (with its link).
+          if (!selectedAll().includes(hit.object)) inspect(hit);
           startCarry(hit.object);
         } else toast('Aim at an object to grab it, or press X for new gimmicks.');
       } else if (pad.edge(PAD.B)) {
@@ -4166,7 +4429,7 @@ export function renderStage(node, ctx) {
           return false;
         }
         if (pad.buttons || pad.lx || pad.ly || pad.rx || pad.ry || pad.lt || pad.rt) padUsed = true;
-        if (pad.edge(PAD.MENU)) openPalette();
+        if (pad.edge(PAD.MENU)) openMenu();
         else if (pad.edge(PAD.VIEW)) padHelp();
         else if (carry) padCarry(pad);
         else padFree(pad);
@@ -4198,6 +4461,108 @@ export function renderStage(node, ctx) {
       true,
     );
 
+    // ----- the grid (StageViewerForm.Grid.cs): U shows it, Shift+U snaps, Ctrl+U finer, Ctrl+Shift+U coarser -----
+    function gridChanged() {
+      saveGrid(grid);
+      dirty = overlayDirty = true;
+      if (carry) carry.sig = '';
+      menu?.refresh();
+    }
+    function gridKey(ctrl, shift) {
+      if (ctrl) {
+        grid.size = stepSize(grid, shift ? 1 : -1);
+        toast(`Grid ${sizeText(grid.size)}`);
+      } else if (shift) {
+        grid.snap = !grid.snap;
+        toast(grid.snap ? `Snapping to the grid (${sizeText(grid.size)}) — hold Ctrl to move freely` : 'Snapping off — hold Ctrl to snap');
+      } else {
+        grid.show = (grid.show + 1) % GRID_SHOW.length;
+        toast(`Grid: ${GRID_SHOW[grid.show]}`);
+      }
+      gridChanged();
+    }
+
+    // ----- the menu (GUI/Forge/ForgeMenu.cs): controller Menu, F10, or Esc with nothing selected -----
+    menu = forgeMenu(host, { onClose: () => !stopped && canvas.focus({ preventScroll: true }) });
+    const onOff = (v) => (v ? 'on' : 'off');
+    const closeThen = (fn) => () => {
+      menu.close();
+      fn();
+    };
+    function openMenu() {
+      if (cnMode) return toast('Leave the collision & nav editor first (F3).');
+      if (carry) dropCarry();
+      menu?.open(mainPage);
+    }
+    const mainPage = {
+      title: 'Map editor',
+      status: () => {
+        const n = selectedAll().length;
+        return `${n ? `${n} selected` : 'Nothing selected'} · ${gridSummary(grid)}`;
+      },
+      items: () => [
+        { text: 'Resume', desc: 'Back to the map (Menu, B or Esc)', activate: () => menu.close() },
+        { header: true, text: 'Edit' },
+        { text: 'Undo', value: () => edit.history.undo.at(-1)?.label || '', enabled: () => edit.history.undo.length > 0, activate: undo, desc: 'Ctrl+Z · D-pad left on the map' },
+        { text: 'Redo', value: () => edit.history.redo.at(-1)?.label || '', enabled: () => edit.history.redo.length > 0, activate: redo, desc: 'Ctrl+Y · D-pad right on the map' },
+        { text: 'Link the selection', value: () => (selectedAll().length > 1 ? `${selectedAll().length} objects` : ''), enabled: () => selectedAll().length > 1, activate: linkSelection, desc: 'Makes the selected objects one object that is selected, moved and carried together (Ctrl+G); saved with the edits' },
+        { text: 'Unlink', enabled: () => selectedAll().some((x) => linkOf.has(x)), activate: unlinkSelection, desc: 'Each linked piece in the selection is its own object again (Ctrl+Shift+G)' },
+        { text: 'Clear the selection', enabled: () => !!selection, activate: () => select(null), desc: 'Esc · B on the map. Ctrl+click adds or takes out an object, Ctrl+drag a box of them' },
+        scene.gimmicks
+          ? { text: 'Add gimmicks…', activate: closeThen(() => toggleCatalog(true).then(() => (catalogBox.querySelector('.stage-gimmick') || catalogBox.querySelector('input'))?.focus())), desc: "The stage's gimmick catalogue (X on the map)" }
+          : null,
+        { text: 'Placement panel', enabled: () => !!selected(), activate: closeThen(() => placeBox.querySelector('input, select, button')?.focus()), desc: 'Offset, turn, size, Hidden and Solid of the selected object (Y on the map)' },
+        { text: 'Save edits…', activate: closeThen(saveFile), desc: 'Downloads the edits file the desktop HappyTool reads too' },
+        { text: 'Load edits…', activate: closeThen(loadFile), desc: 'Applies an edits file saved here or by the desktop HappyTool' },
+        { header: true, text: 'View' },
+        { text: 'Grid and snapping…', value: () => gridSummary(grid), activate: () => menu.push(gridPage), desc: 'The floor grid, its size and height, and snapping to it (U)' },
+        { text: 'Collision lines', value: () => onOff(colBox.checked), enabled: () => !colBox.disabled, activate: toggleCollision, desc: 'H · D-pad down on the map' },
+        { text: 'Nav lines', value: () => onOff(navBox.checked), enabled: () => !navBox.disabled, activate: toggleNav, desc: 'P' },
+        { text: 'Collision & nav editor', activate: closeThen(() => setCnMode(colRead?.live ? 1 : 2)), desc: 'Erase or add collision, paint nav, edit waypoints (F3)' },
+        {
+          text: 'Textures',
+          value: () => onOff(texBox.checked),
+          activate: () => {
+            texBox.checked = !texBox.checked;
+            dirty = true;
+          },
+        },
+        {
+          text: 'Lightmap',
+          value: () => lmSelect.selectedOptions[0]?.textContent || '',
+          adjust: (dir) => {
+            const n = lmSelect.options.length;
+            lmSelect.selectedIndex = (lmSelect.selectedIndex + dir + n) % n;
+            lmSelect.dispatchEvent(new Event('change'));
+          },
+        },
+        { text: 'Fly speed', value: () => `${flyMul.toFixed(1)}×`, adjust: (dir) => (flyMul = Math.round(padClamp(flyMul + dir * 0.1, 0.1, 5) * 10) / 10), desc: 'LB / RB on the map' },
+        { text: 'Fit the map in view', activate: closeThen(() => resetBtn.click()), desc: 'R' },
+        { text: 'Frame the selection', enabled: () => !!selection, activate: closeThen(frameSelection), desc: 'F · R3 on the map frames what you aim at' },
+        { header: true, text: 'More' },
+        { text: 'Download the map as .glb', activate: closeThen(() => exportModel('glb')), desc: 'For Blender and other 3D tools, with the edits' },
+        { text: 'Controls', activate: closeThen(padHelp), desc: "The controller's buttons (View)" },
+        { text: 'Find a feature…', activate: closeThen(openPalette), desc: 'Every command of the page by name (Ctrl+K)' },
+      ],
+    };
+    const gridPage = {
+      title: 'Grid and snapping',
+      status: () => gridSummary(grid),
+      items: () => {
+        const set = (fn) => () => (fn(), gridChanged());
+        const base = () => unionBounds(selectedAll());
+        return [
+          { text: 'Grid', value: () => GRID_SHOW[grid.show], activate: set(() => (grid.show = (grid.show + 1) % 3)), adjust: (dir) => set(() => (grid.show = (grid.show + dir + 3) % 3))(), desc: 'Off, on (the map hides it), or on top of everything (U)' },
+          { text: 'Grid size', value: () => sizeText(grid.size), adjust: (dir) => set(() => (grid.size = stepSize(grid, dir)))(), desc: 'Ctrl+U finer, Ctrl+Shift+U coarser' },
+          { text: 'Height', value: () => `${Math.round(grid.height) / 100} m`, adjust: (dir) => set(() => (grid.height += dir * grid.size))(), desc: 'Raises or lowers the grid one step' },
+          { text: "Put it at the selection's base", enabled: () => !!base(), activate: set(() => (grid.height = Math.round(base().min[1] * 100) / 100)), desc: 'The grid goes to the bottom of the selected objects' },
+          { text: "Back to the map's 0", enabled: () => grid.height !== 0, activate: set(() => (grid.height = 0)) },
+          { text: 'Snapping', value: () => onOff(grid.snap), activate: set(() => (grid.snap = !grid.snap)), adjust: () => set(() => (grid.snap = !grid.snap))(), desc: 'Moves land on the grid, turns on 15°, sizes on 10% steps; holding Ctrl while dragging does the opposite (Shift+U)' },
+          { text: 'Axis indicator', value: () => onOff(grid.axes), activate: set(() => (grid.axes = !grid.axes)), adjust: () => set(() => (grid.axes = !grid.axes))(), desc: 'The X / Y / Z arrows in the corner' },
+        ];
+      },
+    };
+
     // ----- Find a feature (Ctrl+K): the map's keyboard shortcuts, sent to the map as the key would be -----
     const press = (key, mods = {}) => () => {
       canvas.focus();
@@ -4214,6 +4579,12 @@ export function renderStage(node, ctx) {
         cmd('Collision lines on or off', 'H', press('h')),
         cmd('Nav lines on or off', 'P', press('p')),
         cmd('Frame the selected object', 'F', press('f')),
+        cmd('Menu', 'F10', openMenu, 'The map editor menu; also Esc with nothing selected, or Menu on a controller'),
+        cmd('Grid: off, on, on top of everything', 'U', press('u')),
+        cmd('Snapping to the grid on or off', 'Shift+U', press('U', { shiftKey: true })),
+        cmd('Finer grid', 'Ctrl+U', press('u', { ctrlKey: true })),
+        cmd('Coarser grid', 'Ctrl+Shift+U', press('U', { ctrlKey: true, shiftKey: true })),
+        cmd('Add to the selection', 'Ctrl+click, Ctrl+drag', () => canvas.focus(), 'Ctrl+click adds or takes out one object, Ctrl+drag a box of them (Ctrl+Shift+drag takes them out)'),
         cmd('Fly the camera', 'W A S D  Q E', () => canvas.focus(), 'Click the map, then hold the keys; drag to look, wheel to zoom'),
       ];
       if (cnMode) {
@@ -4229,6 +4600,8 @@ export function renderStage(node, ctx) {
             cmd('Select the next object', 'Tab', press('Tab')),
             cmd('Nudge the selected object', 'Arrows, Page Up/Down', () => canvas.focus(), 'Shift for bigger steps, Ctrl to turn it'),
             cmd('Deselect', 'Esc', press('Escape')),
+            cmd('Link the selection into one object', 'Ctrl+G', press('g', { ctrlKey: true })),
+            cmd('Unlink the selection', 'Ctrl+Shift+G', press('G', { ctrlKey: true, shiftKey: true })),
           );
       }
       return list;

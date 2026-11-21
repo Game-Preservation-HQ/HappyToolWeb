@@ -80,6 +80,30 @@ export function turnAbout(p, origin, axis, deg) {
   return [q[0] + origin[0], q[1] + origin[1], q[2] + origin[2]];
 }
 
+/** The degrees about X, Y, Z that rotation() turns back into R (R = Rz·Ry·Rx). */
+function eulerOf(R) {
+  const tidy = (d) => Math.round(wrapDegrees(d / DEG) * 1e6) / 1e6;
+  if (Math.abs(R[6]) > 1 - 1e-9) return [0, tidy(R[6] < 0 ? Math.PI / 2 : -Math.PI / 2), tidy(Math.atan2(-R[1], R[4]))];
+  return [tidy(Math.atan2(R[7], R[8])), tidy(Math.asin(-R[6])), tidy(Math.atan2(R[3], R[0]))];
+}
+const AXIS_TURN = (axis, deg) => (axis === 0 ? rotX(deg * DEG) : axis === 1 ? rotY(deg * DEG) : rotZ(deg * DEG));
+
+/** A state turned by rotation matrix M about origin: the object's pivot travels round it and the object turns with it. */
+export function turnStateBy(st, pivot, origin, M) {
+  const at = [pivot[0] + st.t[0] - origin[0], pivot[1] + st.t[1] - origin[1], pivot[2] + st.t[2] - origin[2]];
+  const q = m3apply(M, at);
+  return { ...st, t: [q[0] + origin[0] - pivot[0], q[1] + origin[1] - pivot[1], q[2] + origin[2] - pivot[2]], r: eulerOf(m3mul(M, rotation(st.r))) };
+}
+/** A state turned about the line through origin along world axis (0 X, 1 Y, 2 Z) by deg, as a group turns together. */
+export const turnState = (st, pivot, origin, axis, deg) => turnStateBy(st, pivot, origin, AXIS_TURN(axis, deg));
+/** The turn that takes rotation rOld to rNew, to turn the rest of a group the same way. */
+export const rotationDelta = (rOld, rNew) => m3mul(rotation(rNew), m3transpose(rotation(rOld)));
+/** A state sized by f about origin on the axes in mask ([x, y, z] booleans): its place spreads out, its size grows. */
+export function scaleState(st, pivot, origin, f, mask = [true, true, true]) {
+  const t = st.t.map((v, k) => (mask[k] ? origin[k] + (pivot[k] + v - origin[k]) * f - pivot[k] : v));
+  return withState(st, { t, s: st.s.map((v, k) => (mask[k] ? v * f : v)) });
+}
+
 export function boundsOf(pos, firstVertex, count) {
   const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
   for (let v = firstVertex; v < firstVertex + count; v++)
