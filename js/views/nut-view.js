@@ -2,13 +2,15 @@
 // Controls/SquirrelCodeTextBox*.cs, Controls/CodeFindBar.cs, Controls/SquirrelScriptIndex.cs): highlighting in the
 // desktop's colours, line numbers, brace matching, find and replace, go to line, comment toggle, auto-indent, code
 // assist and call tips from the engine catalogue, the functions list, go to definition across the Data folder's
-// scripts with back / forward, the engine toolbox, zoom and line-ending conversion. The file keeps its encoding
+// scripts with back / forward (F12 or Ctrl+click), the engine toolbox, zoom, line-ending conversion, and the desktop's
+// File / Edit / View / Navigate menus and right-click menu. The file keeps its encoding
 // (most of the game's scripts are Shift-JIS) and line endings.
 import { el, button, toast, ask, debounce } from '../ui.js';
 import { lineEndings, restoreLineEndings, decodeText, encodeShiftJis } from '../util.js';
 import { decodeLayers } from '../formats/wrappers.js';
 import { tokenize, outline, lineIndex, wordAt, callAt, KEYWORDS } from '../formats/squirrel.js';
 import { setViewCommands } from '../palette.js';
+import { menuBar, contextMenu } from '../menubar.js';
 
 const INDENT = 4; // the desktop indents with 4 spaces
 const ZOOM_KEY = 'happytool-web-nut-zoom';
@@ -945,8 +947,8 @@ export function renderNut(node, ctx) {
     if (ctrl && (k === '/' || e.code === 'Slash')) return toggleComment(), true;
     if (ctrl && e.shiftKey && k === 'ArrowUp') return nextFunction(-1), true;
     if (ctrl && e.shiftKey && k === 'ArrowDown') return nextFunction(1), true;
-    if (ctrl && (k === '=' || k === '+')) return setZoom(ZOOMS.find((z) => z > zoom) ?? zoom), true;
-    if (ctrl && k === '-') return setZoom(ZOOMS.findLast((z) => z < zoom) ?? zoom), true;
+    if (ctrl && (k === '=' || k === '+')) return zoomBy(1), true;
+    if (ctrl && k === '-') return zoomBy(-1), true;
     if (ctrl && k === '0') return setZoom(100), true;
     if (k === 'F3') return step(e.shiftKey ? -1 : 1), true;
     if (k === 'F12') return goToDefinition(), true;
@@ -971,9 +973,130 @@ export function renderNut(node, ctx) {
       e.stopPropagation();
     }
   });
-  ta.addEventListener('dblclick', (e) => {
-    if (!e.ctrlKey) return;
-    goToDefinition();
+  // Ctrl+click (Cmd+click on a Mac) on a name goes to its definition, as F12: the click has already put the caret there.
+  ta.addEventListener('click', (e) => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.button !== 0 || ta.selectionStart !== ta.selectionEnd) return;
+    const a = ta.selectionStart;
+    if (wordAt(ta.value, a) || toks.some((t) => t.t === 'string' && t.s < a && a < t.e)) goToDefinition();
+  });
+  // A hand pointer while Ctrl is held, so the click reads as "go to".
+  ta.addEventListener('mousemove', (e) => ta.classList.toggle('nut-ctrl', e.ctrlKey || e.metaKey));
+  for (const type of ['keydown', 'keyup']) ta.addEventListener(type, (e) => (e.key === 'Control' || e.key === 'Meta') && ta.classList.toggle('nut-ctrl', type === 'keydown'));
+  ta.addEventListener('blur', () => ta.classList.remove('nut-ctrl'));
+
+  // ---- the desktop's menus (GUI/SquirrelEditor.Commands.cs) ----
+  const zoomBy = (d) => setZoom((d > 0 ? ZOOMS.find((z) => z > zoom) : ZOOMS.findLast((z) => z < zoom)) ?? zoom);
+  // Undo and redo use the browser's own history, which holds every edit (edit() goes through execCommand).
+  function native(cmd, keys) {
+    ta.focus({ preventScroll: true });
+    if (!document.execCommand(cmd)) say(`The browser would not ${cmd} from the menu; press ${keys}.`, 'bad');
+  }
+  async function copy(cut) {
+    const { selectionStart: a, selectionEnd: b } = ta;
+    if (a === b) return;
+    try {
+      await navigator.clipboard.writeText(ta.value.slice(a, b));
+    } catch {
+      ta.focus({ preventScroll: true });
+      if (!document.execCommand(cut ? 'cut' : 'copy')) say(`The browser would not ${cut ? 'cut' : 'copy'} from the menu; press Ctrl+${cut ? 'X' : 'C'}.`, 'bad');
+      return;
+    }
+    if (cut) edit(a, b, '');
+    else ta.focus({ preventScroll: true });
+  }
+  async function paste() {
+    const { selectionStart: a, selectionEnd: b } = ta;
+    let s;
+    try {
+      s = await navigator.clipboard.readText();
+    } catch {
+      ta.focus({ preventScroll: true });
+      return say('The browser would not share the clipboard with the menu; press Ctrl+V.', 'bad');
+    }
+    if (s) edit(a, b, s.replace(/\r\n?/g, '\n'));
+    else ta.focus({ preventScroll: true });
+  }
+  const file = ctx.file || {};
+  const hasSel = () => ta.selectionEnd > ta.selectionStart;
+  const editItems = () => [
+    { label: 'Undo', keys: 'Ctrl+Z', run: () => native('undo', 'Ctrl+Z') },
+    { label: 'Redo', keys: 'Ctrl+Y', run: () => native('redo', 'Ctrl+Y') },
+    null,
+    { label: 'Cut', keys: 'Ctrl+X', run: () => copy(true), enabled: hasSel },
+    { label: 'Copy', keys: 'Ctrl+C', run: () => copy(false), enabled: hasSel },
+    { label: 'Paste', keys: 'Ctrl+V', run: paste, enabled: () => !!navigator.clipboard?.readText },
+    { label: 'Select all', keys: 'Ctrl+A', run: () => (ta.focus({ preventScroll: true }), ta.select(), updateCaret()) },
+    null,
+    { label: 'Toggle line comment', keys: 'Ctrl+/', run: toggleComment },
+  ];
+  const definitionItem = { label: 'Go to definition / open include', keys: 'F12, Ctrl+click', run: goToDefinition };
+  const menus = [
+    {
+      label: 'File',
+      items: () => [
+        { label: 'Open…', run: file.open },
+        { label: 'Save', keys: 'Ctrl+S', run: file.save },
+        { label: 'Save as…', run: file.saveAs },
+        null,
+        { label: file.closeLabel || 'Close', run: file.close },
+      ],
+    },
+    {
+      label: 'Edit',
+      items: () => [
+        ...editItems(),
+        null,
+        { label: 'Find…', keys: 'Ctrl+F', run: () => openFind(false) },
+        { label: 'Replace…', keys: 'Ctrl+H', run: () => openFind(true) },
+        { label: 'Find next', keys: 'F3', run: () => step(1) },
+        { label: 'Find previous', keys: 'Shift+F3', run: () => step(-1) },
+        { label: 'Go to line…', keys: 'Ctrl+G', run: goToLinePrompt },
+      ],
+    },
+    {
+      label: 'View',
+      items: () => [
+        { label: 'Engine toolbox', checked: () => !toolbox.hidden, run: () => setToolbox(toolbox.hidden) },
+        null,
+        { label: 'Zoom in', keys: 'Ctrl+Plus', run: () => zoomBy(1) },
+        { label: 'Zoom out', keys: 'Ctrl+Minus', run: () => zoomBy(-1) },
+        { label: 'Reset zoom', keys: 'Ctrl+0', run: () => setZoom(100) },
+      ],
+    },
+    {
+      label: 'Navigate',
+      items: () => [
+        { label: 'Back', keys: 'Alt+←', run: () => goBack(-1), enabled: () => history.back.length > 0 },
+        { label: 'Forward', keys: 'Alt+→', run: () => goBack(1), enabled: () => history.fwd.length > 0 },
+        null,
+        definitionItem,
+        null,
+        { label: 'Previous function', keys: 'Ctrl+Shift+↑', run: () => nextFunction(-1) },
+        { label: 'Next function', keys: 'Ctrl+Shift+↓', run: () => nextFunction(1) },
+      ],
+    },
+  ];
+  // Right-click (or the Menu key / Shift+F10): the desktop's editor menu. A right-click outside the selection has
+  // already moved the caret there, so the commands act on what was clicked.
+  const contextItems = () => [definitionItem, null, ...editItems(), null, { label: 'Find…', keys: 'Ctrl+F', run: () => openFind(false) }];
+  // From the keyboard the menu opens under the caret, with its first item lit for the arrow keys.
+  function caretMenu() {
+    closeAssist();
+    const r = code.getBoundingClientRect();
+    const { x, y } = caretXY(ta.selectionEnd);
+    contextMenu(contextItems, r.left + gutter.offsetWidth + x - ta.scrollLeft, r.top + y - ta.scrollTop + lh(), true);
+  }
+  ta.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    if (e.button !== 2) return caretMenu();
+    closeAssist();
+    contextMenu(contextItems, e.clientX, e.clientY);
+  });
+  // Not every browser turns these keys into a contextmenu event, so the editor opens the menu itself.
+  ta.addEventListener('keydown', (e) => {
+    if (e.key !== 'ContextMenu' && !(e.key === 'F10' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey)) return;
+    e.preventDefault();
+    caretMenu();
   });
   async function goToLinePrompt() {
     const v = await ask(`Go to line (1–${lineCount.toLocaleString()})`, String(lineOf(ta.selectionStart) + 1), 'Go');
@@ -993,7 +1116,7 @@ export function renderNut(node, ctx) {
           { label: 'Go to line', keys: 'Ctrl+G', section: 'Script', run: goToLinePrompt },
           { label: 'Toggle line comment', keys: 'Ctrl+/', section: 'Script', run: toggleComment },
           { label: 'Code assist (complete a name)', keys: 'Ctrl+Space / Ctrl+J', section: 'Script', run: () => (ta.focus(), openAssist(true)) },
-          { label: 'Go to definition (or open the script a quoted path names)', keys: 'F12 / Ctrl+double-click', section: 'Script', run: goToDefinition },
+          { label: 'Go to definition (or open the script a quoted path names)', keys: 'F12 / Ctrl+click', section: 'Script', run: goToDefinition },
           { label: 'Back to where I jumped from', keys: 'Alt+←', section: 'Script', run: () => goBack(-1) || say('Nothing to go back to.') },
           { label: 'Forward again', keys: 'Alt+→', section: 'Script', run: () => goBack(1) || say('Nothing to go forward to.') },
           { label: 'Previous / next function', keys: 'Ctrl+Shift+↑ / ↓', section: 'Script', run: () => nextFunction(1) },
@@ -1007,14 +1130,13 @@ export function renderNut(node, ctx) {
   // ---- layout ----
   const toolbar = el(
     'div',
-    { class: 'toolbar' },
+    { class: 'toolbar nut-toolbar' },
+    menuBar(menus, 'Script editor menu'),
+    el('span', { class: 'nut-bar-sep', 'aria-hidden': 'true' }),
     button('‹', () => nextFunction(-1), { title: 'Previous function (Ctrl+Shift+↑)', 'aria-label': 'Previous function' }),
     fnSel,
     button('›', () => nextFunction(1), { title: 'Next function (Ctrl+Shift+↓)', 'aria-label': 'Next function' }),
-    button('Find', () => openFind(false), { title: 'Find (Ctrl+F); Ctrl+H to replace' }),
-    button('Go to line', goToLinePrompt, { title: 'Go to line (Ctrl+G)' }),
-    button('Comment', toggleComment, { title: 'Comment or uncomment the selected lines (Ctrl+/)' }),
-    button('Definition', goToDefinition, { title: 'Go to the definition of the name at the caret, or open the script a quoted path names (F12)' }),
+    el('span', { class: 'spacer' }),
     tbBtn,
   );
   root.append(toolbar, findBar, el('div', { class: 'nut-main' }, code, toolbox), statusBar);

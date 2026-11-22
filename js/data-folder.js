@@ -1,5 +1,6 @@
-// The game Data folder picked with the File System Access API: read it into File objects, and keep its handle in
-// IndexedDB so the next visit can offer to reopen it (the browser asks for permission again each visit).
+// The game Data folder picked with the File System Access API: read it into File objects, and (when the user agrees)
+// keep its handle in IndexedDB so the next visit can open it again. A page never learns the folder's path: the handle
+// is what the browser lets it keep, and the browser may ask for permission again on a later visit.
 
 const DB = 'happytool-web';
 const STORE = 'handles';
@@ -42,6 +43,15 @@ export async function saveHandle(handle) {
     await run('readwrite', (s) => s.put(handle, 'data'));
   } catch {
     /* not stored: the folder just won't be offered next time */
+  }
+}
+
+/** Forgets the saved folder (the user chose not to have it remembered). */
+export async function forgetHandle() {
+  try {
+    await run('readwrite', (s) => s.delete('data'));
+  } catch {
+    /* nothing was stored */
   }
 }
 

@@ -586,6 +586,27 @@ span.twisty { cursor: default; }
   white-space: pre; overflow: auto; background: transparent; color: transparent; caret-color: var(--nut-text);
 }
 .nut-ta::selection { background: var(--nut-sel); color: transparent; }
+.nut-ta.nut-ctrl { cursor: pointer; }
+.nut-bar-sep { width: 1px; align-self: stretch; margin: 2px 2px; background: var(--border); }
+
+/* Menu bar and right-click menus (js/menubar.js), as the desktop editors' menus. */
+.menubar { display: flex; gap: 2px; }
+.menubar-item { font: inherit; color: var(--text); background: transparent; border: 1px solid transparent; border-radius: var(--radius); padding: 4px 9px; cursor: pointer; }
+.menubar-item:hover, .menubar-item[aria-expanded='true'] { background: var(--surface-2); border-color: var(--border); }
+.menu-pop {
+  position: fixed; z-index: 50; min-width: 220px; max-height: calc(100vh - 8px); overflow: auto; padding: 4px;
+  display: flex; flex-direction: column; background: var(--surface); color: var(--text); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow); font-size: 13px;
+}
+.menu-item {
+  display: grid; grid-template-columns: 18px 1fr auto; gap: 8px; align-items: center; text-align: left; font: inherit;
+  color: inherit; background: transparent; border: 0; border-radius: 4px; padding: 5px 10px 5px 4px; cursor: pointer; white-space: nowrap;
+}
+.menu-item.is-active:not(:disabled), .menu-item:focus-visible { background: var(--accent-soft); outline: none; }
+.menu-item:disabled { color: var(--muted); opacity: 0.6; cursor: default; }
+.menu-check { text-align: center; }
+.menu-keys { color: var(--muted); font-size: 12px; padding-left: 16px; }
+.menu-sep { height: 1px; margin: 4px 6px; background: var(--border); }
 .nut-measure { position: absolute; visibility: hidden; white-space: pre; font: inherit; top: 0; left: 0; }
 .sq-keyword { color: var(--nut-kw); }
 .sq-comment { color: var(--nut-comment); }
@@ -596,6 +617,9 @@ span.twisty { cursor: default; }
 .sq-bad { color: var(--nut-bad); font-weight: 700; text-decoration: underline wavy; }
 .nut-select { padding: 4px 6px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--text); font: inherit; font-size: 13px; }
 .nut-functions { max-width: 340px; font-family: var(--mono); }
+/* one row, as the desktop bar: the functions list gives way first */
+.nut-toolbar { flex-wrap: nowrap; }
+.nut-toolbar .nut-functions { flex: 0 1 340px; min-width: 7em; }
 .nut-find { display: flex; flex-direction: column; gap: 4px; padding: 6px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
 .nut-find[hidden], .nut-find-row[hidden] { display: none; }
 .nut-find-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }

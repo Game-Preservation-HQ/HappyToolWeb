@@ -1,5 +1,5 @@
 // HappyTool web: open Happy Wars data files, unwrap them, browse and edit, save with the original wrappers.
-import { el, button, toast, pickFiles, openDialog } from './ui.js';
+import { el, button, toast, pickFiles, openDialog, ask } from './ui.js';
 import { decodeLayers, encodeLayers, writableLayers } from './formats/wrappers.js';
 import { parseBres, writeBres } from './formats/bres.js';
 import { parseLng, writeLng, validateLng } from './formats/lng.js';
@@ -13,7 +13,7 @@ import { renderNut } from './views/nut-view.js';
 import { renderMedia } from './views/media-view.js';
 import { renderHex } from './views/hex-view.js';
 import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictures } from './browser.js';
-import { loadHandle, saveHandle, readDirectory } from './data-folder.js';
+import { loadHandle, saveHandle, forgetHandle, readDirectory } from './data-folder.js';
 import { openPalette, setAppCommands } from './palette.js';
 import { startGamepad } from './gamepad.js';
 
@@ -60,6 +60,8 @@ function stagePicturesFor(dir) {
 }
 const expanded = new Set();
 let savedHandle = null;
+/** Whether to open the Data folder by itself on later visits: 'yes', 'no', or null (not asked yet). */
+const REMEMBER_KEY = 'happytool-web-remember-data';
 // Opera has showDirectoryPicker, but picking a folder with it can end with no permission prompt (so nothing opens), and
 // reopening a folder handle kept in IndexedDB can crash it; there the plain folder picker (an <input>) is used instead.
 const isOpera = /\bOPR\//.test(navigator.userAgent) || !!navigator.userAgentData?.brands?.some((b) => /opera/i.test(b.brand));
@@ -260,8 +262,9 @@ async function popTo(level) {
   return true;
 }
 
-async function save() {
+async function save(name) {
   if (!current?.stack) return;
+  if (typeof name !== 'string' || !name.trim()) name = baseName(current.path);
   const s = current.stack;
   dom.save.disabled = true;
   try {
@@ -270,10 +273,10 @@ async function save() {
     const payload = serialize(root);
     const layers = writableLayers(root.layers);
     const bytes = await encodeLayers(payload, layers);
-    downloadBytes(bytes, baseName(current.path));
+    downloadBytes(bytes, name);
     Object.assign(root, { payload, raw: bytes, layers, dirty: false });
     current.dirty = false;
-    toast(`Saved ${baseName(current.path)} (${formatSize(bytes.length)}). Your browser puts it in its downloads folder.`, 'ok');
+    toast(`Saved ${name} (${formatSize(bytes.length)}). Your browser puts it in its downloads folder.`, 'ok');
   } catch (e) {
     toast(`Save failed: ${e.message}`, 'error', 10000);
   }
@@ -403,6 +406,19 @@ function renderView() {
     changed: markDirty,
     rerender: () => (renderInfo(), renderView()),
     openChild,
+    /** The File menu of an editor view (the script editor's): open, save, save as, close. */
+    file: {
+      open: openFilesPicker,
+      save: () => (current?.dirty ? save() : toast('No changes to save.')),
+      saveAs: async () => {
+        const name = await ask('Save as', baseName(current.path), 'Save');
+        if (name?.trim()) save(name.trim());
+      },
+      // Inside a bundle, Close goes back to it (the edits go with it); a file of its own goes back to its folder and
+      // keeps its edits until it is saved.
+      close: () => (stack().length > 1 ? popTo(stack().length - 2) : browseTo(browse ?? '')),
+      closeLabel: stack().length > 1 ? 'Close (back to the bundle)' : 'Close',
+    },
     showHex: () => ((node.showHex = true), renderInfo(), renderView()),
     /** The stage bundles among the open files (the map editor's "another stage's sky"), read from disk when asked. */
     stageBundles: () =>
@@ -488,8 +504,13 @@ function emptyState() {
     el(
       'div',
       { class: 'empty-actions' },
-      button('Open Data folder…', openDataFolder, { class: 'btn btn-primary' }),
-      savedHandle ? button(`Reopen ${savedHandle.name}`, reopenDataFolder, { title: 'Open the folder you used last time (the browser asks to allow it again)' }) : null,
+      button('Open Data folder…', openDataFolder, { class: savedHandle && readPref(REMEMBER_KEY, null) === 'yes' ? 'btn' : 'btn btn-primary' }),
+      savedHandle
+        ? button(`Reopen ${savedHandle.name}`, reopenDataFolder, {
+            class: readPref(REMEMBER_KEY, null) === 'yes' ? 'btn btn-primary' : 'btn',
+            title: 'Open the folder you used last time. The browser asks to allow it again; “Allow on every visit” lets it open by itself next time.',
+          })
+        : null,
       button('Open files…', openFilesPicker),
     ),
     el('p', { class: 'muted small' }, 'On Steam the Data folder is usually C:\\Program Files (x86)\\Steam\\steamapps\\common\\Happy Wars\\Data.'),
@@ -607,14 +628,60 @@ async function loadDataFolder(handle) {
     return render();
   }
   savedHandle = handle;
-  saveHandle(handle);
   if (!list.length) {
     toast(`${handle.name} has no files.`, 'warn');
     return render();
   }
   addFiles(list);
-  if (list.length === 1) return;
-  browseTo(handle.name);
+  if (list.length > 1) browseTo(handle.name);
+  rememberFolder(handle);
+}
+
+/**
+ * The first time a Data folder opens, asks whether to open it by itself on later visits (opt in or out); then keeps
+ * the folder's handle (yes) or forgets it (no). Closing the question with Esc decides nothing, so it comes back.
+ */
+async function rememberFolder(handle) {
+  let choice = readPref(REMEMBER_KEY, null);
+  if (choice == null) {
+    choice = await openDialog((dlg, done) =>
+      dlg.append(
+        el('h2', { class: 'dialog-title' }, 'Open this Data folder by itself next time?'),
+        el(
+          'p',
+          { class: 'dialog-text' },
+          `HappyTool web can remember ${handle.name} in this browser and open it again when you come back. The folder stays on your computer and nothing is uploaded. ` +
+            'The browser may ask you to allow the folder again; “Allow on every visit” there lets it open without a click.',
+        ),
+        el('p', { class: 'dialog-text muted small' }, 'You can change this later in Find a feature (Ctrl+K): “Data folder”.'),
+        el(
+          'div',
+          { class: 'dialog-actions' },
+          button('Don’t remember', () => done('no')),
+          button('Remember it', () => done('yes'), { class: 'btn btn-primary', autofocus: true }),
+        ),
+      ),
+    );
+    if (choice == null) return;
+    writePref(REMEMBER_KEY, choice);
+    toast(choice === 'yes' ? `${handle.name} will open by itself next time.` : `${handle.name} won’t be remembered.`, 'ok');
+  }
+  if (choice === 'yes') saveHandle(handle);
+  else forgetHandle();
+}
+
+function setRememberFolder(on) {
+  writePref(REMEMBER_KEY, on ? 'yes' : 'no');
+  if (on && savedHandle) saveHandle(savedHandle);
+  if (!on) {
+    forgetHandle();
+    if (!files.length) savedHandle = null;
+  }
+  toast(
+    on ? (savedHandle ? `${savedHandle.name} will open by itself next time.` : 'The next Data folder you open will open by itself on later visits.') : 'The Data folder won’t be remembered.',
+    'ok',
+  );
+  if (!files.length) render();
 }
 
 async function openFilesPicker() {
@@ -731,6 +798,13 @@ $('btn-find').addEventListener('click', openPalette);
 startGamepad({ onMenu: openPalette });
 setAppCommands(() => [
   ...(stack().length > 1 ? [{ label: 'Back to the bundle this came from', keys: 'Alt+←', section: 'Location', run: () => popTo(stack().length - 2) }] : []),
+  ...(folderAccess
+    ? [
+        readPref(REMEMBER_KEY, null) === 'yes'
+          ? { label: 'Stop opening the Data folder by itself (forget it)', section: 'Data folder', run: () => setRememberFolder(false) }
+          : { label: 'Open the Data folder by itself next time (remember it)', section: 'Data folder', run: () => setRememberFolder(true) },
+      ]
+    : []),
 ]);
 
 window.addEventListener('beforeunload', (e) => {
@@ -745,12 +819,19 @@ if (typeof DecompressionStream === 'undefined')
 if (problems.length) $('env-warning').replaceChildren(...problems.map((p) => el('p', { class: 'banner banner-error' }, p)));
 
 render();
-if (folderAccess)
-  loadHandle().then((h) => {
-    if (h && !files.length) {
-      savedHandle = h;
-      render();
+if (folderAccess && readPref(REMEMBER_KEY, null) !== 'no')
+  loadHandle().then(async (h) => {
+    if (!h || files.length) return;
+    savedHandle = h;
+    let state = 'prompt';
+    try {
+      state = await h.queryPermission({ mode: 'read' });
+    } catch {
+      /* treated as not allowed yet */
     }
+    // Asking for permission needs a click, so without it the Reopen button does the asking.
+    if (readPref(REMEMBER_KEY, null) === 'yes' && state === 'granted' && !files.length) return loadDataFolder(h);
+    render();
   });
 
 // ---------- about ----------
