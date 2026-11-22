@@ -787,10 +787,49 @@ window.addEventListener('drop', async (e) => {
   if (list.length) addFiles(list);
 });
 
+/**
+ * One step back, as the desktop's controller Back does (GameDataEditor.HandleGamepadBack, BresBundleEditor's): out of a
+ * bundle opened inside another, out of a file to its folder (its edits stay until it is saved), or up a folder.
+ * False when there is nowhere to go.
+ */
+function stepBack() {
+  if (current) {
+    if (stack().length > 1) popTo(stack().length - 2);
+    else browseTo(browse ?? dirOf(current.path));
+    return true;
+  }
+  if (!canGoUp()) return false;
+  browseTo(dirOf(browse));
+  return true;
+}
+// The picked folder is the top, as the Data folder is on the desktop: above it is only that one folder again.
+const canGoUp = () => !!browse && !(!dirOf(browse) && !tree.root.files.length && tree.root.dirs.size === 1);
+/** What steps back from here, for Find a feature; null when nothing does. */
+const stepBackLabel = () =>
+  current ? (stack().length > 1 ? 'Back to the bundle this came from' : 'Back to the folder') : canGoUp() ? 'Up a folder' : null;
+// The map takes Esc itself (deselect, leave a tool) and has its own way out (← Entries).
+const mapShown = () => !!dom.view.querySelector('.stage-view');
+const typingIn = (t) =>
+  t instanceof Element &&
+  (t.isContentEditable || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' ||
+    (t.tagName === 'INPUT' && !['button', 'checkbox', 'radio', 'range', 'submit', 'reset', 'color', 'file'].includes(t.type)));
+
 window.addEventListener('keydown', (e) => {
-  if (e.altKey && e.key === 'ArrowLeft' && stack().length > 1) {
+  const plain = !e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey;
+  if (e.altKey && !e.ctrlKey && !e.metaKey && e.key === 'ArrowLeft' && (stack().length > 1 || !mapShown())) {
+    // Alt+← (and the controller's View button, which sends it) steps back like the desktop's controller Back.
     e.preventDefault();
-    popTo(stack().length - 2);
+    stepBack();
+  } else if (
+    plain &&
+    // Esc steps back from a folder or a file, Backspace goes up a folder in the browser, as the desktop's does.
+    (e.key === 'Escape' || (e.key === 'Backspace' && !current)) &&
+    !e.defaultPrevented &&
+    !typingIn(e.target) &&
+    !document.querySelector('dialog[open]') &&
+    !mapShown()
+  ) {
+    if (stepBack()) e.preventDefault();
   } else if ((e.ctrlKey || e.metaKey) && e.key === 's') {
     e.preventDefault();
     if (current?.dirty) save();
@@ -813,7 +852,9 @@ $('btn-find').addEventListener('click', openPalette);
 // Controller: moves around the page like the desktop's (stick/D-pad, A, B, X/Y); Menu opens Find a feature.
 startGamepad({ onMenu: openPalette });
 setAppCommands(() => [
-  ...(stack().length > 1 ? [{ label: 'Back to the bundle this came from', keys: 'Alt+←', section: 'Location', run: () => popTo(stack().length - 2) }] : []),
+  ...(stepBackLabel() && !(mapShown() && stack().length < 2)
+    ? [{ label: stepBackLabel(), keys: current ? 'Esc · Alt+←' : 'Esc · Backspace · Alt+←', section: 'Location', run: stepBack }]
+    : []),
   ...(folderAccess
     ? [
         readPref(REMEMBER_KEY, null) === 'yes'
