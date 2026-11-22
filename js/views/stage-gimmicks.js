@@ -372,7 +372,7 @@ export function gimmickKit({ dataFiles, textures, report = () => {} }) {
     return new Map(list.map((m) => [lower(m), templates.get(lower(m)) ?? null]));
   }
 
-  return { load, has: (model) => !!bundleOf(byName, lower(model)) };
+  return { load, has: (model) => !!bundleOf(byName, lower(model)), bundle: (model) => bundleOf(byName, lower(model))?.name ?? null };
 }
 
 const ordinal = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
@@ -559,10 +559,16 @@ export function placeRecord(record, g, dy = 0) {
 /**
  * The table with every edit applied (EditedGimmickTable): moved / turned placements get their new numbers, removed
  * ones `enable_ : false`, new ones are appended (copies of their template, with its camera entry). Returns
- * {text, moved, removed, added}, or null when nothing changed.
+ * {text, moved, removed, added}, or null when nothing changed. setupFields(g): the record fields its gimmick setup
+ * changes ({field: literal}, null = none; stage-gimmick-setup.js), written into its record too (WithGimmickSetup).
  */
-export function editedGimmickTable(text, placements) {
-  const moves = (g) => placementChanged(g);
+export function editedGimmickTable(text, placements, setupFields = () => null) {
+  // Moved, or set up differently (team, ram target, monument number).
+  const moves = (g) => placementChanged(g) || (!g.removed && setupFields(g) != null);
+  const withSetup = (record, g) => {
+    for (const [k, v] of Object.entries(setupFields(g) ?? {})) record = setJsonField(record, k, v);
+    return record;
+  };
   if (text == null || !placements.some(moves)) return null;
   const sec = findSection(text, SECTION);
   if (!sec) return null;
@@ -573,10 +579,10 @@ export function editedGimmickTable(text, placements) {
     seen.set(e.key, nth + 1);
     const g = placements.filter((x) => !x.isNew && x.tag === e.key)[nth];
     if (!g || !moves(g)) continue;
-    out += text.slice(at, e.open) + placeRecord(text.slice(e.open, e.close + 1), g);
+    out += text.slice(at, e.open) + withSetup(placeRecord(text.slice(e.open, e.close + 1), g), g);
     at = e.close + 1;
     if (g.removed && !g.removed0) removed++;
-    else moved++;
+    else if (placementChanged(g)) moved++;
   }
   let end = sec.close;
   while (end > sec.open && /\s/.test(text[end - 1])) end--;
@@ -584,7 +590,7 @@ export function editedGimmickTable(text, placements) {
   const fresh = placements.filter((g) => g.isNew && !g.removed);
   let sep = seen.size ? ',' : '';
   for (const g of fresh) {
-    out += `${sep}\n\t"${g.tag}":${placeRecord(g.templateText, g)}`;
+    out += `${sep}\n\t"${g.tag}":${withSetup(placeRecord(g.templateText, g), g)}`;
     sep = ',';
     added++;
   }
