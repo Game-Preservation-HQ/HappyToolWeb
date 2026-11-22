@@ -46,6 +46,7 @@ import {
   gimmickTableBytes, placementMesh, newPlacement, newGimmickTag, newPlacementsOf,
 } from './stage-gimmicks.js';
 import { readNav, navLines, writeNavMesh, writePathGraph, is360Spd, spd360ToSteam } from '../formats/stage-nav.js';
+import { parseGpt, writeGpt, followedPath, movedPaths } from '../formats/gimmick-paths.js';
 import { rebuildNav, Blocker, MIN_REF, nodeRefKey, navSummary, navChanged, pathChanged } from '../formats/stage-nav-edit.js';
 import {
   COLNAV_KEY, CN_SHAPES, CN_SIZES, CN_MIN_BRUSH, CN_MAX_BRUSH, readColNav, cloneColNav, colNavFeature, removedFlags,
@@ -615,6 +616,14 @@ export function renderStage(node, ctx) {
   const colLabel = el('label', { class: 'check muted', title: 'Reading the collision…' }, colBox, ' Collision');
   const navBox = el('input', { type: 'checkbox', disabled: true });
   const navLabel = el('label', { class: 'check muted', title: 'Reading the nav mesh…' }, navBox, ' Nav');
+  // Gimmick paths (the bundle's .gpt routes): shown only when the stage has some. gptFiles: entry name → its bytes.
+  const gptPaths = [], gptFiles = new Map();
+  const gptBox = el('input', { type: 'checkbox' });
+  const gptLabel = el('label', {
+    class: 'check',
+    title: "The routes moving gimmicks follow (Rainbow's rafts …). A raft path's ends follow their harbours when you move them; the bundle download writes the moved paths.",
+  }, gptBox, ' Paths');
+  gptLabel.hidden = true;
   const resetBtn = button('Reset view', null, { title: 'Frame the whole stage (R)' });
   const view = el(
     'div',
@@ -628,6 +637,7 @@ export function renderStage(node, ctx) {
       el('label', { class: 'check' }, texBox, ' Textures'),
       colLabel,
       navLabel,
+      gptLabel,
       resetBtn,
       el('span', { class: 'spacer' }),
       status,
@@ -922,6 +932,7 @@ export function renderStage(node, ctx) {
       g2.setTransform(1, 0, 0, 1, 0, 0);
       g2.clearRect(0, 0, w, h);
       g2.setTransform(dpr, 0, 0, dpr, 0, 0);
+      drawGimmickPaths(g2);
       if (cnMode) drawCnOverlay(g2);
       // The axis indicator sits in the bottom-left corner, above the hint line that runs along the bottom.
       if (grid.axes) drawAxisIndicator(g2, hint.offsetParent ? hint.offsetTop - overlay.offsetTop : overlay.clientHeight, basis());
@@ -1753,6 +1764,7 @@ export function renderStage(node, ctx) {
       if (navHandEdited()) parts.push('bot navigation');
       if (edit.sky && edit.sky.Mode !== 'dungeon') parts.push('sky');
       if (fogChanged(edit)) parts.push('fog');
+      if (gptPaths.length && movedPaths(gptPaths, gptHarbours()).length) parts.push('gimmick paths');
       return parts;
     }
     /** Nav painted or erased, or waypoints added, deleted, linked or unlinked by hand. */
@@ -1930,6 +1942,10 @@ export function renderStage(node, ctx) {
           const touched = parts.includes('objects') || parts.includes('collision');
           archive = { ...archive, entries: archive.entries.slice() };
           const line = await bakeNav(archive, touched);
+          if (line) lines.push(line);
+        }
+        if (parts.includes('gimmick paths')) {
+          const line = await bakeGimmickPaths(archive);
           if (line) lines.push(line);
         }
         if (parts.includes('sky')) {
@@ -2685,6 +2701,128 @@ export function renderStage(node, ctx) {
       },
     );
     renderNav();
+
+    // ----- gimmick paths: the .gpt routes moving gimmicks follow (StageViewerForm.GimmickPaths.cs) -----
+    gptBox.checked = !!job.showGpt;
+    function showGpt() {
+      job.showGpt = gptBox.checked;
+      dirty = true;
+    }
+    function toggleGpt() {
+      gptBox.checked = !gptBox.checked;
+      showGpt();
+    }
+    gptBox.addEventListener('change', showGpt);
+    /** Every .gpt of the bundle that reads ({name, data, paths}), logged as the desktop does (LoadGimmickPaths). */
+    async function readGimmickPaths(arc) {
+      const files = [];
+      for (const e of arc.entries) {
+        if (!/\.gpt$/i.test(e.name)) continue;
+        const d = e.pointer || !e.data?.length ? null : (await decodeLayers(e.data)).payload;
+        const paths = parseGpt(e.name, d);
+        if (!paths) {
+          console.warn(`Map editor: gimmick paths: ${e.name} isn't laid out as expected; left as it is`);
+          continue;
+        }
+        console.info(`Map editor: gimmick paths: ${e.name} — ${paths.map((p) => `${p.name} (${p.points.length} points)`).join(', ')}`);
+        files.push({ name: e.name, data: d, paths });
+      }
+      return files;
+    }
+    (job.gpt || (job.gpt = readGimmickPaths(model))).then(
+      (files) => {
+        if (stopped || !files.length) return;
+        for (const f of files) {
+          gptFiles.set(f.name.toLowerCase(), f.data);
+          gptPaths.push(...f.paths);
+        }
+        gptLabel.hidden = false;
+        downloadRefresh();
+        dirty = true;
+      },
+      (e) => console.warn(`Map editor: the gimmick paths of ${edit.stage} could not be read: ${e.message}`),
+    );
+    /**
+     * The stage's own RaftHarbor placements (not new, this season's), each as it stands now: the harbours a raft path's
+     * ends follow (HarbourShift). A harbour with no model (sligA's have none) can only be moved by an edits file, whose
+     * entry waits in edit.gimmickOther.
+     */
+    function gptHarbours() {
+      const gm = scene.gimmicks;
+      if (!gm || !gptPaths.length) return [];
+      return gm.placements
+        .filter((g) => g.type === 'RaftHarbor' && !g.isNew && g.season == null)
+        .map((g) => {
+          const o = gimmickObjects.get(g);
+          if (o) return placementFromState(o);
+          const s = edit.gimmickOther.find((x) => x.Tag === g.tag && (x.Season ?? null) === null);
+          if (!s) return g;
+          const copy = { ...g, position: g.position.slice(), rotation: g.rotation.slice() };
+          applyGimmickEdit(copy, s);
+          return copy;
+        });
+    }
+    /** Each path as a cyan line 20 cm up, green at its start and red at its end, with its name (DrawGimmickPaths). */
+    function drawGimmickPaths(g2) {
+      if (!gptBox.checked || !gptPaths.length) return;
+      const harbours = gptHarbours();
+      g2.save();
+      g2.lineWidth = 2.5;
+      g2.lineJoin = 'round';
+      g2.font = '12px system-ui, sans-serif';
+      for (const p of gptPaths) {
+        const pts = (followedPath(p, harbours) ?? p.points).map((v) => project([v[0], v[1] + 20, v[2]]));
+        g2.strokeStyle = 'rgb(77 242 242)';
+        g2.beginPath();
+        let pen = false;
+        for (const q of pts) {
+          if (q && pen) g2.lineTo(q.x, q.y);
+          else if (q) g2.moveTo(q.x, q.y);
+          pen = !!q;
+        }
+        g2.stroke();
+        const dot = (q, colour) => {
+          if (!q) return;
+          g2.fillStyle = colour;
+          g2.fillRect(q.x - 4.5, q.y - 4.5, 9, 9);
+        };
+        dot(pts[0], 'rgb(77 255 102)');
+        dot(pts.at(-1), 'rgb(255 115 89)');
+        const at = pts[Math.floor(pts.length / 2)] || pts.find(Boolean);
+        if (at) {
+          g2.fillStyle = 'rgb(0 0 0 / 0.6)';
+          g2.fillText(p.name, at.x + 7, at.y - 5);
+          g2.fillStyle = 'rgb(77 242 242)';
+          g2.fillText(p.name, at.x + 6, at.y - 6);
+        }
+      }
+      g2.restore();
+    }
+    /**
+     * The moved paths' points written into their .gpt entries of archive (in place), every other byte as it was, each
+     * read back (GimmickPathsExport). Returns the summary line, or null when no path follows a moved harbour.
+     */
+    async function bakeGimmickPaths(archive) {
+      const moved = movedPaths(gptPaths, gptHarbours());
+      if (!moved.length) return null;
+      const byFile = new Map();
+      for (const m of moved) {
+        const key = m[0].file.toLowerCase();
+        if (!byFile.has(key)) byFile.set(key, []);
+        byFile.get(key).push(m);
+      }
+      for (const [key, list] of byFile) {
+        const bytes = writeGpt(gptFiles.get(key), list);
+        const i = archive.entries.findIndex((e) => e.name.toLowerCase() === key);
+        if (i < 0) throw new Error(`${list[0][0].file} is missing from the bundle.`);
+        archive.entries[i] = { ...archive.entries[i], pointer: false, size: bytes.length, data: bytes };
+        const back = (await decodeLayers(archive.entries[i].data)).payload;
+        if (back.length !== bytes.length || back.some((x, k) => x !== bytes[k]) || !parseGpt(key, back))
+          throw new Error(`${list[0][0].file} did not read back.`);
+        console.info(`Map editor export: ${list[0][0].file}: ${list.length} path(s) moved with their harbours`);
+      }
+      return `Gimmick paths: ${moved.length} raft path(s) moved with their harbours, written into the map.`;
+    }
 
     // ----- collision edits: erase collision by hand, add pieces (StageViewerForm.ColNav.cs) -----
     let cnMode = 0; // 0 off, 1 erase collision, 2 add collision, 3 paint nav, 4 waypoints
@@ -4519,6 +4657,9 @@ export function renderStage(node, ctx) {
         { text: 'Grid and snapping…', value: () => gridSummary(grid), activate: () => menu.push(gridPage), desc: 'The floor grid, its size and height, and snapping to it (U)' },
         { text: 'Collision lines', value: () => onOff(colBox.checked), enabled: () => !colBox.disabled, activate: toggleCollision, desc: 'H · D-pad down on the map' },
         { text: 'Nav lines', value: () => onOff(navBox.checked), enabled: () => !navBox.disabled, activate: toggleNav, desc: 'P' },
+        gptPaths.length
+          ? { text: 'Gimmick paths', value: () => onOff(gptBox.checked), activate: toggleGpt, desc: "The routes moving gimmicks follow (Rainbow's rafts …). A raft path's ends follow their harbours when you move them; the bundle download writes the moved paths" }
+          : null,
         { text: 'Collision & nav editor', activate: closeThen(() => setCnMode(colRead?.live ? 1 : 2)), desc: 'Erase or add collision, paint nav, edit waypoints (F3)' },
         {
           text: 'Textures',
