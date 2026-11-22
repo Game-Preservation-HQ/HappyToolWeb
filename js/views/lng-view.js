@@ -3,10 +3,11 @@
 // and a status line. Keys are edited in the grid (double-click or Enter), text in the box below.
 import { el, button, toast, ask, confirmBox, pickFiles, downloadBlob, debounce, openDialog } from '../ui.js';
 import { menuBar } from '../menubar.js';
-import { lngToCsv, mergeCsv, parseLng, looksLikeLngHeader } from '../formats/lng.js';
+import { parseLng, looksLikeLngHeader } from '../formats/lng.js';
 import { decodeLayers } from '../formats/wrappers.js';
 import { parseBres } from '../formats/bres.js';
 import { fileFromRows, validateRows, statisticsReport, fillMissing, mergeLng, mergeMessage, compareReport } from '../formats/lng-tools.js';
+import { catalogToCsv, importCsv as csvToCatalog, catalogToXlsx, importXlsx as xlsxToCatalog, importMessage } from '../formats/lng-sheets.js';
 import { hasFontText, colorsIn, parseColor, normalizeHex, toHex6, wrapColor, stripMarkup, renderPreview } from '../formats/lng-markup.js';
 import { baseName } from '../util.js';
 
@@ -632,26 +633,34 @@ export function renderLng(node, ctx) {
     toast(`Replaced in ${n.toLocaleString()} cell(s).`, 'ok');
   }
 
-  // ---- CSV (the desktop's CSV rules come with the import/export slice) ----
+  // ---- CSV and Excel (HappyTool's Export/Import CSV and Excel) ----
   const stem = baseName(node.name).replace(/\.[^.]*$/, '') || 'text';
-  const exportCsv = () => downloadBlob(new Blob([lngToCsv(file)], { type: 'text/csv;charset=utf-8' }), `${stem}.csv`);
-  async function importCsv() {
-    const [f] = await pickFiles({ accept: '.csv,text/csv' });
-    if (!f) return;
+  async function exportSheet(csv) {
+    if (!prep()) return;
+    const name = `${stem}.${csv ? 'csv' : 'xlsx'}`;
     try {
-      if (!ui.aligned) syncAll();
-      const { updated, added } = mergeCsv(file, await f.text());
-      if (updated || added) changed();
-      ui.rows = buildRows(file);
-      ui.aligned = false;
-      ui.sel = new Set();
-      ui.focus = null;
-      loadDetail(null);
-      refresh();
-      toast(`CSV merged: ${updated} updated, ${added} added`, 'ok');
+      const cat = fileFromRows(file, ui.rows);
+      downloadBlob(csv ? new Blob([catalogToCsv(cat)], { type: 'text/csv;charset=utf-8' }) : await catalogToXlsx(cat), name);
     } catch (e) {
-      toast(`CSV import failed: ${e.message}`, 'error');
+      return toast(`Export ${csv ? 'CSV' : 'Excel'}: ${e.message}`, 'error');
     }
+    toast(`Exported ${ui.rows.length.toLocaleString()} keys to ${name}.`, 'ok');
+  }
+  async function importSheet(csv) {
+    const what = csv ? 'CSV' : 'Excel';
+    const [f] = await pickFiles({ accept: csv ? '.csv,text/csv' : '.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    if (!f) return;
+    if (node.dirty && !(await confirmBox(`Import merges ${what} data into the current strings and marks the file as changed. Continue?`, 'Continue'))) return;
+    if (!prep()) return;
+    let r;
+    try {
+      const cat = fileFromRows(file, ui.rows);
+      r = csv ? csvToCatalog(cat, await f.text()) : await xlsxToCatalog(cat, new Uint8Array(await f.arrayBuffer()));
+    } catch (e) {
+      return toast(`Import ${what}: ${e.message}`, 'error');
+    }
+    applyCatalog(r.file);
+    message(`Import ${what}`, importMessage(r));
   }
 
   // ---- checks, merge and compare (HappyTool's Validate, Statistics, Fill missing, Merge from .lng, Compare with .lng) ----
@@ -681,6 +690,7 @@ export function renderLng(node, ctx) {
     return openDialog((dlg, done) => {
       const p = el('p', { class: 'dialog-text' }, text);
       p.style.whiteSpace = 'pre-wrap';
+      p.style.overflowWrap = 'anywhere';
       dlg.append(el('h2', { class: 'dialog-title' }, title), p,
         el('div', { class: 'dialog-actions' }, button('OK', () => done(null), { class: 'btn btn-primary', autofocus: true })));
     });
@@ -770,14 +780,17 @@ export function renderLng(node, ctx) {
     } catch (e) {
       return toast(`Merge: ${e.message}`, 'error');
     }
-    // The grid is rebuilt from the merged file (re-sorted, rows without a key gone), as the desktop's RebuildGrid.
-    file.languages.splice(0, file.languages.length, ...r.file.languages);
+    applyCatalog(r.file);
+    message('Merge', mergeMessage(r));
+  }
+  /** The grid is rebuilt from a merged or imported catalog (re-sorted, rows without a key gone), as the desktop's RebuildGrid. */
+  function applyCatalog(next) {
+    file.languages.splice(0, file.languages.length, ...next.languages);
     Object.assign(ui, { rows: buildRows(file), sel: new Set(), focus: null, detail: null });
     ui.extra.clear();
     syncAll();
     changed();
     ctx.rerender();
-    message('Merge', mergeMessage(r));
   }
   async function compareWith() {
     if (!prep()) return;
@@ -810,10 +823,12 @@ export function renderLng(node, ctx) {
         file_?.save && { label: 'Save', keys: 'Ctrl+S', run: file_.save },
         file_?.saveAs && { label: 'Save as…', run: file_.saveAs },
         null,
+        { label: 'Export Excel…', run: () => exportSheet(false) },
+        { label: 'Import Excel…', run: () => importSheet(false) },
         { label: 'Merge from .lng…', run: mergeFrom },
         { label: 'Compare with .lng…', run: compareWith },
-        { label: 'Export CSV…', run: exportCsv },
-        { label: 'Import CSV…', run: importCsv },
+        { label: 'Export CSV…', run: () => exportSheet(true) },
+        { label: 'Import CSV…', run: () => importSheet(true) },
         null,
         file_?.close && { label: file_.closeLabel || 'Close', run: file_.close },
       ].filter((x) => x !== undefined && x !== false),
