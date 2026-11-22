@@ -61,6 +61,7 @@ const FOV = Math.PI / 4;
 const MAX_GRAB = 3000; // cm: a box select leaves out objects this wide or tall (MaxGrabSize), gimmicks excepted
 const SKY_RADIUS = 920; // ClipFar 1000 * 0.92 when StageCameraParam.json isn't read (ComputeSkyRenderRadius)
 const LM_KEY = 'happytool-web-lightmap';
+const PANEL_KEY = 'happytool-web-map-panel'; // '0' while the side panel is hidden
 const LM_MODES = [
   ['normal', 'Lightmap: normal'],
   ['bright', 'Lightmap: bright (×2)'],
@@ -637,12 +638,37 @@ export function renderStage(node, ctx) {
   }, gptBox, ' Paths');
   gptLabel.hidden = true;
   const resetBtn = button('Reset view', null, { title: 'Frame the whole stage (R)' });
+  // The side panel (Placement … Layers): the ☰ button hides it to give the map the room, kept for the next visit.
+  const side = el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Gimmicks'), gimmickBox, el('h3', {}, 'Collision edits'), cnBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Export 3D model'), modelBox, el('h3', {}, 'Layers'), layersBox);
+  const panelBtn = button('☰', null, { class: 'btn btn-icon' });
+  const showPanel = (on) => {
+    const what = on ? 'Hide the side panel' : 'Show the side panel';
+    side.hidden = !on;
+    panelBtn.setAttribute('aria-expanded', String(on));
+    panelBtn.setAttribute('aria-label', what);
+    panelBtn.title = `${what} (Placement, Inspect, Gimmicks, Sky, Fog, Download, Layers)`;
+  };
+  panelBtn.addEventListener('click', () => {
+    const on = side.hidden;
+    showPanel(on);
+    try {
+      localStorage.setItem(PANEL_KEY, on ? '1' : '0');
+    } catch {
+      /* private mode: kept for this visit only */
+    }
+  });
+  try {
+    showPanel(localStorage.getItem(PANEL_KEY) !== '0');
+  } catch {
+    showPanel(true);
+  }
   const view = el(
     'div',
     { class: 'view stage-view' },
     el(
       'div',
       { class: 'toolbar' },
+      panelBtn,
       button('← Entries', ctx.back, { title: 'Back to the list of entries in this bundle' }),
       el('strong', {}, model.name),
       lmSelect,
@@ -657,7 +683,7 @@ export function renderStage(node, ctx) {
     el(
       'div',
       { class: 'stage-body' },
-      el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Gimmicks'), gimmickBox, el('h3', {}, 'Collision edits'), cnBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Export 3D model'), modelBox, el('h3', {}, 'Layers'), layersBox),
+      side,
       host,
     ),
   );

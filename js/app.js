@@ -745,6 +745,22 @@ $('btn-theme').addEventListener('click', () => {
   }
 });
 
+// The ☰ button hides the file list beside the page for more room; the choice is kept for the next visit.
+const SIDEBAR_KEY = 'happytool-web-sidebar';
+function showSidebar(on) {
+  const what = on ? 'Hide the file list' : 'Show the file list';
+  $('sidebar').hidden = !on;
+  $('btn-sidebar').setAttribute('aria-expanded', String(on));
+  $('btn-sidebar').setAttribute('aria-label', what);
+  $('btn-sidebar').title = what;
+}
+showSidebar(readPref(SIDEBAR_KEY, true) !== false);
+$('btn-sidebar').addEventListener('click', () => {
+  const on = $('sidebar').hidden;
+  showSidebar(on);
+  writePref(SIDEBAR_KEY, on);
+});
+
 let dragDepth = 0;
 const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
 window.addEventListener('dragenter', (e) => {

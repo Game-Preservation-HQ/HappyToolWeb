@@ -169,6 +169,8 @@ code, pre, .hex { font-family: var(--mono); }
   letter-spacing: 0.5px;
 }
 .topbar-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.topbar-start { display: flex; align-items: center; gap: 10px; }
+.sidebar[hidden], .stage-side[hidden] { display: none; }
 .layout { flex: 1; display: flex; min-height: 0; }
 .sidebar {
   width: 280px;

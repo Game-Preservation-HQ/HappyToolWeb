@@ -10,7 +10,10 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><span class="brand-mark" aria-hidden="true">HT</span><span>HappyTool <span class="muted">web</span></span></div>
+    <div class="topbar-start">
+      <button type="button" class="btn btn-icon" id="btn-sidebar" aria-controls="sidebar" aria-expanded="true" aria-label="Hide the file list" title="Hide the file list">☰</button>
+      <div class="brand"><span class="brand-mark" aria-hidden="true">HT</span><span>HappyTool <span class="muted">web</span></span></div>
+    </div>
     <div class="topbar-actions">
       <button type="button" class="btn" id="btn-find" title="Search every menu, button, switch and shortcut (Ctrl+K)">Find a feature <kbd>Ctrl K</kbd></button>
       <button type="button" class="btn" id="btn-open">Open files…</button>
@@ -22,7 +25,7 @@
   </header>
 
   <div class="layout">
-    <aside class="sidebar" aria-label="Open files">
+    <aside class="sidebar" id="sidebar" aria-label="Open files">
       <input type="search" id="file-filter" class="input input-sm" placeholder="Filter files" aria-label="Filter files">
       <ul id="file-list" class="file-list"></ul>
       <div id="side-tree" class="side-tree" hidden></div>
