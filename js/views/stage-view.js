@@ -47,6 +47,10 @@ import {
 } from './stage-gimmicks.js';
 import { readNav, navLines, writeNavMesh, writePathGraph, is360Spd, spd360ToSteam } from '../formats/stage-nav.js';
 import { parseGpt, writeGpt, followedPath, movedPaths } from '../formats/gimmick-paths.js';
+import { latin1 } from '../formats/gimmick-script.js';
+import {
+  SETUP_KEY, cleanSetup, setupFeature, setupFromFeature, readStageScript, applyStageScript, applyTactics, gimmickSetupRules,
+} from './stage-gimmick-setup.js';
 import { rebuildNav, Blocker, MIN_REF, nodeRefKey, navSummary, navChanged, pathChanged } from '../formats/stage-nav-edit.js';
 import {
   COLNAV_KEY, CN_SHAPES, CN_SIZES, CN_MIN_BRUSH, CN_MAX_BRUSH, readColNav, cloneColNav, colNavFeature, removedFlags,
@@ -79,7 +83,7 @@ const presetDomes = new Map();
 const fogChanged = (e) => !!e.fogStock && !!e.fog && !sameFog(e.fog, e.fogStock);
 /**
  * The edits file's Features: other features kept as read, plus the fog when it is changed (or as stored, until read) and
- * the collision edits when there are any.
+ * the collision edits, linked objects and gimmick setup when there are any.
  */
 function fogFeatures(e) {
   const out = { ...e.otherFeatures };
@@ -91,10 +95,14 @@ function fogFeatures(e) {
   if (e.links) {
     if (e.links.length) out.links = { Groups: e.links.map((l) => l.map((o) => o.name)) };
   } else if (e.storedLinks) out.links = e.storedLinks;
+  // Gimmick setup (StageViewerForm.GimmickSetup.cs): only tags the loaded table has; with no table, every edit as read.
+  const gs = setupFeature(e.gimmickSetup, e.gimmickTags?.() ?? null);
+  if (gs) out[SETUP_KEY] = gs;
   return Object.keys(out).length ? out : null;
 }
 const lower = (s) => (s ? s.toLowerCase() : s);
 const shortName = (n) => n.replace(/\\/g, '/').split('/').slice(-2).join('/');
+const sameBytes = (a, b) => a.length === b.length && a.every((x, k) => x === b[k]);
 
 /** True for little-endian bundles that hold .rrm models (Steam stage bundles). */
 export const looksLikeStage = (arc) => !!arc?.littleEndian && arc.entries.some((e) => /\.rrm$/i.test(e.name) && !e.pointer);
@@ -487,6 +495,8 @@ function setUpEdits(scene, model) {
     links: null, // linked objects [[object, ...], ...] once the map has read them (Ctrl+G)
     storedLinks: null, // the stored "links" feature, until then
     colnav: readColNav(null), // collision erased by hand and pieces added (the "colnav" feature)
+    gimmickSetup: {}, // tag → {Team, Build, RamTarget, Number}: gimmicks set up differently (the "gimmickSetup" feature)
+    gimmickTags: scene.gimmicks ? () => new Set(scene.gimmicks.placements.map((g) => g.tag)) : null,
     fogPreview: fogPreviewOn(),
   };
   // Gimmicks: pivot at the table's position, the stock state its rotation (and removal), so the state reads back as the
@@ -512,7 +522,8 @@ function setUpEdits(scene, model) {
     }
     edit.sky = cloneSky(stored.Sky);
     if (stored.Features && typeof stored.Features === 'object' && !Array.isArray(stored.Features)) {
-      const { fog, [COLNAV_KEY]: cn, links, ...rest } = stored.Features;
+      const { fog, [COLNAV_KEY]: cn, links, [SETUP_KEY]: gs, ...rest } = stored.Features;
+      Object.assign(edit.gimmickSetup, setupFromFeature(gs));
       edit.storedFog = fogFromFeature(fog);
       edit.storedLinks = links ?? null;
       edit.colnav = readColNav(cn);
@@ -587,6 +598,7 @@ export function renderStage(node, ctx) {
     job = { report: null, camera: null };
     const id = stageKey(model.name);
     const ids = [...new Set([id, id.replace(/_harness$/i, ''), ctx.filePath ? stageKey(ctx.filePath) : null].filter(Boolean))];
+    job.ids = ids;
     job.promise = loadScene(model, (t) => job.report?.(t), { ids, dataFiles: ctx.dataFiles });
     jobs.set(model, job);
   }
@@ -1364,7 +1376,17 @@ export function renderStage(node, ctx) {
         if (sky?.Mode === 'picture' && !picture) skyNote += ' Choose the picture again in the Sky panel to see it.';
       }
       // The file's fog (a "fog" feature), and the features this page doesn't edit, kept as they are.
-      const { fog: fileFog, [COLNAV_KEY]: fileCn, links: fileLinks, ...rest } = res.features;
+      const { fog: fileFog, [COLNAV_KEY]: fileCn, links: fileLinks, [SETUP_KEY]: fileSetup, ...rest } = res.features;
+      // The file's gimmick setup (a "gimmickSetup" feature) replaces this one.
+      if (fileSetup && typeof fileSetup === 'object' && !Array.isArray(fileSetup)) {
+        const before = setupFromFeature(edit.gimmickSetup), after = setupFromFeature(fileSetup);
+        if (JSON.stringify(before) !== JSON.stringify(after)) {
+          setSetup(after);
+          acts.push({ undo: () => setSetup(before), redo: () => setSetup(after) });
+          const n = Object.keys(after).length;
+          skyNote += ` Gimmick setup: ${n} gimmick${n === 1 ? '' : 's'}.`;
+        }
+      }
       // The file's linked objects (a "links" feature) replace these.
       if (fileLinks && typeof fileLinks === 'object') {
         const before = edit.links || [], after = readLinks(fileLinks);
@@ -1752,6 +1774,18 @@ export function renderStage(node, ctx) {
       },
     );
 
+    // ----- gimmick setup: the rules and the files it writes (StageViewerForm.GimmickSetup.cs), read with the gimmicks -----
+    const setupFiles = { bundle: null, loose: null, tactics: null }; // each {path, bytes, layers}
+    const setupCtx = {
+      placements: () => scene.gimmicks?.placements ?? [],
+      tableText: () => scene.gimmicks?.table.text ?? null,
+      setup: edit.gimmickSetup,
+      nut: null,
+      bundle: (m) => scene.gimmicks?.kit.bundle(m) ?? null,
+      tactics: null,
+    };
+    const setupRules = gimmickSetupRules(setupCtx);
+
     // ----- download (objects, sky and fog written into a copy of the bundle, as the desktop export does) -----
     const downloadNote = el('p', { class: 'muted stage-count' });
     const bakeBtn = button('Download bundle', bakeBundle, {
@@ -1765,6 +1799,7 @@ export function renderStage(node, ctx) {
       if (edit.sky && edit.sky.Mode !== 'dungeon') parts.push('sky');
       if (fogChanged(edit)) parts.push('fog');
       if (gptPaths.length && movedPaths(gptPaths, gptHarbours()).length) parts.push('gimmick paths');
+      if (setupFiles.bundle && setupExport()?.planEmpty === false) parts.push('stage script');
       return parts;
     }
     /** Nav painted or erased, or waypoints added, deleted, linked or unlinked by hand. */
@@ -1802,12 +1837,25 @@ export function renderStage(node, ctx) {
       if (live.path && r.pathName && pathChanged(live)) await put(r.pathName, writePathGraph(live.path));
       return navChanged(live) || pathChanged(live) ? navSummary(live) : null;
     }
+    /** The bundle's stage_setting.nut with the setup's teams, build states and bundles written in (GimmickSetupExport). */
+    async function bakeStageScript(archive) {
+      const sx = setupExport();
+      if (!sx || sx.planEmpty || !setupFiles.bundle) return [];
+      const i = archive.entries.findIndex((e) => (e.name || '').toLowerCase() === 'stage_setting.nut');
+      if (i < 0) throw new Error('stage_setting.nut is missing from the bundle');
+      const r = applyStageScript(setupFiles.bundle.bytes, sx.plan);
+      if (!readStageScript(r.bytes) || !sameBytes((await decodeLayers(r.bytes)).payload, r.bytes))
+        throw new Error('stage_setting.nut did not read back');
+      archive.entries[i] = { ...archive.entries[i], pointer: false, size: r.bytes.length, data: r.bytes };
+      console.info(`Map editor export: stage_setting.nut: ${r.changed} value(s) changed, ${r.inserted} line(s) added, ${r.filesAdded} bundle(s) listed`);
+      return sx.lines.filter((l) => l.startsWith('Stage script:'));
+    }
     const listOf = (a) => (a.length > 1 ? `${a.slice(0, -1).join(', ')} and ${a[a.length - 1]}` : a[0]);
     function renderDownload() {
       const parts = bakeParts();
       downloadNote.textContent = parts.length
         ? `Writes the ${listOf(parts)} into a copy of ${edit.stage}.bres.`
-        : 'Move, hide or make objects Solid, change the sky or fog, or edit the collision, to write them into a copy of the bundle.';
+        : 'Move, hide or make objects Solid, change the sky or fog, edit the collision, or set up the castle gimmicks, to write them into a copy of the bundle.';
       bakeBtn.disabled = !parts.length;
       if (!downloadBox.contains(bakeBtn)) downloadBox.replaceChildren(downloadNote, el('div', { class: 'toolbar' }, bakeBtn));
     }
@@ -1903,7 +1951,7 @@ export function renderStage(node, ctx) {
     /** Downloads a copy of the bundle with the objects (and their collision), sky (ApplySkyToBundle) and fog (FogExport) written in. */
     async function bakeBundle() {
       const parts = bakeParts();
-      if (!parts.length) return toast('Change the sky or fog first.');
+      if (!parts.length) return toast('Nothing to write into the bundle yet.');
       bakeBtn.disabled = true;
       const was = status.textContent;
       try {
@@ -1948,6 +1996,7 @@ export function renderStage(node, ctx) {
           const line = await bakeGimmickPaths(archive);
           if (line) lines.push(line);
         }
+        if (parts.includes('stage script')) lines.push(...(await bakeStageScript(archive)));
         if (parts.includes('sky')) {
           const s = edit.sky;
           const pack = s.Mode === 'stage' ? await skyPack(s.Stage) : null;
@@ -3942,9 +3991,11 @@ export function renderStage(node, ctx) {
     const gimmickObjects = new Map(edit.objects.filter((o) => o.gimmick).map((o) => [o.gimmick, o]));
     const gimmickNote = el('p', { class: 'muted stage-count' });
     const gimmickBtn = button('Download gimmick table', downloadGimmickTable, {
-      title: "Write the moved, turned and removed gimmicks into a copy of the stage's gimmick table, as the desktop export does",
+      title: "Write the moved, turned, removed and set-up gimmicks into a copy of the stage's gimmick table, as the desktop export does, " +
+        'with the installed stage script (<stage>_ssn_stage_setting.nut) and bot tactics (<stage>_stage_tactics.json) when the setup changes them',
     });
     const gimmickList = el('div', { class: 'stage-gimmick-list' });
+    const setupBox = el('div', { class: 'stage-gimmick-setup', hidden: true });
     const byText = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
     function renderGimmicks() {
       const gm = scene.gimmicks;
@@ -3960,14 +4011,19 @@ export function renderStage(node, ctx) {
       const changed = gm.placements.filter(placementChanged);
       const added = changed.filter((g) => g.isNew).length, removed = changed.filter((g) => g.removed && !g.removed0).length;
       const moved = changed.length - removed - added, own = gm.placements.filter((g) => !g.isNew).length;
+      const tags = edit.gimmickTags?.();
+      const setUp = Object.keys(edit.gimmickSetup).filter((t) => !tags || tags.has(t)).length;
+      const sx = setupExport();
+      const setupWrites = !!sx && (sx.records > 0 || (!sx.planEmpty && !!setupFiles.loose) || (sx.tacticsEdit && !!setupFiles.tactics));
       gimmickNote.textContent =
         `${own} placements in ${gm.table.name}; ${[...gimmickObjects.keys()].filter((g) => !g.isNew).length} shown with their models. ` +
-        (changed.length
-          ? `Edited: ${moved} moved, ${removed} removed${added ? `, ${added} added` : ''}.`
-          : 'Select one to move, turn or remove (Del) it.');
-      gimmickBtn.disabled = !changed.length;
+        (changed.length || setUp
+          ? `Edited: ${moved} moved, ${removed} removed${added ? `, ${added} added` : ''}${setUp ? `, ${setUp} set up differently` : ''}.`
+          : 'Select one to move, turn or remove (Del) it, or set up its team.');
+      gimmickBtn.disabled = !changed.length && !setupWrites;
+      renderSetup();
       if (!gimmickBox.contains(gimmickList))
-        gimmickBox.replaceChildren(gimmickNote, el('div', { class: 'toolbar' }, gimmickBtn, addBtn), catalogBox, gimmickList);
+        gimmickBox.replaceChildren(gimmickNote, el('div', { class: 'toolbar' }, gimmickBtn, addBtn), catalogBox, setupBox, gimmickList);
       const sel = selected();
       const rows = gm.placements
         .filter((g) => !(g.isNew && g.removed))
@@ -4121,18 +4177,119 @@ export function renderStage(node, ctx) {
     async function downloadGimmickTable() {
       const gm = scene.gimmicks;
       if (!gm) return;
-      for (const o of gimmickObjects.values()) placementFromState(o);
+      const sx = setupExport(); // also brings the placements up to date
+      const files = [];
       let r;
       try {
-        r = editedGimmickTable(gm.table.text, gm.placements);
-        if (!r) return toast('No gimmick has been moved, turned or removed yet.');
-        downloadBytes(await gimmickTableBytes(gm.table, r.text), gm.table.name, 'application/json');
+        r = editedGimmickTable(gm.table.text, gm.placements, setupRules.setupFields);
+        if (r) files.push([await gimmickTableBytes(gm.table, r.text), gm.table.name, 'application/json']);
+        // The installed copies the setup changes, wrapped like them and named as the desktop export names them.
+        const nutName = `${edit.stage}_ssn_stage_setting.nut`, tacticsName = `${edit.stage}_stage_tactics.json`;
+        if (sx && !sx.planEmpty && setupFiles.loose)
+          files.push([await companionBytes(setupFiles.loose, (b) => applyStageScript(b, sx.plan).bytes, nutName), nutName, 'text/plain']);
+        if (sx?.tacticsEdit && setupFiles.tactics)
+          files.push([await companionBytes(setupFiles.tactics, (b) => applyTactics(b, sx.copies, sx.values, sx.moves), tacticsName), tacticsName, 'application/json']);
       } catch (e) {
         console.error(e);
         return toast(`The gimmick table could not be written: ${e.message}`, 'error');
       }
-      toast(`Gimmicks: ${r.moved} moved, ${r.removed} removed, ${r.added} added — table written to ${gm.table.name}.`);
+      if (!files.length)
+        return toast(sx && !sx.planEmpty && setupFiles.bundle
+          ? 'This setup only changes the stage script inside the map: use Download bundle.'
+          : 'No gimmick has been moved, turned, removed or set up yet.');
+      for (const f of files) downloadBytes(...f);
+      const lines = r ? [`Gimmicks: ${r.moved} moved, ${r.removed} removed, ${r.added} added — table written to ${gm.table.name}.`] : [];
+      toast([...lines, ...(sx?.lines ?? [])].join(' '), 'ok', 10000);
     }
+    /** An edited companion table, wrapped like the installed one and read back (WriteCompanion). */
+    async function companionBytes(file, change, name) {
+      const plain = change(file.bytes);
+      const bytes = file.layers?.length ? await encodeLayers(plain, file.layers) : plain;
+      if (!sameBytes((await decodeLayers(bytes)).payload, plain)) throw new Error(`${name} did not read back`);
+      return bytes;
+    }
+    /** The setup as it would be written now (exportPlan), the placements brought up to date first; null with no table. */
+    function setupExport() {
+      if (!scene.gimmicks) return null;
+      for (const o of gimmickObjects.values()) placementFromState(o);
+      return setupRules.exportPlan({ inBundle: !!setupFiles.bundle, loose: !!setupFiles.loose });
+    }
+    /** Replaces the setup in place (the rules hold edit.gimmickSetup). */
+    function setSetup(next) {
+      for (const k of Object.keys(edit.gimmickSetup)) delete edit.gimmickSetup[k];
+      Object.assign(edit.gimmickSetup, setupFromFeature(next));
+    }
+    /** The selected gimmick's setup rows (GimmickSetupRows): the arrows step each one; Ctrl+Z undoes it. */
+    function renderSetup() {
+      const o = selected();
+      const g = o?.gimmick ? placementFromState(o) : null;
+      const rows = g ? setupRules.rows(g) : [];
+      setupBox.hidden = !rows.length;
+      if (!rows.length) return setupBox.replaceChildren();
+      setupBox.replaceChildren(
+        el('div', { class: 'stage-setup-head' }, `Setup · ${g.type} ${g.tag}`),
+        ...rows.map((r) => {
+          const back = button('◀', () => stepSetup(g, r, -1), { title: `${r.label}: the one before` });
+          const next = button('▶', () => stepSetup(g, r, 1), { title: `${r.label}: the next one` });
+          back.disabled = next.disabled = !r.enabled;
+          return el('div', { class: 'stage-setup-row', title: r.title },
+            el('span', { class: 'stage-setup-label' }, r.label), back, el('span', { class: 'stage-setup-value' }, r.value), next);
+        }),
+      );
+    }
+    /** One step of a setup row, undoable as "<what> · <tag>" (ChangeSetup). */
+    function stepSetup(g, r, d) {
+      const s = r.step(d);
+      if (!s) return;
+      const tag = g.tag, was = setupRules.setupOf(g);
+      const before = was ? cleanSetup(was) : null, after = s.edit ? cleanSetup(s.edit) : null;
+      if (JSON.stringify(before) === JSON.stringify(after)) return;
+      const put = (e) => (e ? (edit.gimmickSetup[tag] = { ...e }) : delete edit.gimmickSetup[tag]);
+      put(after);
+      edit.history.push([], `${s.what} · ${tag}`, null, { undo: () => put(before), redo: () => put(after) });
+      edit.history.breakMerge();
+      edited();
+      status.textContent = `${s.what} · ${tag}`;
+    }
+    /**
+     * The stage script and bot tactics the setup writes (LoadGimmickSetup): the bundle's stage_setting.nut, the installed
+     * Data/ssn/<id>/stage_setting.nut and Data/json/stage/<id>_stage_tactics.json, each {path, bytes, layers}.
+     */
+    async function readSetupFiles() {
+      const out = { bundle: null, loose: null, tactics: null };
+      const e = model.entries.find((x) => (x.name || '').toLowerCase() === 'stage_setting.nut');
+      if (e && !e.pointer && e.data?.length) out.bundle = { path: e.name, bytes: (await decodeLayers(e.data)).payload, layers: [] };
+      const read = async (f) => {
+        const d = await decodeLayers(await f.read());
+        return { path: f.path, bytes: d.payload, layers: d.layers };
+      };
+      const ids = [...new Set([scene.gimmicks?.table.stageId, ...(job.ids ?? [])].filter(Boolean))];
+      for (const id of ids) {
+        const nut = out.loose ? null : ctx.dataFiles?.(`ssn/${id}`).find((f) => f.name.toLowerCase() === 'stage_setting.nut');
+        if (nut) out.loose = await read(nut);
+        const want = `${id}_stage_tactics.json`.toLowerCase();
+        const tf = out.tactics ? null : ctx.dataFiles?.('json/stage').find((f) => f.name.toLowerCase() === want);
+        if (tf) out.tactics = await read(tf);
+      }
+      return out;
+    }
+    if (scene.gimmicks)
+      (job.setupFiles || (job.setupFiles = readSetupFiles())).then(
+        (f) => {
+          if (stopped) return;
+          Object.assign(setupFiles, f);
+          const master = f.bundle ?? f.loose;
+          setupCtx.nut = master ? readStageScript(master.bytes)?.info ?? null : null;
+          setupCtx.tactics = f.tactics ? latin1(f.tactics.bytes) : null;
+          console.info(
+            `Map editor: gimmick setup: stage script ${setupCtx.nut ? `${setupCtx.nut.calls.length} gimmick calls` : 'not found'}` +
+              (f.loose ? `, installed copy ${f.loose.path}` : '') + (f.tactics ? ', tactics found' : ''),
+          );
+          renderGimmicks();
+          downloadRefresh();
+        },
+        (e) => console.warn(`Map editor: the gimmick setup files of ${edit.stage} could not be read: ${e.message}`),
+      );
     gimmickRefresh = renderGimmicks;
     renderGimmicks();
     setLinks(edit.links ?? readLinks(edit.storedLinks));
