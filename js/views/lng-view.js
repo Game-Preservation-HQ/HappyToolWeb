@@ -1,9 +1,12 @@
 // .lng text table editor, as HappyTool's: a grid of keys × languages, the picked cell's text below it with an in-game
 // colour preview, a filter with "Missing only" and "Has markup", File and Edit menus, Find & Replace, font colour tools
 // and a status line. Keys are edited in the grid (double-click or Enter), text in the box below.
-import { el, button, toast, ask, confirmBox, pickFiles, downloadBlob, debounce } from '../ui.js';
+import { el, button, toast, ask, confirmBox, pickFiles, downloadBlob, debounce, openDialog } from '../ui.js';
 import { menuBar } from '../menubar.js';
-import { lngToCsv, mergeCsv } from '../formats/lng.js';
+import { lngToCsv, mergeCsv, parseLng, looksLikeLngHeader } from '../formats/lng.js';
+import { decodeLayers } from '../formats/wrappers.js';
+import { parseBres } from '../formats/bres.js';
+import { fileFromRows, validateRows, statisticsReport, fillMissing, mergeLng, mergeMessage, compareReport } from '../formats/lng-tools.js';
 import { hasFontText, colorsIn, parseColor, normalizeHex, toHex6, wrapColor, stripMarkup, renderPreview } from '../formats/lng-markup.js';
 import { baseName } from '../util.js';
 
@@ -651,6 +654,143 @@ export function renderLng(node, ctx) {
     }
   }
 
+  // ---- checks, merge and compare (HappyTool's Validate, Statistics, Fill missing, Merge from .lng, Compare with .lng) ----
+  const names = () => langs.map((l) => l.name);
+  function prep() {
+    if (!commitInline()) return false;
+    if (!ui.aligned) syncAll();
+    return true;
+  }
+  /** The desktop's read-only text report window. */
+  function report(title, text, w = 640, h = 480) {
+    return openDialog((dlg, done) => {
+      const area = el('textarea', { class: 'input lng-report', spellcheck: 'false', wrap: 'off', 'aria-label': title });
+      area.readOnly = true;
+      area.value = text;
+      area.style.height = `min(${h}px, 60vh)`;
+      dlg.style.width = `min(${w}px, calc(100vw - 32px))`;
+      dlg.append(
+        el('h2', { class: 'dialog-title' }, title),
+        area,
+        el('div', { class: 'dialog-actions' },
+          button('Save as .txt…', () => downloadBlob(new Blob([text.replace(/\n/g, '\r\n')], { type: 'text/plain;charset=utf-8' }), `${stem} - ${title}.txt`)),
+          button('Close', () => done(null), { class: 'btn btn-primary', autofocus: true })));
+    });
+  }
+  function message(title, text) {
+    return openDialog((dlg, done) => {
+      const p = el('p', { class: 'dialog-text' }, text);
+      p.style.whiteSpace = 'pre-wrap';
+      dlg.append(el('h2', { class: 'dialog-title' }, title), p,
+        el('div', { class: 'dialog-actions' }, button('OK', () => done(null), { class: 'btn btn-primary', autofocus: true })));
+    });
+  }
+  /** A small options window; resolves true for OK. */
+  function options(title, body, okLabel) {
+    return openDialog((dlg, done) => {
+      dlg.append(el('form', { method: 'dialog', class: 'lng-options', onsubmit: (e) => (e.preventDefault(), done(true)) },
+        el('h2', { class: 'dialog-title' }, title), ...body,
+        el('div', { class: 'dialog-actions' }, button('Cancel', () => done(false)),
+          el('button', { type: 'submit', class: 'btn btn-primary', autofocus: true }, okLabel))));
+    }).then((v) => v === true);
+  }
+  /** A bundle with several tables (Dict_*.bres holds Lang, Atrb, Voice, ActCmd): pick one, the same family as this file first. */
+  const family = (n) => baseName(n).replace(/_[^_]*\.lng$/i, '').toLowerCase();
+  async function chooseTable(bundle, list) {
+    const want = family(node.name);
+    const pick = el('select', { class: 'input', 'aria-label': 'Text table' },
+      ...list.map((x, i) => el('option', { value: String(i), selected: family(x.name) === want }, baseName(x.name))));
+    const ok = await options('Pick a text table', [
+      el('p', { class: 'dialog-text' }, `${bundle} holds ${list.length} text tables.`),
+      el('label', { class: 'lng-optrow' }, 'Table:', pick)], 'OK');
+    return ok ? list[Number(pick.value)] : null;
+  }
+  /** Another .lng from disk: plain, BFBR/ZRES-wrapped, or the first .lng inside a bundle (langbres/Dict_*.bres). */
+  async function pickOtherLng() {
+    const [f] = await pickFiles({ accept: '.lng,.bres' });
+    if (!f) return null;
+    let u8 = (await decodeLayers(new Uint8Array(await f.arrayBuffer()))).payload;
+    let label = f.name;
+    if (!looksLikeLngHeader(u8)) {
+      let bres = null;
+      try {
+        bres = parseBres(u8);
+      } catch {
+        // not a bundle either
+      }
+      const list = bres?.entries.filter((x) => !x.pointer && /\.lng$/i.test(x.name)) ?? [];
+      if (!list.length) throw new Error(`${f.name} is not a .lng text table.`);
+      const e = list.length === 1 ? list[0] : await chooseTable(f.name, list);
+      if (!e) return null;
+      u8 = (await decodeLayers(e.data)).payload;
+      label = baseName(e.name);
+    }
+    return { file: parseLng(u8), label };
+  }
+
+  function validate() {
+    if (!prep()) return;
+    const { keys, lines } = validateRows(ui.rows, names());
+    if (!lines.length) return toast(`All ${keys} keys have text in every language.`, 'ok');
+    report('Validation report', lines.join('\n'), 560, 420);
+  }
+  function statistics() {
+    if (prep()) report('Translation statistics', statisticsReport(ui.rows, names()));
+  }
+  async function fillFrom() {
+    if (!langs.length || !prep()) return;
+    const pick = el('select', { class: 'input', 'aria-label': 'Copy from language' }, ...langs.map((l, i) => el('option', { value: String(i) }, l.name)));
+    const only = el('input', { type: 'checkbox', checked: true });
+    const ok = await options('Fill missing translations', [
+      el('label', { class: 'lng-optrow' }, 'Copy from language:', pick),
+      el('label', { class: 'check lng-optrow' }, only, ' Only fill empty cells (leave existing text)')], 'Fill');
+    if (!ok) return;
+    const src = Number(pick.value);
+    const n = fillMissing(ui.rows, names(), src, only.checked, setCell);
+    if (!n) return toast('No empty cells were filled.');
+    changed();
+    refresh();
+    loadDetail(ui.detail?.row, ui.detail?.lang);
+    toast(`Filled ${n} cell(s) from ${langs[src].name}.`, 'ok');
+  }
+  async function mergeFrom() {
+    let other;
+    try {
+      other = await pickOtherLng();
+    } catch (e) {
+      return toast(`Merge: ${e.message}`, 'error');
+    }
+    if (!other) return;
+    const over = el('input', { type: 'checkbox' });
+    if (!(await options('Merge options', [el('label', { class: 'check lng-optrow' }, over, ' Overwrite existing non-empty strings')], 'Merge'))) return;
+    if (!prep()) return;
+    let r;
+    try {
+      r = mergeLng(fileFromRows(file, ui.rows), other.file, over.checked);
+    } catch (e) {
+      return toast(`Merge: ${e.message}`, 'error');
+    }
+    // The grid is rebuilt from the merged file (re-sorted, rows without a key gone), as the desktop's RebuildGrid.
+    file.languages.splice(0, file.languages.length, ...r.file.languages);
+    Object.assign(ui, { rows: buildRows(file), sel: new Set(), focus: null, detail: null });
+    ui.extra.clear();
+    syncAll();
+    changed();
+    ctx.rerender();
+    message('Merge', mergeMessage(r));
+  }
+  async function compareWith() {
+    if (!prep()) return;
+    const current = fileFromRows(file, ui.rows);
+    let other;
+    try {
+      other = await pickOtherLng();
+    } catch (e) {
+      return toast(`Compare: ${e.message}`, 'error');
+    }
+    if (other) report('Compare .lng files', compareReport(current, other.file, baseName(node.name), other.label));
+  }
+
   // ---- toolbar, menus, keys ----
   const filterBox = el('input', { type: 'search', class: 'input input-sm lng-filter', placeholder: 'Key or text…', 'aria-label': 'Filter keys and texts', value: ui.filter });
   filterBox.addEventListener('input', debounce(() => {
@@ -670,6 +810,8 @@ export function renderLng(node, ctx) {
         file_?.save && { label: 'Save', keys: 'Ctrl+S', run: file_.save },
         file_?.saveAs && { label: 'Save as…', run: file_.saveAs },
         null,
+        { label: 'Merge from .lng…', run: mergeFrom },
+        { label: 'Compare with .lng…', run: compareWith },
         { label: 'Export CSV…', run: exportCsv },
         { label: 'Import CSV…', run: importCsv },
         null,
@@ -689,8 +831,13 @@ export function renderLng(node, ctx) {
         { label: 'Go to key…', keys: 'Ctrl+G', run: goToKey },
         { label: 'Rename key…', keys: 'F2', run: renameKey, enabled: () => !!focusedRow() },
         null,
+        { label: 'Fill missing from language…', run: fillFrom },
+        null,
         { label: 'Strip font markup (current text)', run: stripCurrent, enabled: () => !!ui.detail },
         { label: 'Strip font markup (all strings)', run: stripAll },
+        { label: 'Validate translations…', run: validate },
+        null,
+        { label: 'Translation statistics…', run: statistics },
       ],
     },
   ];
