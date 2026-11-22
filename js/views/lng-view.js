@@ -1,200 +1,756 @@
-// .lng text table editor: language picker, searchable key list, text editor with the other languages beside it,
-// add/delete key, CSV export and import.
+// .lng text table editor, as HappyTool's: a grid of keys × languages, the picked cell's text below it with an in-game
+// colour preview, a filter with "Missing only" and "Has markup", File and Edit menus, Find & Replace, font colour tools
+// and a status line. Keys are edited in the grid (double-click or Enter), text in the box below.
 import { el, button, toast, ask, confirmBox, pickFiles, downloadBlob, debounce } from '../ui.js';
+import { menuBar } from '../menubar.js';
 import { lngToCsv, mergeCsv } from '../formats/lng.js';
+import { hasFontText, colorsIn, parseColor, normalizeHex, toHex6, wrapColor, stripMarkup, renderPreview } from '../formats/lng-markup.js';
 import { baseName } from '../util.js';
 
-const ROW_LIMIT = 1000;
+const ROW_H = 24;
 const MAX_KEY = 256;
-const byKey = (a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0); // ordinal, like HappyTool
+const TIP_MAX = 12000;
+const ordinal = (a, b) => (a < b ? -1 : a > b ? 1 : 0); // HappyTool compares and sorts keys ordinally
+const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const isTyping = (t) =>
+  t instanceof Element && (t.isContentEditable || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' ||
+    (t.tagName === 'INPUT' && !['button', 'checkbox', 'radio', 'range', 'submit', 'reset', 'color', 'file'].includes(t.type)));
+
+/** One grid row per key across every language; a language without the key holds null ("missing"). */
+function buildRows(file) {
+  const map = new Map();
+  file.languages.forEach((l, i) => {
+    for (const e of l.entries) {
+      let r = map.get(e.key);
+      if (!r) map.set(e.key, (r = { key: e.key, t: new Array(file.languages.length).fill(null) }));
+      r.t[i] = e.text;
+    }
+  });
+  return [...map.values()].sort((a, b) => ordinal(a.key, b.key));
+}
 
 export function renderLng(node, ctx) {
   const file = node.model;
-  const ui = (node.ui ??= { lang: 0, filter: '', key: null, scroll: 0 });
-  if (ui.lang >= file.languages.length) ui.lang = 0;
-  const lang = () => file.languages[ui.lang];
+  const langs = file.languages;
+  const ui = (node.ui ??= {});
+  if (ui.file !== file) {
+    Object.assign(ui, { file, rows: buildRows(file), aligned: false, filter: '', missing: false, markup: false, sort: null,
+      sel: new Set(), focus: null, detail: null, sticky: 0, scroll: 0, scrollLeft: 0, extra: new Set(), hex: '#2dc6ff',
+      find: { text: '', repl: '', scope: 'all', matchCase: false, pos: null, open: false } });
+  }
+  const F = ui.find;
+  let vis = [];
 
-  const langSel = el(
-    'select',
-    { class: 'input input-sm', 'aria-label': 'Language' },
-    file.languages.map((l, i) => el('option', { value: i, selected: i === ui.lang }, `${l.name} (${l.entries.length})`)),
-  );
-  const filterBox = el('input', { type: 'search', class: 'input input-sm', placeholder: 'Search keys and text', 'aria-label': 'Search keys and text', value: ui.filter });
-  const count = el('span', { class: 'muted' });
-  const list = el('div', { class: 'lng-list', role: 'listbox', tabindex: '0', 'aria-label': 'Keys' });
-  const editor = el('div', { class: 'lng-editor' });
+  // Text edits write straight into the entry at the row's index; anything that adds, removes or renames rows
+  // rewrites every language's list from the grid (every key in every language, missing as "", as HappyTool saves).
+  function syncAll() {
+    langs.forEach((l, i) => (l.entries = ui.rows.map((r) => ({ key: r.key, text: r.t[i] ?? '' }))));
+    ui.rows.forEach((r, j) => (r.j = j));
+    ui.aligned = true;
+  }
+  function setCell(row, li, v) {
+    if (row.t[li] === v) return false;
+    row.t[li] = v;
+    if (ui.aligned) langs[li].entries[row.j].text = v;
+    else syncAll();
+    return true;
+  }
+  function setKey(row, v) {
+    if (row.key === v) return false;
+    row.key = v;
+    syncAll();
+    return true;
+  }
+  const cellText = (row, c) => (c < 0 ? row.key : row.t[c] ?? '');
 
-  const matches = () => {
-    const f = ui.filter.toLowerCase();
-    return lang().entries.filter((e) => !f || e.key.toLowerCase().includes(f) || e.text.toLowerCase().includes(f));
-  };
-
-  function fillList() {
-    const all = matches();
-    const shown = all.slice(0, ROW_LIMIT);
-    list.replaceChildren(
-      ...shown.map((e) =>
-        el(
-          'div',
-          { class: `lng-row${e.key === ui.key ? ' sel' : ''}`, role: 'option', 'aria-selected': String(e.key === ui.key), dataset: { key: e.key } },
-          el('span', { class: 'lng-key' }, e.key),
-          el('span', { class: 'lng-text' }, e.text.replace(/\r?\n/g, ' ⏎ ') || '(empty)'),
-        ),
-      ),
-      ...(all.length > ROW_LIMIT ? [el('p', { class: 'note' }, `Showing the first ${ROW_LIMIT} of ${all.length.toLocaleString()} matches. Search to narrow the list.`)] : []),
+  // ---- filter, sort, visible rows ----
+  function computeVisible() {
+    const f = ui.filter.trim().toLowerCase();
+    vis = ui.rows.filter(
+      (r) =>
+        ui.extra.has(r) ||
+        ((!f || r.key.toLowerCase().includes(f) || r.t.some((s) => s != null && s.toLowerCase().includes(f))) &&
+          (!ui.missing || r.t.some((s) => s == null || s === '')) &&
+          (!ui.markup || r.t.some(hasFontText))),
     );
-    count.textContent = ui.filter ? `${all.length.toLocaleString()} of ${lang().entries.length.toLocaleString()}` : `${lang().entries.length.toLocaleString()} keys`;
+    if (ui.sort) {
+      const { col, dir } = ui.sort;
+      const v = (r) => (col < 0 ? r.key : r.t[col]);
+      vis.sort((a, b) => {
+        const x = v(a), y = v(b);
+        return dir * (x == null ? (y == null ? 0 : -1) : y == null ? 1 : ordinal(x, y));
+      });
+    }
+    sizer.style.height = `${vis.length * ROW_H}px`;
+    // The translated row body counts toward the scroll height, so clear it first: the browser then clamps scrollTop
+    // to the new list before paint reads it.
+    body.style.transform = '';
+    body.replaceChildren();
   }
 
-  function fillEditor() {
-    const entry = lang().entries.find((e) => e.key === ui.key);
-    if (!entry) {
-      editor.replaceChildren(el('p', { class: 'muted empty-hint' }, 'Pick a key to edit its text.'));
+  // ---- DOM ----
+  const cols = `minmax(200px, 1.2fr) repeat(${langs.length}, minmax(200px, 1fr))`;
+  const minW = `${200 + 200 * langs.length}px`;
+  const grid = el('div', { class: 'lng-grid', tabindex: '0', role: 'grid', 'aria-label': 'Keys and texts', 'aria-multiselectable': 'true' });
+  grid.style.setProperty('--lng-cols', cols);
+  grid.style.setProperty('--lng-min', minW);
+  const head = el('div', { class: 'lng-head', role: 'row' });
+  const sizer = el('div', { class: 'lng-sizer' });
+  const body = el('div', { class: 'lng-body' });
+  sizer.append(body);
+  grid.append(head, sizer);
+  function fillHead() {
+    const arrow = (c) => (ui.sort?.col === c ? (ui.sort.dir > 0 ? ' ▲' : ' ▼') : '');
+    head.replaceChildren(
+      ...[-1, ...langs.keys()].map((c) =>
+        el('button', { type: 'button', role: 'columnheader', tabindex: '-1', title: 'Sort by this column (click again to reverse, a third time to clear)', onclick: () => sortBy(c) },
+          (c < 0 ? 'Key' : langs[c].name) + arrow(c)),
+      ),
+    );
+  }
+  function sortBy(c) {
+    ui.sort = ui.sort?.col !== c ? { col: c, dir: 1 } : ui.sort.dir > 0 ? { col: c, dir: -1 } : null;
+    fillHead();
+    refresh();
+  }
+
+  function paint() {
+    const top = Math.max(0, grid.scrollTop - ROW_H);
+    const h = grid.clientHeight || 600;
+    const start = Math.max(0, Math.floor(top / ROW_H) - 4);
+    const end = Math.min(vis.length, Math.ceil((top + h) / ROW_H) + 4);
+    body.style.transform = `translateY(${start * ROW_H}px)`;
+    const out = [];
+    for (let v = start; v < end; v++) out.push(rowEl(vis[v], v));
+    body.replaceChildren(...out);
+  }
+  function rowEl(r, v) {
+    const isSel = ui.sel.has(r);
+    const cur = ui.focus?.row === r ? ui.focus.col : null;
+    return el(
+      'div',
+      { class: `lng-gr${isSel ? ' sel' : ''}`, role: 'row', 'aria-selected': String(isSel), dataset: { v } },
+      el('div', { class: `lng-c k${cur === -1 ? ' cur' : ''}`, role: 'gridcell', dataset: { c: -1 }, title: r.key },
+        el('span', { class: 'lng-tx' }, r.key || el('i', { class: 'muted' }, '(empty key)'))),
+      ...r.t.map((s, c) => {
+        const swatches = s ? colorsIn(s).map(parseColor).filter(Boolean) : [];
+        return el(
+          'div',
+          { class: `lng-c${cur === c ? ' cur' : ''}`, role: 'gridcell', dataset: { c }, title: s ? `${r.key}\n\n${s.length > TIP_MAX ? s.slice(0, TIP_MAX) + '…' : s}` : null },
+          el('span', { class: 'lng-tx' }, s ? s.replace(/\r?\n/g, ' ⏎ ') : ''),
+          swatches.length ? el('span', { class: 'lng-sw' }, swatches.map((rgb) => el('i', { style: `background:rgb(${rgb.join(',')})` }))) : null,
+        );
+      }),
+    );
+  }
+  let painting = 0;
+  grid.addEventListener('scroll', () => {
+    ui.scroll = grid.scrollTop;
+    ui.scrollLeft = grid.scrollLeft;
+    if (!painting) painting = requestAnimationFrame(() => ((painting = 0), paint()));
+  }, { passive: true });
+
+  function refresh() {
+    computeVisible();
+    paint();
+    status();
+  }
+
+  // ---- selection and focus ----
+  let anchor = null;
+  const visIndex = (row) => (row ? vis.indexOf(row) : -1);
+  function focusCell(row, col, { select = true, extend = false, toggle = false, scroll = true } = {}) {
+    if (!row) return;
+    if (extend && anchor && vis.includes(anchor)) {
+      const a = visIndex(anchor), b = visIndex(row);
+      ui.sel = new Set(vis.slice(Math.min(a, b), Math.max(a, b) + 1));
+    } else if (toggle) {
+      ui.sel.has(row) ? ui.sel.delete(row) : ui.sel.add(row);
+      anchor = row;
+    } else if (select) {
+      ui.sel = new Set([row]);
+      anchor = row;
+    }
+    ui.focus = { row, col };
+    loadDetail(row, col < 0 ? ui.sticky : col);
+    if (col >= 0) ui.sticky = col;
+    if (scroll) scrollToRow(row, col);
+    paint();
+  }
+  function scrollToRow(row, col) {
+    const v = visIndex(row);
+    if (v < 0) return;
+    const y = v * ROW_H + ROW_H; // below the header
+    const h = grid.clientHeight;
+    if (y < grid.scrollTop + ROW_H) grid.scrollTop = y - ROW_H;
+    else if (y + ROW_H > grid.scrollTop + h) grid.scrollTop = y + ROW_H - h;
+    const hc = col != null && head.children[col + 1];
+    if (hc) {
+      if (hc.offsetLeft < grid.scrollLeft) grid.scrollLeft = hc.offsetLeft;
+      else if (hc.offsetLeft + hc.offsetWidth > grid.scrollLeft + grid.clientWidth) grid.scrollLeft = hc.offsetLeft + hc.offsetWidth - grid.clientWidth;
+    }
+  }
+  const focusedRow = () => (ui.focus && ui.rows.includes(ui.focus.row) ? ui.focus.row : null);
+
+  grid.addEventListener('mousedown', (e) => {
+    const cell = e.target.closest('.lng-c');
+    if (!cell || e.button !== 0) return;
+    const row = vis[Number(cell.parentElement.dataset.v)];
+    focusCell(row, Number(cell.dataset.c), { extend: e.shiftKey, toggle: e.ctrlKey || e.metaKey, scroll: false });
+  });
+  grid.addEventListener('dblclick', (e) => {
+    const cell = e.target.closest('.lng-c');
+    if (!cell) return;
+    const row = vis[Number(cell.parentElement.dataset.v)];
+    if (Number(cell.dataset.c) < 0) editKeyInline(row);
+    else memo.focus();
+  });
+  grid.addEventListener('keydown', (e) => {
+    if (e.target !== grid) return;
+    const nav = { ArrowDown: 1, ArrowUp: -1, PageDown: 'pd', PageUp: 'pu', Home: 'home', End: 'end' }[e.key];
+    const nc = langs.length;
+    const f = ui.focus && vis.includes(ui.focus.row) ? ui.focus : null;
+    if (nav != null && !e.altKey) {
+      e.preventDefault();
+      if (!vis.length) return;
+      const page = Math.max(1, Math.floor(grid.clientHeight / ROW_H) - 1);
+      let v = f ? visIndex(f.row) : -1;
+      if (nav === 'home') v = 0;
+      else if (nav === 'end') v = vis.length - 1;
+      else if (nav === 'pd') v += page;
+      else if (nav === 'pu') v -= page;
+      else v += nav;
+      v = Math.max(0, Math.min(vis.length - 1, v));
+      focusCell(vis[v], f ? f.col : 0, { extend: e.shiftKey });
+    } else if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !e.altKey && f) {
+      e.preventDefault();
+      focusCell(f.row, Math.max(-1, Math.min(nc - 1, f.col + (e.key === 'ArrowRight' ? 1 : -1))), { select: false });
+    } else if (e.key === 'Tab' && f && !e.ctrlKey && !e.altKey) {
+      const c = f.col + (e.shiftKey ? -1 : 1);
+      if (c < -1 || c >= nc) return;
+      e.preventDefault();
+      focusCell(f.row, c, { select: false });
+    } else if (e.key === 'Enter' && f && !e.ctrlKey && !e.altKey) {
+      e.preventDefault();
+      if (f.col < 0) editKeyInline(f.row);
+      else memo.focus();
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a' && !e.altKey) {
+      e.preventDefault();
+      ui.sel = new Set(vis);
+      paint();
+    } else if (e.key === ' ' && f) {
+      e.preventDefault();
+      focusCell(f.row, f.col, { toggle: true, scroll: false });
+    }
+  });
+
+  // ---- inline key editor ----
+  let inline = null;
+  function editKeyInline(row) {
+    if (!commitInline()) return;
+    const v = visIndex(row);
+    if (v < 0) return;
+    scrollToRow(row, -1);
+    const input = el('input', { type: 'text', class: 'lng-inline', spellcheck: 'false', maxlength: '255', 'aria-label': 'Key', value: row.key });
+    input.style.top = `${v * ROW_H}px`;
+    input.style.width = `${Math.max(180, body.querySelector(`[data-v="${v}"] [data-c="-1"]`)?.offsetWidth || 220)}px`;
+    inline = { row, input };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        e.stopPropagation();
+        if (commitInline()) grid.focus();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        cancelInline();
+        grid.focus();
+      }
+    });
+    // Leaving the box keeps a good key and drops a bad one (with the reason), so a click elsewhere never traps you.
+    input.addEventListener('blur', () => {
+      if (inline?.input !== input) return;
+      const problem = keyProblem(input.value.trim(), row);
+      if (problem) {
+        toast(`${problem} The key was not changed.`, 'error');
+        cancelInline();
+      } else commitInline();
+    });
+    sizer.append(input);
+    input.focus();
+    input.select();
+  }
+  /** Checks and stores the inline key; false (and the editor stays) when it is too long or a duplicate. */
+  function commitInline() {
+    if (!inline) return true;
+    const { row, input } = inline;
+    const problem = keyProblem(input.value.trim(), row);
+    if (problem) {
+      toast(problem, 'error');
+      input.focus();
+      return false;
+    }
+    inline = null;
+    input.remove();
+    if (setKey(row, input.value)) changed();
+    if (ui.detail?.row === row) caption.textContent = `${row.key}  —  ${langs[ui.detail.lang].name}`;
+    paint();
+    return true;
+  }
+  function cancelInline() {
+    if (!inline) return;
+    inline.input.remove();
+    inline = null;
+  }
+  function keyProblem(key, row) {
+    if (!key) return null; // an empty key is allowed while editing; the row is left out when saved
+    if (key.length >= MAX_KEY) return 'Key is too long (max 255 ASCII bytes).';
+    if (/[^\x00-\x7f]/.test(key)) return 'Keys can only use ASCII characters.';
+    if (ui.rows.some((r) => r !== row && r.key.trim() === key)) return `Duplicate key: ${key}`;
+    return null;
+  }
+
+  // ---- detail: caption, text box, preview ----
+  const caption = el('div', { class: 'lng-caption' });
+  const memo = el('textarea', { class: 'editor lng-memo', spellcheck: 'false', 'aria-label': 'Text' });
+  const preview = el('div', { class: 'lng-preview', 'aria-label': 'In-game preview' });
+  function loadDetail(row, li) {
+    if (!row || li == null || li >= langs.length) {
+      ui.detail = null;
+      caption.textContent = 'Select a row — edit Key in the grid, text markup below';
+      memo.value = '';
+      memo.disabled = true;
+      renderPreview('', preview);
       return;
     }
-    const ta = el('textarea', { class: 'editor lng-textarea', spellcheck: 'false', 'aria-label': `Text for ${entry.key} in ${lang().name}` });
-    ta.value = entry.text;
-    const refreshRow = debounce(() => {
-      const row = list.querySelector(`.lng-row[data-key="${CSS.escape(entry.key)}"] .lng-text`);
-      if (row) row.textContent = entry.text.replace(/\r?\n/g, ' ⏎ ') || '(empty)';
-    }, 200);
-    ta.addEventListener('input', () => {
-      entry.text = ta.value;
-      ctx.changed();
-      refreshRow();
+    ui.detail = { row, lang: li };
+    caption.textContent = `${row.key}  —  ${langs[li].name}`;
+    memo.disabled = false;
+    memo.value = row.t[li] ?? '';
+    renderPreview(memo.value, preview);
+  }
+  const repaintSoon = debounce(() => (paint(), status()), 150);
+  memo.addEventListener('input', () => {
+    const d = ui.detail;
+    if (!d) return;
+    if (setCell(d.row, d.lang, memo.value)) changed();
+    renderPreview(memo.value, preview);
+    repaintSoon();
+  });
+  function changed() {
+    ctx.changed();
+  }
+
+  // ---- status ----
+  const statusLine = el('div', { class: 'lng-status', role: 'status' });
+  const status = debounce(() => {
+    const parts = ['Happy Wars text resource (.lng)', `Grid keys: ${ui.rows.length.toLocaleString()}`];
+    langs.forEach((l, i) => {
+      const n = ui.rows.reduce((a, r) => a + (r.t[i] == null || r.t[i] === '' ? 1 : 0), 0);
+      if (n) parts.push(`${l.name} empty: ${n.toLocaleString()}`);
     });
-    const others = file.languages
-      .map((l, i) => ({ l, i, e: l.entries.find((x) => x.key === entry.key) }))
-      .filter(({ i }) => i !== ui.lang);
-    editor.replaceChildren(
-      el('div', { class: 'lng-editor-head' }, el('code', { class: 'lng-key-full' }, entry.key), el('span', { class: 'chip' }, lang().name)),
-      ta,
-    );
-    if (others.length)
-      editor.append(
-        el(
-          'div',
-          { class: 'lng-others' },
-          el('h3', {}, 'Other languages'),
-          ...others.map(({ l, i, e }) =>
-            el(
-              'button',
-              { type: 'button', class: 'lng-other', title: `Switch to ${l.name}`, onclick: () => switchLang(i) },
-              el('span', { class: 'chip' }, l.name),
-              el('span', { class: e ? null : 'muted' }, e ? e.text || '(empty)' : '(missing)'),
-            ),
-          ),
-        ),
-      );
-  }
+    if (vis.length !== ui.rows.length) parts.push(`Visible: ${vis.length.toLocaleString()}`);
+    statusLine.textContent = parts.join('  |  ');
+  }, 60);
 
-  function pick(key) {
-    ui.key = key;
-    for (const r of list.querySelectorAll('.lng-row')) {
-      const on = r.dataset.key === key;
-      r.classList.toggle('sel', on);
-      r.setAttribute('aria-selected', String(on));
+  // ---- entry commands ----
+  function newEntry() {
+    if (!commitInline()) return;
+    const row = { key: '', t: langs.map(() => '') };
+    ui.rows.push(row);
+    ui.extra.add(row);
+    syncAll();
+    changed();
+    refresh();
+    focusCell(row, -1);
+    editKeyInline(row);
+  }
+  async function deleteEntries() {
+    const targets = ui.sel.size ? [...ui.sel].filter((r) => ui.rows.includes(r)) : focusedRow() ? [focusedRow()] : [];
+    if (!targets.length) return toast('Select a row first.', 'warn');
+    const msg =
+      targets.length > 1 ? `Delete ${targets.length.toLocaleString()} selected entries?` : targets[0].key ? `Delete entry "${targets[0].key}"?` : 'Delete this empty entry?';
+    if (!(await confirmBox(msg, 'Delete', true))) return;
+    cancelInline();
+    const gone = new Set(targets);
+    const v = visIndex(focusedRow());
+    ui.rows = ui.rows.filter((r) => !gone.has(r));
+    syncAll();
+    ui.sel = new Set();
+    changed();
+    computeVisible();
+    const next = vis[Math.min(Math.max(0, v), vis.length - 1)];
+    ui.focus = next ? { row: next, col: ui.focus?.col ?? 0 } : null;
+    if (next) ui.sel.add(next);
+    loadDetail(null);
+    paint();
+    status();
+    grid.focus();
+  }
+  function suggestDuplicateKey(src) {
+    const base = src.trim() || 'NEW_KEY';
+    const keys = new Set(ui.rows.map((r) => r.key.trim()));
+    for (let i = 1; i <= 999; i++) {
+      const k = `${base}_copy${i === 1 ? '' : i}`;
+      if (!keys.has(k) && k.length < MAX_KEY) return k;
     }
-    fillEditor();
+    return `${base}_copy`;
   }
-  function switchLang(i) {
-    ui.lang = i;
-    langSel.value = String(i);
-    fillList();
-    fillEditor();
+  function duplicateEntry() {
+    const src = focusedRow();
+    if (!src) return toast('Select a row to duplicate.', 'warn');
+    if (!commitInline()) return;
+    const row = { key: suggestDuplicateKey(src.key), t: src.t.slice() };
+    ui.rows.push(row);
+    ui.extra.add(row);
+    syncAll();
+    changed();
+    refresh();
+    focusCell(row, -1);
+    editKeyInline(row);
   }
-
-  list.addEventListener('click', (e) => {
-    const row = e.target.closest('.lng-row');
-    if (row) pick(row.dataset.key);
-  });
-  list.addEventListener('keydown', (e) => {
-    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
-    e.preventDefault();
-    const rows = [...list.querySelectorAll('.lng-row')];
-    const cur = rows.findIndex((r) => r.dataset.key === ui.key);
-    const next = rows[Math.max(0, Math.min(rows.length - 1, cur + (e.key === 'ArrowDown' ? 1 : -1)))];
-    if (next) {
-      pick(next.dataset.key);
-      next.scrollIntoView({ block: 'nearest' });
+  async function renameKey() {
+    const row = focusedRow();
+    if (!row) return toast('Select a row first.', 'warn');
+    const v = await ask('Rename key — new key name:', row.key, 'Rename');
+    const key = v?.trim();
+    if (!key || key === row.key) return;
+    const problem = keyProblem(key, row);
+    if (problem) return toast(problem, 'error');
+    setKey(row, key);
+    changed();
+    loadDetail(row, ui.detail?.lang ?? ui.sticky);
+    paint();
+  }
+  async function copy(what) {
+    let s = '';
+    if (what === 'key') {
+      const row = focusedRow();
+      if (!row) return toast('Select a row first.', 'warn');
+      s = row.key;
+    } else {
+      if (document.activeElement === memo || ui.detail) s = memo.value;
+      else if (ui.focus && ui.focus.col >= 0) s = ui.focus.row.t[ui.focus.col] ?? '';
+      if (!s) return toast('No text to copy.', 'warn');
     }
-  });
-  list.addEventListener('scroll', () => (ui.scroll = list.scrollTop), { passive: true });
-  langSel.addEventListener('change', () => switchLang(Number(langSel.value)));
-  filterBox.addEventListener(
-    'input',
-    debounce(() => {
-      ui.filter = filterBox.value.trim();
-      fillList();
-    }, 150),
-  );
-
-  async function addKey() {
-    const key = (await ask('New key (added to every language)', '', 'Add'))?.trim();
+    try {
+      await navigator.clipboard.writeText(s);
+      toast(what === 'key' ? 'Key copied' : 'Text copied', 'ok', 1500);
+    } catch (e) {
+      toast(`Could not copy: ${e.message}`, 'error');
+    }
+  }
+  async function goToKey() {
+    const cur = ui.detail?.row.key.trim() ?? focusedRow()?.key ?? '';
+    const key = (await ask('Go to key — enter the string key to select:', cur, 'Go'))?.trim();
     if (!key) return;
-    if (/[^\x20-\x7e]/.test(key)) return toast('Keys can only use printable ASCII characters', 'error');
-    if (key.length >= MAX_KEY) return toast(`Keys must be shorter than ${MAX_KEY} characters`, 'error');
-    if (file.languages.some((l) => l.entries.some((e) => e.key === key))) return toast(`${key} already exists`, 'error');
-    for (const l of file.languages) {
-      l.entries.push({ key, text: '' });
-      l.entries.sort(byKey);
+    ui.filter = key;
+    filterBox.value = key;
+    ui.extra.clear();
+    refresh();
+    const row = vis.find((r) => r.key.trim() === key);
+    if (!row) return toast(`No row matches key "${key}".`, 'warn');
+    focusCell(row, langs.length ? 0 : -1);
+    grid.focus();
+  }
+  function insertLineBreak() {
+    if (!ui.detail) return toast('Select a text cell to edit first.', 'warn');
+    const a = memo.selectionStart;
+    memo.focus();
+    memo.setRangeText('\n', a, a, 'end');
+    memo.setSelectionRange(a + 1, a + 1);
+    memo.dispatchEvent(new Event('input'));
+  }
+
+  // ---- font colour tools ----
+  const hexBox = el('input', { type: 'text', class: 'input input-sm lng-hex', spellcheck: 'false', 'aria-label': 'Font colour (hex)', value: ui.hex, title: 'Hex colour for Wrap font color, e.g. #2dc6ff' });
+  const picker = el('input', { type: 'color', class: 'lng-picker', 'aria-label': 'Pick a font colour', title: 'Pick a colour' });
+  const syncPicker = () => {
+    const rgb = parseColor(hexBox.value);
+    if (rgb) picker.value = toHex6(rgb);
+  };
+  syncPicker();
+  hexBox.addEventListener('input', () => ((ui.hex = hexBox.value), syncPicker()));
+  picker.addEventListener('input', () => ((hexBox.value = ui.hex = picker.value.toLowerCase())));
+  function wrapFont() {
+    const hex = hexBox.value;
+    if (!parseColor(hex)) return toast('Enter a valid hex color (e.g. #2dc6ff).', 'warn');
+    const target = ui.detail ? memo : inline?.input;
+    if (!target) return toast('Select a text cell first (double-click to edit, or focus a language column).', 'warn');
+    const a = target.selectionStart, b = target.selectionEnd;
+    const open = `<font color="${normalizeHex(hex)}">`;
+    target.focus();
+    target.setRangeText(wrapColor(target.value.slice(a, b), hex), a, b, 'end');
+    if (a === b) target.setSelectionRange(a + open.length, a + open.length); // empty tag: the caret goes between the tags
+    if (target === memo) memo.dispatchEvent(new Event('input'));
+  }
+  function stripCurrent() {
+    if (!ui.detail) return toast('Select a text cell first.', 'warn');
+    const s = stripMarkup(memo.value);
+    if (s === memo.value) return toast('No font markup in this text.', 'info', 2000);
+    memo.value = s;
+    memo.dispatchEvent(new Event('input'));
+  }
+  function stripAll() {
+    let n = 0;
+    for (const r of ui.rows)
+      r.t.forEach((s, i) => {
+        if (!s) return;
+        const t = stripMarkup(s);
+        if (t !== s) {
+          setCell(r, i, t);
+          n++;
+        }
+      });
+    if (!n) return toast('No font markup found.', 'info');
+    changed();
+    if (ui.detail) loadDetail(ui.detail.row, ui.detail.lang);
+    refresh();
+    toast(`Stripped markup from ${n.toLocaleString()} cell(s).`, 'ok');
+  }
+
+  // ---- Find & Replace (one panel, stays open while you work in the grid) ----
+  const findBox = el('input', { type: 'text', class: 'input input-sm', spellcheck: 'false', 'aria-label': 'Find', value: F.text });
+  const replBox = el('input', { type: 'text', class: 'input input-sm', spellcheck: 'false', 'aria-label': 'Replace', value: F.repl });
+  const scopeSel = el('select', { class: 'input input-sm', 'aria-label': 'Scope' },
+    [['all', 'All language columns'], ['current', 'Current language column'], ['keys', 'Keys only']].map(([v, t]) => el('option', { value: v, selected: v === F.scope }, t)));
+  const caseBox = el('input', { type: 'checkbox', checked: F.matchCase });
+  findBox.addEventListener('input', () => (F.text = findBox.value));
+  replBox.addEventListener('input', () => (F.repl = replBox.value));
+  scopeSel.addEventListener('change', () => (F.scope = scopeSel.value));
+  caseBox.addEventListener('change', () => (F.matchCase = caseBox.checked));
+  const findPanel = el(
+    'div',
+    { class: 'lng-find', role: 'dialog', 'aria-label': 'Find & Replace', hidden: !F.open },
+    el('div', { class: 'lng-find-title' }, el('strong', {}, 'Find & Replace'), button('×', () => closeFind(), { class: 'btn btn-quiet btn-sm', title: 'Close (Esc)', 'aria-label': 'Close' })),
+    el('label', {}, 'Find:'), findBox,
+    el('label', {}, 'Replace:'), replBox,
+    el('label', {}, 'Scope:'), el('div', { class: 'lng-find-opts' }, scopeSel, el('label', { class: 'check' }, caseBox, ' Match case')),
+    el('div', { class: 'lng-find-btns' },
+      button('Find next', () => findStep(1), { class: 'btn btn-primary btn-sm' }),
+      button('Find previous', () => findStep(-1), { class: 'btn btn-sm' }),
+      button('Replace', replaceOne, { class: 'btn btn-sm' }),
+      button('Replace all', replaceAll, { class: 'btn btn-sm' }),
+      button('Close', () => closeFind(), { class: 'btn btn-sm' })),
+    el('p', { class: 'lng-find-hint' }, 'Shortcuts: Enter → find next  •  Shift+Enter → find previous  •  Esc → close'),
+  );
+  findPanel.addEventListener('keydown', (e) => {
+    if ((e.key === 'Enter' && !e.ctrlKey && !e.altKey && e.target.tagName !== 'BUTTON') || e.key === 'F3') {
+      e.preventDefault();
+      e.stopPropagation();
+      findStep(e.shiftKey ? -1 : 1);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeFind(true);
     }
-    ctx.changed();
-    ui.filter = '';
-    filterBox.value = '';
-    ui.key = key;
-    fillList();
-    fillEditor();
-    list.querySelector(`.lng-row[data-key="${CSS.escape(key)}"]`)?.scrollIntoView({ block: 'center' });
+  });
+  function openFind(replace) {
+    F.open = true;
+    findPanel.hidden = false;
+    const box = replace ? replBox : findBox;
+    box.focus();
+    box.select();
+  }
+  function closeFind(refocus) {
+    F.open = false;
+    findPanel.hidden = true;
+    if (refocus) grid.focus();
+  }
+  function scopeCols() {
+    if (F.scope === 'keys') return [-1];
+    if (F.scope === 'current') return [ui.detail ? ui.detail.lang : ui.focus && ui.focus.col >= 0 ? ui.focus.col : 0];
+    return [...langs.keys()];
+  }
+  const finder = (g) => new RegExp(escRe(F.text), (F.matchCase ? '' : 'i') + (g ? 'g' : ''));
+  function findStep(dir) {
+    if (!F.text) return toast('Enter text to find.', 'warn'), false;
+    if (!commitInline()) return false;
+    const nr = vis.length;
+    if (!nr) return toast('No rows to search.', 'warn'), false;
+    const sc = scopeCols();
+    const nc = sc.length;
+    const total = nr * nc;
+    const start = F.pos && F.pos.v < nr && F.pos.c < nc ? F.pos.v * nc + F.pos.c : Math.max(0, visIndex(focusedRow())) * nc;
+    const re = finder(false);
+    for (let step = 1; step <= total; step++) {
+      const lin = (((start + dir * step) % total) + total) % total;
+      const v = Math.floor(lin / nc), c = lin % nc;
+      if (re.test(cellText(vis[v], sc[c]))) {
+        F.pos = { v, c };
+        focusCell(vis[v], sc[c]);
+        return true;
+      }
+    }
+    F.pos = null;
+    toast('No more matches.', 'info');
+    return false;
+  }
+  function replaceOne() {
+    if (!F.text) return toast('Enter text to find.', 'warn');
+    const sc = scopeCols();
+    const row = F.pos && vis[F.pos.v];
+    const c = F.pos && sc[F.pos.c];
+    const m = row && c !== undefined ? finder(false).exec(cellText(row, c)) : null;
+    if (!m) return findStep(1);
+    const s = cellText(row, c);
+    const next = s.slice(0, m.index) + F.repl + s.slice(m.index + m[0].length);
+    if (c < 0) setKey(row, next);
+    else setCell(row, c, next);
+    changed();
+    loadDetail(row, c < 0 ? ui.sticky : c);
+    paint();
+    findStep(1);
+  }
+  function replaceAll() {
+    if (!F.text) return toast('Enter text to find.', 'warn');
+    if (!commitInline()) return;
+    const sc = scopeCols();
+    const re = finder(true);
+    let n = 0;
+    let keys = false;
+    for (const row of vis)
+      for (const c of sc) {
+        const s = cellText(row, c);
+        const t = s.replace(re, () => F.repl);
+        if (t === s) continue;
+        n++;
+        if (c < 0) {
+          row.key = t;
+          keys = true;
+        } else setCell(row, c, t);
+      }
+    if (keys) syncAll();
+    if (!n) return toast('No matches found.', 'info');
+    changed();
+    if (ui.detail) loadDetail(ui.detail.row, ui.detail.lang);
+    paint();
+    status();
+    toast(`Replaced in ${n.toLocaleString()} cell(s).`, 'ok');
   }
 
-  async function deleteKey() {
-    if (!ui.key) return toast('Pick a key first', 'warn');
-    if (!(await confirmBox(`Delete ${ui.key} from every language?`, 'Delete', true))) return;
-    for (const l of file.languages) l.entries = l.entries.filter((e) => e.key !== ui.key);
-    ui.key = null;
-    ctx.changed();
-    fillList();
-    fillEditor();
-    langSel.replaceChildren(...file.languages.map((l, i) => el('option', { value: i, selected: i === ui.lang }, `${l.name} (${l.entries.length})`)));
-  }
-
+  // ---- CSV (the desktop's CSV rules come with the import/export slice) ----
   const stem = baseName(node.name).replace(/\.[^.]*$/, '') || 'text';
   const exportCsv = () => downloadBlob(new Blob([lngToCsv(file)], { type: 'text/csv;charset=utf-8' }), `${stem}.csv`);
   async function importCsv() {
     const [f] = await pickFiles({ accept: '.csv,text/csv' });
     if (!f) return;
     try {
+      if (!ui.aligned) syncAll();
       const { updated, added } = mergeCsv(file, await f.text());
-      if (updated || added) ctx.changed();
+      if (updated || added) changed();
+      ui.rows = buildRows(file);
+      ui.aligned = false;
+      ui.sel = new Set();
+      ui.focus = null;
+      loadDetail(null);
+      refresh();
       toast(`CSV merged: ${updated} updated, ${added} added`, 'ok');
-      fillList();
-      fillEditor();
     } catch (e) {
       toast(`CSV import failed: ${e.message}`, 'error');
     }
   }
 
-  fillList();
-  fillEditor();
-  requestAnimationFrame(() => (list.scrollTop = ui.scroll));
-  const order = file.bigEndian ? 'Big-endian (Xbox 360)' : 'Little-endian (PC / Steam)';
-  return el(
-    'div',
-    { class: 'view lng-view' },
-    el('div', { class: 'meta-row' }, el('strong', {}, `${file.languages.length} language${file.languages.length === 1 ? '' : 's'}`), el('span', { class: 'muted' }, `${order} · version ${file.ver}`)),
-    el(
-      'div',
-      { class: 'toolbar' },
-      langSel,
-      filterBox,
-      count,
+  // ---- toolbar, menus, keys ----
+  const filterBox = el('input', { type: 'search', class: 'input input-sm lng-filter', placeholder: 'Key or text…', 'aria-label': 'Filter keys and texts', value: ui.filter });
+  filterBox.addEventListener('input', debounce(() => {
+    ui.filter = filterBox.value;
+    ui.extra.clear();
+    refresh();
+  }, 150));
+  const check = (label, prop) =>
+    el('label', { class: 'check' },
+      el('input', { type: 'checkbox', checked: ui[prop], onchange: (e) => ((ui[prop] = e.target.checked), ui.extra.clear(), refresh()) }), ` ${label}`);
+  const file_ = ctx.file;
+  const menus = [
+    {
+      label: 'File',
+      items: () => [
+        file_?.open && { label: 'Open…', run: file_.open },
+        file_?.save && { label: 'Save', keys: 'Ctrl+S', run: file_.save },
+        file_?.saveAs && { label: 'Save as…', run: file_.saveAs },
+        null,
+        { label: 'Export CSV…', run: exportCsv },
+        { label: 'Import CSV…', run: importCsv },
+        null,
+        file_?.close && { label: file_.closeLabel || 'Close', run: file_.close },
+      ].filter((x) => x !== undefined && x !== false),
+    },
+    {
+      label: 'Edit',
+      items: () => [
+        { label: 'New entry', keys: 'Alt+N', run: newEntry },
+        { label: 'Delete entry', keys: 'Delete', run: deleteEntries, enabled: () => !!(ui.sel.size || focusedRow()) },
+        { label: 'Duplicate entry', keys: 'Ctrl+D', run: duplicateEntry, enabled: () => !!focusedRow() },
+        null,
+        { label: 'Find & replace…', keys: 'Ctrl+H', run: () => openFind(false) },
+        { label: 'Copy key', keys: 'Ctrl+Shift+C', run: () => copy('key'), enabled: () => !!focusedRow() },
+        { label: 'Copy text', keys: 'Alt+T', run: () => copy('text') },
+        { label: 'Go to key…', keys: 'Ctrl+G', run: goToKey },
+        { label: 'Rename key…', keys: 'F2', run: renameKey, enabled: () => !!focusedRow() },
+        null,
+        { label: 'Strip font markup (current text)', run: stripCurrent, enabled: () => !!ui.detail },
+        { label: 'Strip font markup (all strings)', run: stripAll },
+      ],
+    },
+  ];
+  const root = el('div', { class: 'view lng-view' });
+  root.addEventListener('keydown', (e) => {
+    const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    const ctrl = e.ctrlKey || e.metaKey;
+    const typing = isTyping(e.target);
+    let run = null;
+    if (ctrl && !e.altKey && !e.shiftKey && k === 'f') run = () => openFind(false);
+    else if (ctrl && !e.altKey && !e.shiftKey && k === 'h') run = () => openFind(true);
+    else if (ctrl && !e.altKey && !e.shiftKey && k === 'g') run = goToKey;
+    else if (ctrl && !e.altKey && !e.shiftKey && k === 'd') run = duplicateEntry;
+    else if (ctrl && !e.altKey && e.shiftKey && k === 'c') run = () => copy('key');
+    else if (e.altKey && !ctrl && !e.shiftKey && k === 'n') run = newEntry;
+    else if (e.altKey && !ctrl && !e.shiftKey && k === 't') run = () => copy('text');
+    else if (!typing && !ctrl && !e.altKey && !e.shiftKey && k === 'Delete') run = deleteEntries;
+    else if (!typing && !ctrl && !e.altKey && !e.shiftKey && k === 'F2') run = renameKey;
+    else if (!ctrl && !e.altKey && k === 'F3' && F.text) run = () => findStep(e.shiftKey ? -1 : 1);
+    else if (k === 'Escape' && F.open && !typing && !e.defaultPrevented) run = () => closeFind(true);
+    if (!run) return;
+    e.preventDefault();
+    e.stopPropagation();
+    run();
+  });
+
+  const order = file.bigEndian ? ' (big-endian / Xbox 360)' : '';
+  root.append(
+    el('div', { class: 'meta-row' },
+      el('strong', {}, `${langs.length} language${langs.length === 1 ? '' : 's'}`),
+      el('span', { class: 'muted' }, `Happy Wars text resource (.lng)${order} · version ${file.ver} · ${langs.map((l) => `${l.name}: ${l.entries.length.toLocaleString()} strings`).join(' · ')}`)),
+    el('div', { class: 'toolbar lng-toolbar' },
+      menuBar(menus, 'Text table menu'),
+      el('label', { class: 'lng-lbl' }, 'Filter:'), filterBox,
+      check('Missing only', 'missing'),
+      check('Has markup', 'markup'),
       el('span', { class: 'spacer' }),
-      button('Add key…', addKey),
-      button('Delete key', deleteKey, { class: 'btn btn-danger-quiet' }),
-      button('Export CSV', exportCsv, { title: 'One row per key, one column per language' }),
-      button('Import CSV…', importCsv, { title: 'Merge a CSV with a "key" column and one column per language name' }),
-    ),
-    el('div', { class: 'lng-layout' }, list, editor),
+      button('Insert \\n', insertLineBreak, { class: 'btn btn-sm', title: 'Insert a line break at the caret in the text box' }),
+      el('label', { class: 'lng-lbl' }, 'Font:'), hexBox, picker,
+      button('Wrap font color', wrapFont, { class: 'btn btn-sm', title: 'Wrap the selected text in <font color="…">…</font>' })),
+    el('div', { class: 'lng-layout' },
+      grid,
+      el('div', { class: 'lng-detail' },
+        caption,
+        memo,
+        el('div', { class: 'lng-prevwrap' }, el('span', { class: 'muted lng-prevlbl' }, 'In-game preview (font colors):'), preview))),
+    statusLine,
+    findPanel,
   );
+
+  fillHead();
+  computeVisible();
+  const d = ui.detail && ui.rows.includes(ui.detail.row) ? ui.detail : null;
+  loadDetail(d?.row, d?.lang);
+  requestAnimationFrame(() => {
+    grid.scrollTop = ui.scroll;
+    grid.scrollLeft = ui.scrollLeft;
+    paint();
+  });
+  paint();
+  status();
+  return root;
 }
