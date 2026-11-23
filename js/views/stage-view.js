@@ -65,6 +65,7 @@ import {
 import { PLAY, PlayWorld, isCharacterLayer, newPlayer, playStep, playCamera, playWheel, shadowPoint, hudText, playDrawer } from './stage-play.js';
 import { startAvatar, avatarStep, avatarHud, avatarDrawer } from './stage-avatar.js';
 import { gimmickUse, writePosed } from './stage-gimmick-play.js';
+import { shadowInputs, eraseShadows } from '../formats/stage-shadows.js';
 import { loadAvatar } from '../formats/avatar.js';
 import {
   EFFECTS_KEY, EFFECT_COLOUR, SOUND_COLOUR, FILTERS as EFFECT_FILTERS, effectName, movedFromFeature, effectsFeature,
@@ -2437,6 +2438,30 @@ export function renderStage(node, ctx) {
           const c = edits.length || solids.length || added.length || erased || warp ? await bakeCollision(edits, solids, added, entries, at, warp) : null;
           if (c) lines.push(c.line);
           archive = { ...archive, entries: c ? c.entries : entries };
+        }
+        {
+          // Hidden objects take their baked shadows with them (StageShadowEraser, between the edits and the nav as on the desktop).
+          const { casters, receivers } = shadowInputs(edit.objects, scene.meshes);
+          if (casters.length) {
+            status.textContent = 'Clearing baked shadows…';
+            await pause();
+            const at = new Map();
+            archive.entries.forEach((e, i) => at.has(e.name.toLowerCase()) || at.set(e.name.toLowerCase(), i));
+            const s = await eraseShadows(casters, receivers, async (lightmap) => {
+              const e = archive.entries[at.get(`${lightmap}.dds`.toLowerCase())];
+              return e && !e.pointer && e.data?.length ? { name: e.name, data: (await decodeLayers(e.data)).payload.slice() } : null;
+            });
+            if (s.changed.length) {
+              const entries = archive.entries.slice();
+              for (const { name, data } of s.changed) {
+                const i = at.get(name.toLowerCase());
+                entries[i] = { ...entries[i], pointer: false, size: data.length, data };
+              }
+              archive = { ...archive, entries };
+            }
+            const wide = s.tooWide ? `${s.tooWide} hidden object(s) too wide to clear a shadow under (left as baked).` : '';
+            if (s.line || wide) lines.push([s.line, wide].filter(Boolean).join(' '));
+          }
         }
         {
           const touched = parts.includes('objects') || parts.includes('collision');
