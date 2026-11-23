@@ -65,6 +65,11 @@ import {
   EFFECTS_KEY, EFFECT_COLOUR, SOUND_COLOUR, FILTERS as EFFECT_FILTERS, effectName, movedFromFeature, effectsFeature,
   loadEffectTable, movedEffectTable, effectTableBytes, postOf, markerLines, rangeRing, oneDecimal, describeEffect,
 } from './stage-effects.js';
+import {
+  MINIMAP_KEY, STOCK, EDITED, WHOLE, PICTURE, MODE_NAMES as MINIMAP_MODES, isMinimapName, readStockMinimap, minimapFromFeature,
+  minimapFeature, pictureFileName, seaColour, changedFootprints, changeMask, mixMinimap, averageSamples, topDownMatrix,
+  TOP_DOWN_EYE, leftOutOfMinimap, pictureMinimap, minimapDds, stepMode, storeMinimapPicture, loadMinimapPicture, pictureDataUrl,
+} from './stage-minimap.js';
 
 const FOV = Math.PI / 4;
 const MAX_GRAB = 3000; // cm: a box select leaves out objects this wide or tall (MaxGrabSize), gimmicks excepted
@@ -114,6 +119,9 @@ function fogFeatures(e) {
   // Effects and sounds moved by hand (StageViewerForm.Effects.cs EffectEdits).
   const fx = effectsFeature(e.effectMoved);
   if (fx) out[EFFECTS_KEY] = fx;
+  // The minimap (StageViewerForm.Minimap.cs): none while it's the stage's own.
+  const mm = minimapFeature(e.minimap);
+  if (mm) out[MINIMAP_KEY] = mm;
   return Object.keys(out).length ? out : null;
 }
 const lower = (s) => (s ? s.toLowerCase() : s);
@@ -525,6 +533,9 @@ function setUpEdits(scene, model) {
     gimmickSetup: {}, // tag → {Team, Build, RamTarget, Number}: gimmicks set up differently (the "gimmickSetup" feature)
     zoneRemoved: new Set(), // names of the stage collision entries left out of the map (the "stagevolumes" feature)
     effectMoved: new Map(), // effect and sound ids → where they were moved by hand (the "effects" feature)
+    minimap: { Mode: STOCK, Picture: null }, // the minimap setting (the "minimap" feature)
+    minimapStock: null, // the bundle's own minimap: {name, n, rgba}, or {name, error}
+    minimapPicture: null, // {name, blob}: the picture for the Picture mode, kept in this browser
     gimmickTags: scene.gimmicks ? () => new Set(scene.gimmicks.placements.map((g) => g.tag)) : null,
     fogPreview: fogPreviewOn(),
   };
@@ -551,7 +562,8 @@ function setUpEdits(scene, model) {
     }
     edit.sky = cloneSky(stored.Sky);
     if (stored.Features && typeof stored.Features === 'object' && !Array.isArray(stored.Features)) {
-      const { fog, [COLNAV_KEY]: cn, links, [SETUP_KEY]: gs, [STAGE_VOLUMES_KEY]: sv, [EFFECTS_KEY]: fx, ...rest } = stored.Features;
+      const { fog, [COLNAV_KEY]: cn, links, [SETUP_KEY]: gs, [STAGE_VOLUMES_KEY]: sv, [EFFECTS_KEY]: fx, [MINIMAP_KEY]: mm, ...rest } = stored.Features;
+      edit.minimap = minimapFromFeature(mm);
       Object.assign(edit.gimmickSetup, setupFromFeature(gs));
       edit.zoneRemoved = removedFromFeature(sv);
       edit.effectMoved = movedFromFeature(fx);
@@ -640,6 +652,7 @@ export function renderStage(node, ctx) {
   const inspectBox = el('div', { class: 'stage-inspect' }, el('p', { class: 'muted' }, 'Click the map to select an object.'));
   const skyBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const fogBox = el('div', { class: 'stage-sky stage-fog' }, el('p', { class: 'muted' }, 'Reading the stage…'));
+  const minimapBox = el('div', { class: 'stage-sky stage-fog' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const downloadBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const modelBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const gimmickBox = el('div', { class: 'stage-gimmicks' }, el('p', { class: 'muted' }, 'Reading the stage…'));
@@ -671,14 +684,14 @@ export function renderStage(node, ctx) {
   gptLabel.hidden = true;
   const resetBtn = button('Reset view', null, { title: 'Frame the whole stage (R)' });
   // The side panel (Placement … Layers): the ☰ button hides it to give the map the room, kept for the next visit.
-  const side = el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Gimmicks'), gimmickBox, el('h3', {}, 'Collision edits'), cnBox, el('h3', {}, 'Invisible zones'), zoneBox, el('h3', {}, 'Effects and sounds'), effectBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Export 3D model'), modelBox, el('h3', {}, 'Layers'), layersBox);
+  const side = el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Gimmicks'), gimmickBox, el('h3', {}, 'Collision edits'), cnBox, el('h3', {}, 'Invisible zones'), zoneBox, el('h3', {}, 'Effects and sounds'), effectBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Minimap'), minimapBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Export 3D model'), modelBox, el('h3', {}, 'Layers'), layersBox);
   const panelBtn = button('☰', null, { class: 'btn btn-icon' });
   const showPanel = (on) => {
     const what = on ? 'Hide the side panel' : 'Show the side panel';
     side.hidden = !on;
     panelBtn.setAttribute('aria-expanded', String(on));
     panelBtn.setAttribute('aria-label', what);
-    panelBtn.title = `${what} (Placement, Inspect, Gimmicks, Collision edits, Invisible zones, Effects and sounds, Sky, Fog, Download, Layers)`;
+    panelBtn.title = `${what} (Placement, Inspect, Gimmicks, Collision edits, Invisible zones, Effects and sounds, Sky, Fog, Minimap, Download, Layers)`;
   };
   panelBtn.addEventListener('click', () => {
     const on = side.hidden;
@@ -1443,7 +1456,16 @@ export function renderStage(node, ctx) {
         if (sky?.Mode === 'picture' && !picture) skyNote += ' Choose the picture again in the Sky panel to see it.';
       }
       // The file's fog (a "fog" feature), and the features this page doesn't edit, kept as they are.
-      const { fog: fileFog, [COLNAV_KEY]: fileCn, links: fileLinks, [SETUP_KEY]: fileSetup, [STAGE_VOLUMES_KEY]: fileSv, [EFFECTS_KEY]: fileFx, ...rest } = res.features;
+      const { fog: fileFog, [COLNAV_KEY]: fileCn, links: fileLinks, [SETUP_KEY]: fileSetup, [STAGE_VOLUMES_KEY]: fileSv, [EFFECTS_KEY]: fileFx, [MINIMAP_KEY]: fileMm, ...rest } = res.features;
+      // The file's minimap setting (a "minimap" feature) replaces this one.
+      if (fileMm && typeof fileMm === 'object' && !Array.isArray(fileMm)) {
+        const before = { ...edit.minimap }, after = minimapFromFeature(fileMm);
+        if (before.Mode !== after.Mode || before.Picture !== after.Picture) {
+          setMinimap(after);
+          acts.push({ undo: () => setMinimap(before), redo: () => setMinimap(after) });
+          skyNote += ` Minimap: ${MINIMAP_MODES[after.Mode]}${after.Mode === PICTURE ? ` (${pictureFileName(after.Picture)})` : ''}.`;
+        }
+      }
       // The file's moved effects and sounds (an "effects" feature) replace these.
       if (fileFx && typeof fileFx === 'object' && !Array.isArray(fileFx)) {
         const before = new Map(edit.effectMoved), after = movedFromFeature(fileFx);
@@ -1859,6 +1881,262 @@ export function renderStage(node, ctx) {
       },
     );
 
+    // ----- minimap (StageViewerForm.Minimap.cs): the bundle's minimap_*.dds as it is, redrawn from above, or a picture -----
+    const MINIMAP_DESC = "Stock: the stage's own. Edited areas: the map drawn from above where you changed it. Whole map: drawn from above everywhere. Picture: an image of your own.";
+    const mmLine = el('p', { class: 'muted stage-count' });
+    const mmMode = el('select', { class: 'input input-sm', 'aria-label': 'Minimap' }, MINIMAP_MODES.map((t, i) => el('option', { value: String(i) }, t)));
+    const mmCanvas = el('canvas', { class: 'stage-minimap', width: '256', height: '256', 'aria-label': 'The minimap the download writes' });
+    const mmNote = el('p', { class: 'muted stage-count' });
+    const mmPickBtn = button('Choose a picture…', () => chooseMinimapPicture(), {
+      title: "Any image; it's scaled to the minimap. North (−Z) is up, the map's centre is the picture's centre, and the picture spans 600 m.",
+    });
+    const mmUpdateBtn = button('Update the preview', () => updateMinimapPreview(), { title: 'Draws the minimap again from the map as it is now (the download always draws it fresh)' });
+    const mmSaveBtn = button('Save it as PNG…', () => saveMinimapPng(), { title: 'Saves the minimap the download would write, to paint over in an image editor and bring back as a picture' });
+    let mmRead = false, mmWhat = '', mmJob = 0;
+    /** The picture the setting names is here (the desktop checks the file exists). */
+    const hasMinimapPicture = () => !!edit.minimapPicture && edit.minimapPicture.name === pictureFileName(edit.minimap.Picture);
+    /** Puts a minimap setting in place (SetMinimap): kept with the edits, then the preview drawn again. */
+    function setMinimap(m) {
+      edit.minimap = { Mode: m.Mode, Picture: m.Picture ?? null };
+      saveSoon();
+      renderDownload();
+      updateMinimapPreview();
+    }
+    /** The next or previous setting (StepMinimapMode), past Picture while no picture is kept. */
+    function stepMinimap(d) {
+      const mode = stepMode(edit.minimap.Mode, d, !!edit.minimapPicture);
+      setMinimap({ Mode: mode, Picture: mode === PICTURE ? edit.minimapPicture.name : edit.minimap.Picture });
+    }
+    mmMode.addEventListener('change', () => {
+      const mode = Number(mmMode.value);
+      if (mode === PICTURE && !edit.minimapPicture) return chooseMinimapPicture().finally(renderMinimap);
+      setMinimap({ Mode: mode, Picture: mode === PICTURE ? edit.minimapPicture.name : edit.minimap.Picture });
+    });
+    /**
+     * The minimap for setting m at the stock size (BuildMinimap): {rgba, what}, what saying what it holds. The redraws
+     * draw the map as it is now; the picture is the one kept in this browser.
+     */
+    async function buildMinimap(m) {
+      const st = edit.minimapStock, n = st.n;
+      if (m.Mode === PICTURE) {
+        if (!hasMinimapPicture()) throw new Error(`The minimap picture is missing: ${pictureFileName(m.Picture) || '(none chosen)'}; choose it again`);
+        return { rgba: await pictureMinimap(edit.minimapPicture.blob, n), what: `your picture (${edit.minimapPicture.name})` };
+      }
+      if (m.Mode === STOCK) return { rgba: st.rgba, what: "the stage's own" };
+      const sea = seaColour(st.rgba, n);
+      const render = renderTopDown(n, sea);
+      if (m.Mode === WHOLE) return { rgba: render, what: 'the whole map redrawn from above' };
+      const { mask, areas } = changeMask(n, changedFootprints(edit.objects, isEdited, (o) => placementFromState(o).position));
+      return {
+        rgba: mixMinimap(st.rgba, render, mask),
+        what: areas ? `${areas} changed area${areas === 1 ? '' : 's'} redrawn from above` : "the stage's own (nothing changed to redraw)",
+      };
+    }
+    /**
+     * The map drawn straight down over the minimap square at n × n (RenderTopDown): off screen at twice that, averaged;
+     * textures on whatever the view shows, the lightmap as the view has it, every layer but the sky, rainbow and mist.
+     * Where nothing was drawn (open sea) it is the sea colour.
+     */
+    function renderTopDown(n, sea) {
+      const most = Math.min(gl.getParameter(gl.MAX_RENDERBUFFER_SIZE), ...gl.getParameter(gl.MAX_VIEWPORT_DIMS));
+      let ss = 2;
+      if (n * ss > most) ss = 1;
+      if (n * ss > most) throw new Error(`The graphics card can't draw a ${n}-pixel minimap.`);
+      const size = n * ss, samples = new Uint8Array(size * size * 4);
+      const fbo = gl.createFramebuffer(), colour = gl.createRenderbuffer(), depth = gl.createRenderbuffer();
+      try {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+        gl.bindRenderbuffer(gl.RENDERBUFFER, colour);
+        gl.renderbufferStorage(gl.RENDERBUFFER, gl.RGBA8, size, size);
+        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, colour);
+        gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+        gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, size, size);
+        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+        const fs = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+        if (fs !== gl.FRAMEBUFFER_COMPLETE) throw new Error(`The graphics card can't draw off screen (${fs}).`);
+        gl.viewport(0, 0, size, size);
+        gl.clearColor(0, 0, 0, 0);
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthMask(true);
+        gl.depthFunc(gl.LESS);
+        gl.disable(gl.CULL_FACE);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        gl.useProgram(prog.program);
+        const U = prog.u;
+        gl.uniformMatrix4fv(U.uViewProj, false, topDownMatrix());
+        gl.uniform3fv(U.uEye, TOP_DOWN_EYE);
+        gl.uniform3fv(U.uFwd, [0, -1, 0]);
+        gl.uniform1i(U.uTex0, 0);
+        gl.uniform1i(U.uTex1, 1);
+        gl.uniform1f(U.uLmScale, lmSelect.value === 'bright' ? 2 : 1);
+        gl.uniform1f(U.uSkyRadius, 0);
+        gl.uniform1i(U.uFogOn, 0);
+        gl.uniform4f(U.uTint, 0, 0, 0, 0);
+        const lmOn = lmSelect.value !== 'off';
+        for (const m of scene.meshes) {
+          if (m.sky || leftOutOfMinimap(m)) continue;
+          gl.bindVertexArray(meshGpu(m).vao);
+          const useTex = !!m.uvs;
+          for (const b of m.batches) {
+            if (b.indexCount <= 0) continue;
+            const tex = useTex && b.texture ? glTex.get(lower(b.texture)) : null;
+            const light = useTex && m.uvs2 && b.lightmap ? glTex.get(lower(b.lightmap)) : null;
+            const useLight = !!light && lmOn;
+            let mode = 0;
+            if (useTex) mode = tex ? (useLight ? 3 : 2) : light ? 4 : 1;
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, (mode === 4 ? light : tex) || null);
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_2D, mode === 3 ? light : null);
+            gl.uniform1i(U.uMode, mode);
+            gl.uniform1i(U.uLit, useLight ? 0 : 1);
+            gl.drawElements(gl.TRIANGLES, b.indexCount, gl.UNSIGNED_INT, b.firstIndex * 4);
+          }
+        }
+        gl.bindVertexArray(null);
+        gl.pixelStorei(gl.PACK_ALIGNMENT, 1);
+        gl.readPixels(0, 0, size, size, gl.RGBA, gl.UNSIGNED_BYTE, samples);
+      } finally {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+        gl.deleteRenderbuffer(colour);
+        gl.deleteRenderbuffer(depth);
+        gl.deleteFramebuffer(fbo);
+        dirty = true; // the view draws itself again (its viewport and clear colour are set each frame)
+      }
+      return averageSamples(samples, n, ss, sea);
+    }
+    /** Draws the preview again from the setting and the map as they are now (UpdateMinimapPreview). */
+    async function updateMinimapPreview() {
+      const st = edit.minimapStock;
+      if (!st?.rgba) return renderMinimap();
+      const job = ++mmJob;
+      try {
+        const r = await buildMinimap(edit.minimap);
+        if (job !== mmJob || stopped) return;
+        mmCanvas.width = mmCanvas.height = st.n;
+        mmCanvas.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(r.rgba), st.n, st.n), 0, 0);
+        mmWhat = r.what;
+      } catch (e) {
+        if (job !== mmJob) return;
+        mmWhat = '';
+        console.warn(`Map editor: minimap preview: ${e.message}`);
+      }
+      renderMinimap();
+    }
+    /** Any image, kept in this browser for the stage (ChooseMinimapPicture); the setting goes to Picture. */
+    async function chooseMinimapPicture() {
+      const [f] = await pickFiles({ accept: 'image/*' });
+      if (!f || stopped) return;
+      let url;
+      try {
+        url = await pictureDataUrl(f);
+      } catch (e) {
+        return toast(`That picture can't be read: ${e.message}`, 'error');
+      }
+      edit.minimapPicture = { name: f.name, blob: f };
+      if (!storeMinimapPicture(edit.stage, { name: f.name, url }))
+        toast("This browser has no room to keep the picture: it's used until you leave the page.", 'error');
+      setMinimap({ Mode: PICTURE, Picture: f.name });
+      toast(`Minimap: ${f.name}`);
+    }
+    /** The minimap the download would write, as a PNG (SaveMinimapPng), named after the bundle's minimap. */
+    async function saveMinimapPng() {
+      const st = edit.minimapStock;
+      if (!st?.rgba) return;
+      try {
+        const r = await buildMinimap(edit.minimap);
+        const c = document.createElement('canvas');
+        c.width = c.height = st.n;
+        c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(r.rgba), st.n, st.n), 0, 0);
+        const blob = await new Promise((ok, fail) => c.toBlob((b) => (b ? ok(b) : fail(new Error('the PNG could not be made'))), 'image/png'));
+        const name = pictureFileName(st.name).replace(/\.[^.]*$/, '') + '.png';
+        downloadBytes(new Uint8Array(await blob.arrayBuffer()), name, 'image/png');
+        toast(`Saved ${name}`);
+      } catch (e) {
+        toast(`Could not save the minimap: ${e.message}`, 'error');
+      }
+    }
+    /**
+     * The bundle with the minimap entry rewritten (MinimapExport): the entry the stage's own came from (else the first
+     * minimap_*.dds) gets a one-level DXT1 of the minimap drawn fresh. Returns {archive, summary}; throws when it doesn't
+     * read back.
+     */
+    async function bakeMinimap(archive) {
+      const st = edit.minimapStock;
+      const r = await buildMinimap(edit.minimap);
+      const dds = minimapDds(st.n, st.n, r.rgba);
+      const entries = archive.entries.slice();
+      let i = entries.findIndex((e) => e.name === st.name);
+      if (i < 0) i = entries.findIndex((e) => isMinimapName(e.name));
+      if (i < 0) throw new Error(`the bundle has no ${st.name}`);
+      entries[i] = { ...entries[i], pointer: false, size: dds.length, data: dds };
+      let back;
+      try {
+        back = decodeDds(entries[i].data);
+      } catch (e) {
+        throw new Error(`the minimap did not read back (${e.message})`);
+      }
+      if (back.width !== st.n || back.height !== st.n) throw new Error('the minimap did not read back');
+      console.info(`Map editor: ${entries[i].name}: ${r.what}`);
+      return { archive: { ...archive, entries }, summary: `Minimap: ${r.what}.` };
+    }
+    function renderMinimap() {
+      const st = edit.minimapStock;
+      if (!st?.rgba) {
+        minimapBox.replaceChildren(
+          el('p', { class: 'muted' },
+            !mmRead ? 'Reading the minimap…'
+              : st ? `${st.name} can't be read (${st.error}); it is left as it is.`
+              : 'This stage has no minimap in its bundle (minimap_*.dds).'),
+        );
+        return;
+      }
+      const m = edit.minimap;
+      mmMode.value = String(m.Mode);
+      mmLine.textContent = `${st.name}, ${st.n} × ${st.n}${m.Mode === PICTURE ? ` · ${pictureFileName(m.Picture)}` : ''}`;
+      mmNote.textContent = m.Mode === PICTURE && !hasMinimapPicture()
+        ? `The picture ${pictureFileName(m.Picture)} isn't kept in this browser: choose it again.`
+        : mmWhat ? `Shows ${mmWhat}${m.Mode === EDITED || m.Mode === WHOLE ? ' (Update the preview after more changes; the download draws it fresh)' : ''}.` : '';
+      if (!minimapBox.contains(mmMode))
+        minimapBox.replaceChildren(
+          mmLine,
+          el('label', { class: 'stage-fog-row', title: MINIMAP_DESC }, 'Minimap', mmMode),
+          mmCanvas,
+          mmNote,
+          el('div', { class: 'toolbar' }, mmPickBtn, mmUpdateBtn, mmSaveBtn),
+        );
+    }
+    const minimapPage = {
+      title: 'Minimap',
+      status: () => (edit.minimapStock?.name ?? '') + (edit.minimap.Mode === PICTURE ? ` · ${pictureFileName(edit.minimap.Picture)}` : ''),
+      items: () => [
+        { text: 'Minimap', value: () => MINIMAP_MODES[edit.minimap.Mode], activate: () => stepMinimap(1), adjust: (dir) => stepMinimap(dir), desc: MINIMAP_DESC },
+        { text: 'Choose a picture…', activate: () => (menu.close(), chooseMinimapPicture()), desc: "Any image; it's scaled to the minimap. North (−Z) is up, the map's centre is the picture's centre, and the picture spans 600 m." },
+        { text: 'Update the preview', activate: () => updateMinimapPreview(), desc: 'Draws the minimap again from the map as it is now (the download always draws it fresh); the preview is in the side panel' },
+        { text: 'Save it as PNG…', activate: () => (menu.close(), saveMinimapPng()), desc: 'Saves the minimap the download would write, to paint over in an image editor and bring back as a picture' },
+      ],
+    };
+    renderMinimap();
+    Promise.all([readStockMinimap(model), loadMinimapPicture(edit.stage)]).then(
+      ([stock, pic]) => {
+        if (stopped) return;
+        mmRead = true;
+        edit.minimapStock = stock;
+        if (pic) edit.minimapPicture = pic;
+        if (stock?.rgba) console.info(`Map editor: minimap: ${stock.name} ${stock.n}×${stock.n}, mode ${MINIMAP_MODES[edit.minimap.Mode]}`);
+        else if (stock) console.info(`Map editor: minimap: ${stock.name} can't be read (or isn't square); left as it is`);
+        renderDownload();
+        // Drawn after this turn; Update the preview draws it again once more of the map has loaded or changed.
+        setTimeout(() => !stopped && updateMinimapPreview(), 0);
+      },
+      (e) => {
+        mmRead = true;
+        console.warn(`Map editor: the minimap of ${edit.stage} could not be read: ${e.message}`);
+        renderMinimap();
+      },
+    );
+
     // ----- gimmick setup: the rules and the files it writes (StageViewerForm.GimmickSetup.cs), read with the gimmicks -----
     const setupFiles = { bundle: null, loose: null, tactics: null }; // each {path, bytes, layers}
     const setupCtx = {
@@ -1883,6 +2161,7 @@ export function renderStage(node, ctx) {
       if (navHandEdited()) parts.push('bot navigation');
       if (edit.sky && edit.sky.Mode !== 'dungeon') parts.push('sky');
       if (fogChanged(edit)) parts.push('fog');
+      if (edit.minimapStock?.rgba && edit.minimap.Mode !== STOCK) parts.push('minimap');
       if (gptPaths.length && movedPaths(gptPaths, gptHarbours()).length) parts.push('gimmick paths');
       if (setupFiles.bundle && setupExport()?.planEmpty === false) parts.push('stage script');
       return parts;
@@ -1940,7 +2219,7 @@ export function renderStage(node, ctx) {
       const parts = bakeParts();
       downloadNote.textContent = parts.length
         ? `Writes the ${listOf(parts)} into a copy of ${edit.stage}.bres.`
-        : 'Move, hide or make objects Solid, change the sky or fog, edit the collision, or set up the castle gimmicks, to write them into a copy of the bundle.';
+        : 'Move, hide or make objects Solid, change the sky, fog or minimap, edit the collision, or set up the castle gimmicks, to write them into a copy of the bundle.';
       bakeBtn.disabled = !parts.length;
       if (!downloadBox.contains(bakeBtn)) downloadBox.replaceChildren(downloadNote, el('div', { class: 'toolbar' }, bakeBtn));
     }
@@ -2096,6 +2375,13 @@ export function renderStage(node, ctx) {
         }
         if (parts.includes('fog')) {
           const r = await bakeFog(archive, edit.fog);
+          archive = r.archive;
+          lines.push(r.summary);
+        }
+        if (parts.includes('minimap')) {
+          status.textContent = 'Drawing the minimap…';
+          await pause();
+          const r = await bakeMinimap(archive);
           archive = r.archive;
           lines.push(r.summary);
         }
@@ -5624,6 +5910,9 @@ export function renderStage(node, ctx) {
           : null,
         fxTable
           ? { text: 'Move effects and sounds', activate: closeThen(() => setEffectTool(true)), desc: 'Drag one on its level, the wheel raises or lowers it; Download effect table writes them (Shift+J)' }
+          : null,
+        edit.minimapStock?.rgba
+          ? { text: 'Minimap…', value: () => MINIMAP_MODES[edit.minimap.Mode], activate: () => menu.push(minimapPage), desc: 'The stage\'s own, redrawn from above where you changed the map, redrawn whole, or a picture of your own; the bundle download writes it' }
           : null,
         {
           text: 'Textures',

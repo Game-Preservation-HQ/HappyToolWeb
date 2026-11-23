@@ -275,7 +275,7 @@ export function clearDds(dds) {
 // ---------- DXT1 encoder (StageKitWriter.EncodeDds) ----------
 
 /** One DXT1 block of 16 RGBA texels: the box's darkest and brightest corners as ends, nearest of four colours each (EncodeDxt1Block). */
-function dxt1Block(pix, out, o) {
+export function dxt1Block(pix, out, o) {
   let minR = 255, minG = 255, minB = 255, maxR = 0, maxG = 0, maxB = 0;
   for (let i = 0; i < 16; i++) {
     const r = pix[i * 4], g = pix[i * 4 + 1], b = pix[i * 4 + 2];
