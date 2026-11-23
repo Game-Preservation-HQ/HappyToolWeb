@@ -5,7 +5,7 @@
 // The sky can be swapped for another stage's, a picture or a colour preset (slice 3, see stage-sky.js).
 // The stage's collision can be erased by hand and added to with walls, blocks, floors and ramps (see stage-colnav.js).
 import { el, button, toast, downloadBlob, pickFiles, confirmBox, debounce, openDialog } from '../ui.js';
-import { BRUSH_TOOLS, RAISE, MIN_BRUSH, MAX_BRUSH, MIN_STRENGTH, MAX_STRENGTH, BRUSH_COLOURS, stockBounds, groundPieces, coverGround, groundHeights, sculptObject, brushGroundY, brushStep, encodeSculpt, decodeSculpt, sculptWarp, warpNav } from './stage-terraform.js';
+import { BRUSH_TOOLS, RAISE, MIN_BRUSH, MAX_BRUSH, MIN_STRENGTH, MAX_STRENGTH, BRUSH_COLOURS, stockBounds, groundPieces, coverGround, groundHeights, sculptObject, liftFor, brushGroundY, brushStep, encodeSculpt, decodeSculpt, sculptWarp, warpNav } from './stage-terraform.js';
 import { decodeLayers, encodeLayers, writableLayers } from '../formats/wrappers.js';
 import { writeBres } from '../formats/bres.js';
 import {
@@ -60,8 +60,9 @@ import {
 import {
   STAGE_VOLUMES_KEY, removedFromFeature, volumesFeature, parseStageVolumes, readTrapZones, volumeFrame, gimmickFrame,
   carried as carriedFrame, trapLines, volumeLines, volumeBounds, ownerOf, trapKindName, trapKindColour, VOLUME_COLOUR, cssColour,
-  describeVolume, describeTrap, movedVolumeRecord, rewriteStageVolumes,
+  describeVolume, describeTrap, movedVolumeRecord, rewriteStageVolumes, stageVolumeTriangles,
 } from './stage-zones.js';
+import { PLAY, PlayWorld, isCharacterLayer, newPlayer, playStep, playCamera, playWheel, shadowPoint, hudText, playDrawer } from './stage-play.js';
 import {
   EFFECTS_KEY, EFFECT_COLOUR, SOUND_COLOUR, FILTERS as EFFECT_FILTERS, effectName, movedFromFeature, effectsFeature,
   loadEffectTable, movedEffectTable, effectTableBytes, postOf, markerLines, rangeRing, oneDecimal, describeEffect,
@@ -817,6 +818,8 @@ export function renderStage(node, ctx) {
     let tfReaim = false, tfCamSig = '', tfCtrl = false, tfSaveSeq = 0, terraformOff = () => {};
     let vp = null, viewW = 1, viewH = 1;
     const keys = new Set();
+    // The play test (set up further down): {world, p, camDist, shadow, move, run, jump} while walking the map.
+    let play = null, playGfx = null;
     let flyMul = 1; // the controller's fly speed (LB/RB), also for WASD
     let carry = null; // the object the controller carries: {o, start, surface, lift, dist, offset, twisted, sig}
     let releasePad = null;
@@ -878,7 +881,7 @@ export function renderStage(node, ctx) {
         gl.drawElements(gl.TRIANGLES, z - a, gl.UNSIGNED_INT, a * 4);
       };
       const tintOf = new Map(); // mesh → its selected objects
-      for (const o of selectedAll()) tintOf.has(o.mesh) ? tintOf.get(o.mesh).push(o) : tintOf.set(o.mesh, [o]);
+      for (const o of play ? [] : selectedAll()) tintOf.has(o.mesh) ? tintOf.get(o.mesh).push(o) : tintOf.set(o.mesh, [o]);
       for (const pass of ['sky', 'solid']) {
         const skyPass = pass === 'sky';
         if (skyPass) {
@@ -938,6 +941,7 @@ export function renderStage(node, ctx) {
       if (lineProg) drawNav(vp, eye);
       if (lineProg) drawZones(vp, eye);
       if (lineProg) drawEffects(vp, eye);
+      if (play) (playGfx ??= playDrawer(gl)).draw(vp, play.p, play.shadow);
       if (drawGrid) drawGrid(grid, { vp, eye, f, viewH, fov: FOV, far });
       gl.bindVertexArray(null);
       overlayDirty = true;
@@ -989,6 +993,7 @@ export function renderStage(node, ctx) {
      * 12% of the distance to the eye (GizmoLength).
      */
     function gizmo() {
+      if (play) return null;
       const all = selectedAll(), o = all[0];
       if (!o) return null;
       const b = all.length > 1 ? unionBounds(all) : null;
@@ -1037,6 +1042,7 @@ export function renderStage(node, ctx) {
       drawEffectLabels(g2);
       if (cnMode) drawCnOverlay(g2);
       if (tfOn) drawTfOverlay(g2);
+      if (play) drawPlayHud(g2);
       // The axis indicator sits in the bottom-left corner, above the hint line that runs along the bottom.
       if (grid.axes) drawAxisIndicator(g2, hint.offsetParent ? hint.offsetTop - overlay.offsetTop : overlay.clientHeight, basis());
       if (boxDrag?.moved) {
@@ -1573,8 +1579,11 @@ export function renderStage(node, ctx) {
       if (!canvas.isConnected) return stop();
       const dt = Math.min(0.1, (now - last) / 1000);
       last = now;
-      if (fly(dt)) dirty = true;
-      if (tfOn) tfFrame(dt);
+      if (play) playTick(dt);
+      else {
+        if (fly(dt)) dirty = true;
+        if (tfOn) tfFrame(dt);
+      }
       if (dirty) {
         dirty = false;
         draw();
@@ -3973,7 +3982,7 @@ export function renderStage(node, ctx) {
       if (mode === cnMode) return;
       const why = mode ? cnBlocked(mode) : null;
       if (why) return flash(why);
-      if (mode) effectToolOff(), terraformOff();
+      if (mode) effectToolOff(), terraformOff(), playOff();
       cnStrokeEnd();
       const was = cnMode;
       cnMode = mode;
@@ -4814,6 +4823,7 @@ export function renderStage(node, ctx) {
       if (on) {
         if (cnMode) setCnMode(0);
         terraformOff();
+        playOff();
         select(null);
         showEffects();
       } else cancelEffectDrag();
@@ -5445,6 +5455,11 @@ export function renderStage(node, ctx) {
     canvas.addEventListener('pointerdown', (e) => {
       canvas.focus();
       canvas.setPointerCapture(e.pointerId);
+      if (play) {
+        // Playing: any button turns the view around the player.
+        drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, pan: false, moved: false };
+        return;
+      }
       if (fxTool && e.button === 0) {
         // The effects tool: a marker is grabbed; anywhere else turns the view, and a click there lets go of the selection.
         if (effectPointerDown(local(e))) return;
@@ -5464,6 +5479,7 @@ export function renderStage(node, ctx) {
       drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, pan: cnMode || tfOn ? e.button === 1 : e.button !== 0 || e.shiftKey, moved: false };
     });
     canvas.addEventListener('pointermove', (e) => {
+      if (play && !drag) return;
       if (fxDrag) return effectDragMove(local(e));
       if (gdrag) return moveGizmo(local(e), e);
       if (boxDrag) {
@@ -5496,11 +5512,15 @@ export function renderStage(node, ctx) {
         cam.target = cam.target.map((x, k) => x - r[k] * dx * s + u[k] * dy * s);
       } else {
         cam.yaw += dx * 0.006;
-        cam.pitch = Math.max(-1.55, Math.min(1.55, cam.pitch - dy * 0.006));
+        cam.pitch = play ? playPitch(cam.pitch - dy * 0.006) : Math.max(-1.55, Math.min(1.55, cam.pitch - dy * 0.006));
       }
       dirty = true;
     });
     canvas.addEventListener('pointerup', (e) => {
+      if (play) {
+        drag = null;
+        return;
+      }
       if (fxDrag) return effectDragEnd();
       if (gdrag) return endGizmo();
       if (tfStroke) return tfEnd();
@@ -5548,6 +5568,7 @@ export function renderStage(node, ctx) {
       'wheel',
       (e) => {
         e.preventDefault();
+        if (play) return void (play.camDist = playWheel(play.camDist, e.deltaY < 0));
         if (fxTool && fxSel && !e.altKey) return effectWheel(e);
         if (tfOn && !e.altKey) return tfWheel(e);
         if (cnMode && cnMode !== 4 && !e.altKey) return cnWheel(e);
@@ -5559,6 +5580,11 @@ export function renderStage(node, ctx) {
     canvas.addEventListener('keydown', (e) => {
       const k = e.key.toLowerCase();
       const ctrl = e.ctrlKey || e.metaKey;
+      if (play) return playKey(e, k);
+      if (k === 'f5' && !ctrl && !e.altKey) {
+        e.preventDefault();
+        return startPlay();
+      }
       if (ctrl && !e.altKey && (k === 'z' || k === 'y')) {
         e.preventDefault();
         cnStrokeEnd();
@@ -5679,6 +5705,11 @@ export function renderStage(node, ctx) {
       return Math.hypot(p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]);
     };
     function setPadHint() {
+      if (play) {
+        const t = padUsed ? PLAY_PAD_HINT : PLAY_HINT;
+        if (hint.textContent !== t) hint.textContent = t;
+        return;
+      }
       if (cnMode) return;
       if (tfOn) {
         const t = tfHint();
@@ -5872,7 +5903,7 @@ export function renderStage(node, ctx) {
       }
       if (pad.edge(PAD.LEFT)) undo();
       else if (pad.edge(PAD.RIGHT)) redo();
-      else if (pad.edge(PAD.UP)) toast('The play test is not in the web version yet.');
+      else if (pad.edge(PAD.UP)) startPlay();
       else if (pad.edge(PAD.DOWN)) toggleCollision();
       const sl = padRepeat('lb', pad.held(PAD.LB)), sr = padRepeat('rb', pad.held(PAD.RB));
       if (sl || sr) {
@@ -5882,6 +5913,182 @@ export function renderStage(node, ctx) {
         flash(t);
       }
     }
+    // ----- play test (StageViewerForm.Play.cs, part 1; F5 / D-pad up) -----
+    // Walks the map as a stand-in player against its collision as it is now: the stage's (the character layer when
+    // there is one) lifted with the terraforming, moved objects' collision where they are, Solid objects, the collision
+    // editor's pieces, the gimmick table's extra collision and the gimmicks' own models.
+    const PLAY_HINT = 'Play test · WASD: walk · Shift: run · Space: jump · Drag: look around · Wheel: camera distance · H / P: collision / nav lines · Esc or F5: stop';
+    const PLAY_PAD_HINT = 'Play test · Left stick: walk · RB or L3: run · A: jump · Right stick: look around · B, Menu, View or D-pad up: stop';
+    const playPitch = (p) => Math.max(-1.45, Math.min(0.9, p));
+    /** The triangles the player collides with (BuildPlayWorld). */
+    function buildPlayWorld() {
+      const w = new PlayWorld(), layers = colRead?.layers ?? [];
+      const chit = layers.some((l) => isCharacterLayer(l.name)), use = (l) => !chit || isCharacterLayer(l.name);
+      if (colRead?.live) {
+        const m = matchDone(), flags = erasedFlags(), sc = edit.sculpt, owned = new Map();
+        const lift = (x, z) => (sc ? sc.at(x, z) : 0);
+        // An object the sculpt lifts whole (SculptLiftFor) counts as moved, as on the desktop (_objHasXform): its
+        // collision leaves the ground pass and goes in below, placed and lifted like the object.
+        const lifts = new Map();
+        const liftOf = (o) => {
+          let v = lifts.get(o);
+          if (v === undefined) lifts.set(o, (v = sc && !(edit.tfGround?.has(o) && isIdentityTransform(o.state)) ? liftFor(o, sc) : 0));
+          return v;
+        };
+        const apart = (o) => o.state.hidden || !isIdentityTransform(o.state) || liftOf(o) !== 0;
+        layers.forEach((l, li) => {
+          if (!use(l)) return;
+          const P = l.positions, I = l.indices, own = m?.owners[li], f = flags[li];
+          for (let t = 0; t * 3 + 2 < I.length; t++) {
+            if (f && f[t]) continue; // erased by hand
+            const o = own ? own[t] : -1, a = I[t * 3] * 3, b = I[t * 3 + 1] * 3, c = I[t * 3 + 2] * 3;
+            if (o >= 0) {
+              let list = owned.get(o);
+              if (!list) owned.set(o, (list = []));
+              list.push(P[a], P[a + 1], P[a + 2], P[b], P[b + 1], P[b + 2], P[c], P[c + 1], P[c + 2]);
+              if (apart(edit.objects[o])) continue; // placed with its object below
+            }
+            w.add(P[a], P[a + 1] + lift(P[a], P[a + 2]), P[a + 2], P[b], P[b + 1] + lift(P[b], P[b + 2]), P[b + 2], P[c], P[c + 1] + lift(P[c], P[c + 2]), P[c + 2], o);
+          }
+        });
+        for (const o of edit.objects) {
+          const st = o.state, tris = owned.get(o.index), up = st.hidden ? 0 : liftOf(o);
+          const moved = !!tris && (up !== 0 || !isIdentityTransform(st));
+          if (st.hidden || o.gimmick || !(moved || st.solid)) continue;
+          const at = placer(st, o.pivot), place = up ? (out, i, x, y, z) => (at(out, i, x, y, z), (out[i + 1] += up)) : at;
+          if (moved) w.addFlat(tris, o.index, place);
+          if (st.solid) w.addFlat(solidOf(o), o.index, place);
+        }
+      } else
+        for (const l of layers) {
+          const P = l.positions, I = l.indices;
+          if (!use(l) || !P || !I) continue;
+          for (let t = 0; t + 2 < I.length; t += 3) {
+            const a = I[t] * 3, b = I[t + 1] * 3, c = I[t + 2] * 3;
+            w.add(P[a], P[a + 1], P[a + 2], P[b], P[b + 1], P[b + 2], P[c], P[c + 1], P[c + 2], -1);
+          }
+        }
+      for (const v of edit.colnav.Volumes) w.addFlat(volumeTriangles(v), -1);
+      for (const v of zoneVolumes) if (!zoneGone(v)) w.addFlat(stageVolumeTriangles(v, zoneFrame(v)), -1);
+      for (const o of edit.objects) {
+        if (!o.gimmick || o.state.hidden || !(o.triCount >= 1)) continue;
+        const P = o.mesh.positions, T = o.triangles;
+        for (let t = 0; t < o.triCount; t++) {
+          const a = T[t * 3] * 3, b = T[t * 3 + 1] * 3, c = T[t * 3 + 2] * 3;
+          w.add(P[a], P[a + 1], P[a + 2], P[b], P[b + 1], P[b + 2], P[c], P[c + 1], P[c + 2], o.index);
+        }
+      }
+      return w.finish();
+    }
+    /** What the player stands on, for the HUD. */
+    const playDescribe = (i) => {
+      const o = edit.objects[i];
+      if (!o) return 'stage ground';
+      return `standing on ${o.label || o.name}${o.state.solid && !o.gimmick ? ' (Solid)' : ''}`;
+    };
+    /** Starts playing where the view looks at the ground (StartPlay). */
+    function startPlay() {
+      if (play || gdrag) return;
+      if (!colRead) return flash('Reading the collision… try again in a moment');
+      if (carry) dropCarry();
+      if (cnMode) setCnMode(0);
+      terraformOff();
+      effectToolOff();
+      const w = buildPlayWorld();
+      if (!w.count) return flash('Play needs collision — this stage has none the editor can read');
+      // Where the view points, else straight down from the eye. The desktop looks 60000 ahead; the web's opening view
+      // frames the whole map from further away than that, so it looks at least twice the camera's distance.
+      const { f, eye } = basis(), reach = Math.max(60000, cam.dist * 2);
+      let d = f, h = w.raycast(eye, d, reach);
+      if (!h) (d = [0, -1, 0]), (h = w.raycast(eye, d, reach));
+      if (!h) return flash('Point the view at the ground to start playing there');
+      const spawn = [eye[0] + d[0] * h.t, eye[1] + d[1] * h.t + 5, eye[2] + d[2] * h.t];
+      play = { world: w, p: newPlayer(spawn, Math.atan2(f[0], f[2])), camDist: PLAY.camDist, shadow: null, move: [0, 0], run: false, jump: false };
+      if (cam.pitch > -0.05) cam.pitch = -0.3;
+      cam.pitch = playPitch(cam.pitch);
+      keys.clear();
+      drag = null;
+      playCam();
+      canvas.style.cursor = '';
+      flash(`Play mode — ${w.count.toLocaleString()} collision triangles`);
+      setPadHint();
+      dirty = true;
+    }
+    function stopPlay() {
+      if (!play) return;
+      play = null;
+      keys.clear();
+      drag = null;
+      flash('Play stopped — back to editing');
+      hint.textContent = baseHint;
+      setPadHint();
+      dirty = true;
+    }
+    function playOff() {
+      if (play) stopPlay();
+    }
+    function togglePlay() {
+      if (play) stopPlay();
+      else startPlay();
+    }
+    /** The camera behind the player and the shadow under it. */
+    function playCam() {
+      const c = playCamera(play.world, play.p, basis().f, play.camDist);
+      play.camDist = c.camDist;
+      cam.target = c.target;
+      cam.dist = c.dist;
+      play.shadow = shadowPoint(play.world, play.p);
+    }
+    /** One frame of play: the keys and the controller's stick move the player, then the camera follows. */
+    function playTick(dt) {
+      dt = Math.min(dt, 0.05);
+      const mv = [play.move[0], play.move[1]];
+      if (keys.has('w') || keys.has('arrowup')) mv[1] += 1;
+      if (keys.has('s') || keys.has('arrowdown')) mv[1] -= 1;
+      if (keys.has('d') || keys.has('arrowright')) mv[0] += 1;
+      if (keys.has('a') || keys.has('arrowleft')) mv[0] -= 1;
+      const l = Math.hypot(mv[0], mv[1]);
+      if (l > 1) (mv[0] /= l), (mv[1] /= l);
+      const msg = playStep(play.world, play.p, dt, mv, keys.has('shift') || play.run, keys.has(' ') || play.jump, basis().f, cam.yaw);
+      if (msg) flash(msg);
+      playCam();
+      dirty = true;
+    }
+    /** The keyboard while playing: Esc or F5 stops, H and P show the collision and the nav, the rest moves. */
+    function playKey(e, k) {
+      if (k === 'escape' || k === 'f5') {
+        e.preventDefault();
+        return stopPlay();
+      }
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (k === 'h') return toggleCollision();
+      if (k === 'p') return toggleNav();
+      if (['w', 'a', 's', 'd', 'shift', ' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) {
+        keys.add(k);
+        e.preventDefault();
+      }
+    }
+    /** The controller while playing. */
+    function padPlay(pad) {
+      if (pad.edge(PAD.B) || pad.edge(PAD.MENU) || pad.edge(PAD.VIEW) || pad.edge(PAD.UP)) return stopPlay();
+      cam.yaw += pad.rx * 2.6 * pad.dt;
+      cam.pitch = playPitch(cam.pitch + pad.ry * 2.6 * pad.dt);
+      play.move = [pad.lx, pad.ly];
+      play.run = pad.held(PAD.RB) || pad.held(PAD.L3);
+      play.jump = pad.held(PAD.A);
+    }
+    /** The HUD box in the top-left corner (DrawPlayHud). */
+    function drawPlayHud(g2) {
+      const t = hudText(play.world, play.p, playDescribe);
+      g2.font = '12px ui-monospace, Consolas, monospace';
+      const w = g2.measureText(t).width + 16;
+      g2.fillStyle = 'rgba(0, 0, 0, 0.55)';
+      g2.fillRect(8, 8, w, 24);
+      g2.fillStyle = '#fff';
+      g2.textBaseline = 'middle';
+      g2.fillText(t, 16, 20);
+    }
+
     if (!stopped)
       releasePad = takePad((pad) => {
         if (stopped || !canvas.isConnected || document.querySelector('dialog[open]')) return false;
@@ -5896,6 +6103,11 @@ export function renderStage(node, ctx) {
           return false;
         }
         if (pad.buttons || pad.lx || pad.ly || pad.rx || pad.ry || pad.lt || pad.rt) padUsed = true;
+        if (play) {
+          padPlay(pad);
+          setPadHint();
+          return true;
+        }
         if (pad.edge(PAD.MENU)) openMenu();
         else if (pad.edge(PAD.VIEW)) padHelp();
         else if (carry) padCarry(pad);
@@ -5977,6 +6189,7 @@ export function renderStage(node, ctx) {
     }
     function setTerraform(on) {
       if (on === tfOn) return;
+      if (on) playOff();
       if (on) {
         if (edit.sculptJob && !edit.sculpt && !edit.sculptBroken) {
           flash('Reading the terraforming kept for this stage…');
@@ -6339,6 +6552,7 @@ export function renderStage(node, ctx) {
           : null,
         { text: 'Collision & nav editor', activate: closeThen(() => setCnMode(colRead?.live ? 1 : 2)), desc: 'Erase or add collision, paint nav, edit waypoints (F3)' },
         { text: tfOn ? 'Stop terraforming' : 'Terraform', activate: closeThen(() => setTerraform(!tfOn)), desc: 'Raise, lower, smooth and flatten the ground with a brush (F2)' },
+        { text: play ? 'Stop the play test' : 'Play test', activate: closeThen(togglePlay), desc: 'Walk the map as a player to try its collision (F5 / D-pad up)' },
         fxTable
           ? { text: 'Effects and sounds', value: () => onOff(fxShow.on), activate: toggleEffects, desc: 'Where the stage plays its particle effects and sounds (J)' }
           : null,
@@ -6406,6 +6620,7 @@ export function renderStage(node, ctx) {
         cmd('Redo', 'Ctrl+Y', press('y', { ctrlKey: true })),
         cmd(cnMode ? 'Leave the collision & nav editor' : 'Collision & nav editor', 'F3', press('F3'), 'Erase or add collision, paint nav, edit waypoints'),
         cmd(tfOn ? 'Stop terraforming' : 'Terraform', 'F2', press('F2'), 'Raise, lower, smooth and flatten the ground with a brush'),
+        cmd(play ? 'Stop the play test' : 'Play test', 'F5', press('F5'), 'Walk the map as a player to try its collision'),
         cmd('Collision lines on or off', 'H', press('h')),
         cmd('Nav lines on or off', 'P', press('p')),
         cmd('Frame the selected object', 'F', press('f')),

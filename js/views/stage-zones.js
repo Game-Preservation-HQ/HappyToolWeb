@@ -141,6 +141,30 @@ const BOX_CORNERS = [[-1, -1, -1], [1, -1, -1], [1, -1, 1], [-1, -1, 1], [-1, 1,
 const BOX_EDGES = [0, 1, 1, 2, 2, 3, 3, 0, 4, 5, 5, 6, 6, 7, 7, 4, 0, 4, 1, 5, 2, 6, 3, 7];
 /** A box's 8 corners in the world (centre and half size in the frame). BoxWorld. */
 const boxWorld = (centre, half, f) => BOX_CORNERS.map((c) => apply(f, [centre[0] + c[0] * half[0], centre[1] + c[1] * half[1], centre[2] + c[2] * half[2]]));
+const BOX_FACES = [0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5, 2, 3, 7, 2, 7, 6, 3, 0, 4, 3, 4, 7];
+
+/** A collision entry's triangles in a frame (9 numbers each) for the play test: a box, or a 12 × 8 sphere. StageVolumeTriangles. */
+export function stageVolumeTriangles(v, f) {
+  const out = [];
+  if (v.isBox) {
+    const c = boxWorld(v.pos, scale(v.width, 0.5), f);
+    for (const i of BOX_FACES) out.push(c[i][0], c[i][1], c[i][2]);
+  } else if (v.isSphere && v.radius > 0) {
+    const o = apply(f, v.pos), r = v.radius * frameScale(f), SEG = 12, RINGS = 8;
+    const P = (s, k) => {
+      const th = (Math.PI * k) / RINGS, ph = (2 * Math.PI * s) / SEG;
+      return [o[0] + r * Math.sin(th) * Math.cos(ph), o[1] + r * Math.cos(th), o[2] + r * Math.sin(th) * Math.sin(ph)];
+    };
+    const tri = (a, b, c) => out.push(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]);
+    for (let k = 0; k < RINGS; k++)
+      for (let s = 0; s < SEG; s++) {
+        const a = P(s, k), b = P(s + 1, k), c = P(s + 1, k + 1), d = P(s, k + 1);
+        if (k > 0) tri(a, c, b);
+        if (k < RINGS - 1) tri(a, d, c);
+      }
+  }
+  return out;
+}
 
 /** Unit vectors perpendicular to an axis. Perpendiculars. */
 function perpendiculars(ax) {
