@@ -1,6 +1,7 @@
 // Play test (StageViewerForm.Play.cs): walk the map as a stand-in player to try its collision. This is part 1: the
 // collision world, the walk, run and jump, the camera behind the player, the stand-in figure and its HUD line. The
-// warrior avatar, its actions, using the gimmicks and starting at a castle (part 2) are not ported yet.
+// warrior avatar and its actions (part 2b) are in stage-avatar.js; using the gimmicks and starting at a castle (part 2c)
+// are not ported yet.
 
 /** Sizes and speeds in the game's units (cm), as the desktop's Play* constants. */
 export const PLAY = {
@@ -304,8 +305,8 @@ export function resolveContacts(w, p) {
  * The camera behind the player along the view's forward f, just over the head, pulled in where a wall is in the way
  * (UpdatePlayCamera). Returns { target, dist, camDist } (camDist: the zoom clamped to its range).
  */
-export function playCamera(w, p, f, camDist) {
-  const target = [p.pos[0], p.pos[1] + PLAY.height * 0.85, p.pos[2]];
+export function playCamera(w, p, f, camDist, lift = PLAY.height * 0.85) {
+  const target = [p.pos[0], p.pos[1] + lift, p.pos[2]];
   const want = Math.max(PLAY.camMin, Math.min(PLAY.camMax, camDist));
   const h = w.raycast(target, [-f[0], -f[1], -f[2]], want);
   return { target, camDist: want, dist: h ? Math.max(30, h.t - 20) : want };
@@ -376,7 +377,7 @@ uniform float uAlpha;
 out vec4 outColor;
 void main() { outColor = vec4(vCol, uAlpha); }`;
 
-/** The figure's drawer: draw(vp, player, shadow) draws the stand-in where the player is and its shadow disc. */
+/** The figure's drawer: draw(vp, player, shadow, figure) draws the stand-in where the player is (unless figure is false) and its shadow disc. */
 export function playDrawer(gl) {
   const sh = (type, src) => {
     const s = gl.createShader(type);
@@ -404,16 +405,16 @@ export function playDrawer(gl) {
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
     return { vao, count: data.length / 9 };
   };
-  const body = [];
-  for (const [c, r, col] of PARTS) ellipsoid(body, c, r, col);
+  const parts = [];
+  for (const [c, r, col] of PARTS) ellipsoid(parts, c, r, col);
   const disc = [];
   for (let i = 0; i < 20; i++) {
     const a0 = (2 * Math.PI * i) / 20, a1 = (2 * Math.PI * (i + 1)) / 20, R = PLAY.radius;
     for (const [x, z] of [[0, 0], [Math.cos(a0) * R, Math.sin(a0) * R], [Math.cos(a1) * R, Math.sin(a1) * R]]) disc.push(x, 0, z, 0, 1, 0, 0, 0, 0);
   }
-  const figure = upload(body), shadow = upload(disc);
+  const body = upload(parts), shadow = upload(disc);
   return {
-    draw(vp, p, shadowAt) {
+    draw(vp, p, shadowAt, figure = true) {
       gl.useProgram(prog);
       gl.uniformMatrix4fv(U.uViewProj, false, vp);
       gl.disable(gl.CULL_FACE);
@@ -421,8 +422,10 @@ export function playDrawer(gl) {
       gl.uniform3fv(U.uAt, p.pos);
       gl.uniform1f(U.uFacing, p.facing);
       gl.uniform1f(U.uAlpha, 1);
-      gl.bindVertexArray(figure.vao);
-      gl.drawArrays(gl.TRIANGLES, 0, figure.count);
+      if (figure) {
+        gl.bindVertexArray(body.vao);
+        gl.drawArrays(gl.TRIANGLES, 0, body.count);
+      }
       if (shadowAt) {
         gl.enable(gl.BLEND);
         gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);

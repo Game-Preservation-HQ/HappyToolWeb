@@ -63,6 +63,8 @@ import {
   describeVolume, describeTrap, movedVolumeRecord, rewriteStageVolumes, stageVolumeTriangles,
 } from './stage-zones.js';
 import { PLAY, PlayWorld, isCharacterLayer, newPlayer, playStep, playCamera, playWheel, shadowPoint, hudText, playDrawer } from './stage-play.js';
+import { startAvatar, avatarStep, avatarHud, avatarDrawer } from './stage-avatar.js';
+import { loadAvatar } from '../formats/avatar.js';
 import {
   EFFECTS_KEY, EFFECT_COLOUR, SOUND_COLOUR, FILTERS as EFFECT_FILTERS, effectName, movedFromFeature, effectsFeature,
   loadEffectTable, movedEffectTable, effectTableBytes, postOf, markerLines, rangeRing, oneDecimal, describeEffect,
@@ -73,6 +75,8 @@ import {
   TOP_DOWN_EYE, leftOutOfMinimap, pictureMinimap, minimapDds, stepMode, storeMinimapPicture, loadMinimapPicture, pictureDataUrl,
 } from './stage-minimap.js';
 
+// The play test's warrior, loaded once per Data folder (Avatar()): folder -> {promise, done, avatar, note}.
+const avatarJobs = new Map();
 const FOV = Math.PI / 4;
 const MAX_GRAB = 3000; // cm: a box select leaves out objects this wide or tall (MaxGrabSize), gimmicks excepted
 const SKY_RADIUS = 920; // ClipFar 1000 * 0.92 when StageCameraParam.json isn't read (ComputeSkyRenderRadius)
@@ -818,8 +822,9 @@ export function renderStage(node, ctx) {
     let tfReaim = false, tfCamSig = '', tfCtrl = false, tfSaveSeq = 0, terraformOff = () => {};
     let vp = null, viewW = 1, viewH = 1;
     const keys = new Set();
-    // The play test (set up further down): {world, p, camDist, shadow, move, run, jump} while walking the map.
-    let play = null, playGfx = null;
+    // The play test (set up further down): {world, p, avatar, camDist, shadow, move, run, jump, attack, blow, guard}
+    // while walking the map.
+    let play = null, playGfx = null, avatarGfx = null, avatarWait = false;
     let flyMul = 1; // the controller's fly speed (LB/RB), also for WASD
     let carry = null; // the object the controller carries: {o, start, surface, lift, dist, offset, twisted, sig}
     let releasePad = null;
@@ -941,7 +946,10 @@ export function renderStage(node, ctx) {
       if (lineProg) drawNav(vp, eye);
       if (lineProg) drawZones(vp, eye);
       if (lineProg) drawEffects(vp, eye);
-      if (play) (playGfx ??= playDrawer(gl)).draw(vp, play.p, play.shadow);
+      if (play) {
+        if (play.avatar) (avatarGfx ??= avatarDrawer(gl)).draw(vp, play.p, play.avatar);
+        (playGfx ??= playDrawer(gl)).draw(vp, play.p, play.shadow, !play.avatar);
+      }
       if (drawGrid) drawGrid(grid, { vp, eye, f, viewH, fov: FOV, far });
       gl.bindVertexArray(null);
       overlayDirty = true;
@@ -5706,7 +5714,7 @@ export function renderStage(node, ctx) {
     };
     function setPadHint() {
       if (play) {
-        const t = padUsed ? PLAY_PAD_HINT : PLAY_HINT;
+        const t = play.avatar ? (padUsed ? AVATAR_PAD_HINT : AVATAR_HINT) : padUsed ? PLAY_PAD_HINT : PLAY_HINT;
         if (hint.textContent !== t) hint.textContent = t;
         return;
       }
@@ -5919,6 +5927,9 @@ export function renderStage(node, ctx) {
     // editor's pieces, the gimmick table's extra collision and the gimmicks' own models.
     const PLAY_HINT = 'Play test · WASD: walk · Shift: run · Space: jump · Drag: look around · Wheel: camera distance · H / P: collision / nav lines · Esc or F5: stop';
     const PLAY_PAD_HINT = 'Play test · Left stick: walk · RB or L3: run · A: jump · Right stick: look around · B, Menu, View or D-pad up: stop';
+    // With the warrior: the game's buttons. Guard is Shift here, not the desktop's Ctrl: Ctrl+W would close the tab.
+    const AVATAR_HINT = 'Play test · WASD: walk · Space: attack · Q: strong attack · Shift: guard · Drag: look around · Wheel: camera distance · H / P: collision / nav lines · Esc or F5: stop';
+    const AVATAR_PAD_HINT = 'Play test · Left stick: walk · X: attack · Y: strong attack · LB or LT: guard · Right stick: look around · B, Menu, View or D-pad up: stop';
     const playPitch = (p) => Math.max(-1.45, Math.min(0.9, p));
     /** The triangles the player collides with (BuildPlayWorld). */
     function buildPlayWorld() {
@@ -5986,10 +5997,38 @@ export function renderStage(node, ctx) {
       if (!o) return 'stage ground';
       return `standing on ${o.label || o.name}${o.state.solid && !o.gimmick ? ' (Solid)' : ''}`;
     };
+    /** The warrior for this stage's Data folder (Avatar()), loading it the first time; null when it can't be read. */
+    function avatarJob() {
+      const parts = (ctx.filePath ?? '').split('/');
+      if (!ctx.dataFiles || parts.length < 2 || parts.at(-2).toLowerCase() !== 'stage') return null;
+      const key = parts.slice(0, -2).join('/').toLowerCase();
+      let job = avatarJobs.get(key);
+      if (!job) {
+        job = { done: false, avatar: null, note: '' };
+        job.promise = loadAvatar(ctx.dataFiles)
+          .then((r) => ((job.avatar = r.avatar ?? null), (job.note = r.note ?? '')), (e) => (job.note = String(e?.message ?? e)))
+          .finally(() => {
+            job.done = true;
+            console.info('play avatar: ' + (job.avatar ? 'warrior loaded' : 'not loaded') + (job.note ? ' — ' + job.note : ''));
+          });
+        avatarJobs.set(key, job);
+      }
+      return job;
+    }
     /** Starts playing where the view looks at the ground (StartPlay). */
     function startPlay() {
-      if (play || gdrag) return;
+      if (play || gdrag || avatarWait) return;
       if (!colRead) return flash('Reading the collision… try again in a moment');
+      const job = avatarJob();
+      if (job && !job.done) {
+        avatarWait = true;
+        flash('Loading the warrior…');
+        job.promise.then(() => {
+          avatarWait = false;
+          if (!stopped && canvas.isConnected) startPlay();
+        });
+        return;
+      }
       if (carry) dropCarry();
       if (cnMode) setCnMode(0);
       terraformOff();
@@ -6003,14 +6042,16 @@ export function renderStage(node, ctx) {
       if (!h) (d = [0, -1, 0]), (h = w.raycast(eye, d, reach));
       if (!h) return flash('Point the view at the ground to start playing there');
       const spawn = [eye[0] + d[0] * h.t, eye[1] + d[1] * h.t + 5, eye[2] + d[2] * h.t];
-      play = { world: w, p: newPlayer(spawn, Math.atan2(f[0], f[2])), camDist: PLAY.camDist, shadow: null, move: [0, 0], run: false, jump: false };
+      const avatar = job?.avatar ?? null;
+      play = { world: w, p: newPlayer(spawn, Math.atan2(f[0], f[2])), avatar, camDist: PLAY.camDist, shadow: null, move: [0, 0], run: false, jump: false, attack: false, blow: false, guard: false };
+      if (avatar) startAvatar(avatar, play.p);
       if (cam.pitch > -0.05) cam.pitch = -0.3;
       cam.pitch = playPitch(cam.pitch);
       keys.clear();
       drag = null;
       playCam();
       canvas.style.cursor = '';
-      flash(`Play mode — ${w.count.toLocaleString()} collision triangles`);
+      flash(`Play mode — ${w.count.toLocaleString()} collision triangles` + (avatar ? ' · Space / X attack, Q / Y strong attack, Shift / LB guard' : ''));
       setPadHint();
       dirty = true;
     }
@@ -6033,7 +6074,7 @@ export function renderStage(node, ctx) {
     }
     /** The camera behind the player and the shadow under it. */
     function playCam() {
-      const c = playCamera(play.world, play.p, basis().f, play.camDist);
+      const c = playCamera(play.world, play.p, basis().f, play.camDist, play.avatar ? play.avatar.height + 15 : undefined);
       play.camDist = c.camDist;
       cam.target = c.target;
       cam.dist = c.dist;
@@ -6049,7 +6090,9 @@ export function renderStage(node, ctx) {
       if (keys.has('a') || keys.has('arrowleft')) mv[0] -= 1;
       const l = Math.hypot(mv[0], mv[1]);
       if (l > 1) (mv[0] /= l), (mv[1] /= l);
-      const msg = playStep(play.world, play.p, dt, mv, keys.has('shift') || play.run, keys.has(' ') || play.jump, basis().f, cam.yaw);
+      const msg = play.avatar
+        ? avatarStep(play.world, play.avatar, play.p, dt, mv, keys.has(' ') || play.attack, keys.has('q') || play.blow, keys.has('shift') || play.guard, basis().f, cam.yaw)
+        : playStep(play.world, play.p, dt, mv, keys.has('shift') || play.run, keys.has(' ') || play.jump, basis().f, cam.yaw);
       if (msg) flash(msg);
       playCam();
       dirty = true;
@@ -6063,7 +6106,7 @@ export function renderStage(node, ctx) {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (k === 'h') return toggleCollision();
       if (k === 'p') return toggleNav();
-      if (['w', 'a', 's', 'd', 'shift', ' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) {
+      if (['w', 'a', 's', 'd', 'shift', ' ', 'q', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) {
         keys.add(k);
         e.preventDefault();
       }
@@ -6075,11 +6118,16 @@ export function renderStage(node, ctx) {
       cam.pitch = playPitch(cam.pitch + pad.ry * 2.6 * pad.dt);
       play.move = [pad.lx, pad.ly];
       play.run = pad.held(PAD.RB) || pad.held(PAD.L3);
-      play.jump = pad.held(PAD.A);
+      if (play.avatar) {
+        // As in the game: X attack, Y strong attack, LB / LT guard.
+        play.attack = pad.held(PAD.X);
+        play.blow = pad.held(PAD.Y);
+        play.guard = pad.held(PAD.LB) || pad.lt > 64 / 255;
+      } else play.jump = pad.held(PAD.A);
     }
     /** The HUD box in the top-left corner (DrawPlayHud). */
     function drawPlayHud(g2) {
-      const t = hudText(play.world, play.p, playDescribe);
+      const t = hudText(play.world, play.p, playDescribe) + (play.avatar ? avatarHud(play.avatar, play.p) : '');
       g2.font = '12px ui-monospace, Consolas, monospace';
       const w = g2.measureText(t).width + 16;
       g2.fillStyle = 'rgba(0, 0, 0, 0.55)';
