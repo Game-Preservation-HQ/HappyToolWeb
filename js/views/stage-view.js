@@ -5,6 +5,7 @@
 // The sky can be swapped for another stage's, a picture or a colour preset (slice 3, see stage-sky.js).
 // The stage's collision can be erased by hand and added to with walls, blocks, floors and ramps (see stage-colnav.js).
 import { el, button, toast, downloadBlob, pickFiles, confirmBox, debounce, openDialog } from '../ui.js';
+import { BRUSH_TOOLS, RAISE, MIN_BRUSH, MAX_BRUSH, MIN_STRENGTH, MAX_STRENGTH, BRUSH_COLOURS, stockBounds, groundPieces, coverGround, groundHeights, sculptObject, brushGroundY, brushStep, encodeSculpt, decodeSculpt } from './stage-terraform.js';
 import { decodeLayers, encodeLayers, writableLayers } from '../formats/wrappers.js';
 import { writeBres } from '../formats/bres.js';
 import {
@@ -528,6 +529,10 @@ function setUpEdits(scene, model) {
     storedFog: null, // the fog kept in this browser, until the stage's own is read
     otherFeatures: {}, // edits-file features this page doesn't edit, kept as read
     links: null, // linked objects [[object, ...], ...] once the map has read them (Ctrl+G)
+    sculpt: null, // the terraforming grid (Sculpt) once read or started
+    sculptFile: null, // the edits file's Sculpt as kept ({OriginX, …, Data}), null when nothing is terraformed
+    tfGround: null, // the ground pieces (a Set) once terraforming has looked for them
+    tfHeights: null, // the stage's ground height at each grid point (NaN off the ground)
     storedLinks: null, // the stored "links" feature, until then
     colnav: readColNav(null), // collision erased by hand and pieces added (the "colnav" feature)
     gimmickSetup: {}, // tag → {Team, Build, RamTarget, Number}: gimmicks set up differently (the "gimmickSetup" feature)
@@ -561,6 +566,7 @@ function setUpEdits(scene, model) {
       console.warn(`Map editor: the edits kept for ${edit.stage} could not be read: ${e.message}`);
     }
     edit.sky = cloneSky(stored.Sky);
+    edit.sculptFile = stored.Sculpt && typeof stored.Sculpt === 'object' && !Array.isArray(stored.Sculpt) ? stored.Sculpt : null;
     if (stored.Features && typeof stored.Features === 'object' && !Array.isArray(stored.Features)) {
       const { fog, [COLNAV_KEY]: cn, links, [SETUP_KEY]: gs, [STAGE_VOLUMES_KEY]: sv, [EFFECTS_KEY]: fx, [MINIMAP_KEY]: mm, ...rest } = stored.Features;
       edit.minimap = minimapFromFeature(mm);
@@ -653,6 +659,7 @@ export function renderStage(node, ctx) {
   const skyBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const fogBox = el('div', { class: 'stage-sky stage-fog' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const minimapBox = el('div', { class: 'stage-sky stage-fog' }, el('p', { class: 'muted' }, 'Reading the stage…'));
+  const terraformBox = el('div', { class: 'stage-sky stage-fog' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const downloadBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const modelBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const gimmickBox = el('div', { class: 'stage-gimmicks' }, el('p', { class: 'muted' }, 'Reading the stage…'));
@@ -684,14 +691,14 @@ export function renderStage(node, ctx) {
   gptLabel.hidden = true;
   const resetBtn = button('Reset view', null, { title: 'Frame the whole stage (R)' });
   // The side panel (Placement … Layers): the ☰ button hides it to give the map the room, kept for the next visit.
-  const side = el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Gimmicks'), gimmickBox, el('h3', {}, 'Collision edits'), cnBox, el('h3', {}, 'Invisible zones'), zoneBox, el('h3', {}, 'Effects and sounds'), effectBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Minimap'), minimapBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Export 3D model'), modelBox, el('h3', {}, 'Layers'), layersBox);
+  const side = el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Gimmicks'), gimmickBox, el('h3', {}, 'Collision edits'), cnBox, el('h3', {}, 'Invisible zones'), zoneBox, el('h3', {}, 'Effects and sounds'), effectBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Minimap'), minimapBox, el('h3', {}, 'Terraform'), terraformBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Export 3D model'), modelBox, el('h3', {}, 'Layers'), layersBox);
   const panelBtn = button('☰', null, { class: 'btn btn-icon' });
   const showPanel = (on) => {
     const what = on ? 'Hide the side panel' : 'Show the side panel';
     side.hidden = !on;
     panelBtn.setAttribute('aria-expanded', String(on));
     panelBtn.setAttribute('aria-label', what);
-    panelBtn.title = `${what} (Placement, Inspect, Gimmicks, Collision edits, Invisible zones, Effects and sounds, Sky, Fog, Minimap, Download, Layers)`;
+    panelBtn.title = `${what} (Placement, Inspect, Gimmicks, Collision edits, Invisible zones, Effects and sounds, Sky, Fog, Minimap, Terraform, Download, Layers)`;
   };
   panelBtn.addEventListener('click', () => {
     const on = side.hidden;
@@ -757,10 +764,12 @@ export function renderStage(node, ctx) {
     }
     const aniso = gl.getExtension('EXT_texture_filter_anisotropic');
     const edit = scene.edit || (scene.edit = setUpEdits(scene, model));
+    /** writeObject's hook: the terraforming grid on the object just placed. */
+    const tfHook = (o) => edit.sculpt && sculptObject(o, edit.sculpt, !!edit.tfGround?.has(o));
     if (!edit.gimmicksPlaced) {
       // The gimmick meshes hold their models unturned: place them by their state once.
       edit.gimmicksPlaced = true;
-      for (const o of edit.objects) if (o.gimmick) writeObject(o);
+      for (const o of edit.objects) if (o.gimmick) writeObject(o, tfHook);
     }
     const gpu = new Map(scene.meshes.map((m) => [m, uploadMesh(gl, m)]));
     const glTex = new Map([...scene.textures].map(([k, img]) => [k, uploadTexture(gl, img, aniso)]));
@@ -803,13 +812,16 @@ export function renderStage(node, ctx) {
     // The invisible zones' panel, lines and labels (set up with the gimmicks, below).
     let zoneRefresh = () => {}, drawZones = () => {}, drawZoneLabels = () => {};
     let effectRefresh = () => {}, drawEffects = () => {}, drawEffectLabels = () => {}, effectToolOff = () => {};
+    // Terraforming (set up further down): the brush, the stroke and where the brush aims.
+    let tfOn = false, tfTool = RAISE, tfRadius = 900, tfStrength = 1, tfStroke = null, tfPoint = null, tfAim = null;
+    let tfReaim = false, tfCamSig = '', tfCtrl = false, tfSaveSeq = 0, terraformOff = () => {};
     let vp = null, viewW = 1, viewH = 1;
     const keys = new Set();
     let flyMul = 1; // the controller's fly speed (LB/RB), also for WASD
     let carry = null; // the object the controller carries: {o, start, surface, lift, dist, offset, twisted, sig}
     let releasePad = null;
     let last = performance.now();
-    const saveSoon = debounce(() => store(edit.stage, edit.objects, edit.sky, fogFeatures(edit), gimmickEdits(edit)), 250);
+    const saveSoon = debounce(() => store(edit.stage, edit.objects, edit.sky, fogFeatures(edit), gimmickEdits(edit), edit.sculptFile), 250);
 
     function framed(b, from) {
       return { yaw: from.yaw, pitch: from.pitch, target: centre(b), dist: (radius(b) / Math.sin(FOV / 2)) * 1.05 };
@@ -1024,6 +1036,7 @@ export function renderStage(node, ctx) {
       drawZoneLabels(g2);
       drawEffectLabels(g2);
       if (cnMode) drawCnOverlay(g2);
+      if (tfOn) drawTfOverlay(g2);
       // The axis indicator sits in the bottom-left corner, above the hint line that runs along the bottom.
       if (grid.axes) drawAxisIndicator(g2, hint.offsetParent ? hint.offsetTop - overlay.offsetTop : overlay.clientHeight, basis());
       if (boxDrag?.moved) {
@@ -1196,7 +1209,7 @@ export function renderStage(node, ctx) {
     /** Places an object and sends its vertices to the GPU. */
     function apply(o, st) {
       o.state = st;
-      writeObject(o);
+      writeObject(o, tfHook);
       const g = gpu.get(o.mesh), a = o.firstVertex * 3, z = (o.firstVertex + o.vertexCount) * 3;
       gl.bindBuffer(gl.ARRAY_BUFFER, g.pos);
       gl.bufferSubData(gl.ARRAY_BUFFER, a * 4, o.mesh.positions.subarray(a, z));
@@ -1415,9 +1428,11 @@ export function renderStage(node, ctx) {
       renderColInfo();
     }
 
-    function saveFile() {
-      const file = editsFile(edit.stage, edit.objects, edit.sky, fogFeatures(edit), gimmickEdits(edit));
-      if (!Object.keys(file.Objects).length && !file.Sky && !file.Features && !file.Gimmicks) return toast('There are no edits to save yet.');
+    async function saveFile() {
+      tfEnd();
+      const sculpt = edit.sculpt ? await encodeSculpt(edit.sculpt) : edit.sculptFile;
+      const file = editsFile(edit.stage, edit.objects, edit.sky, fogFeatures(edit), gimmickEdits(edit), sculpt);
+      if (!Object.keys(file.Objects).length && !file.Sky && !file.Features && !file.Gimmicks && !file.Sculpt) return toast('There are no edits to save yet.');
       downloadBlob(new Blob([JSON.stringify(file, null, 2)], { type: 'application/json' }), `${edit.stage}.json`);
     }
     async function loadFile() {
@@ -1519,6 +1534,21 @@ export function renderStage(node, ctx) {
           skyNote += ` Collision: ${e.toLocaleString()} triangle${e === 1 ? '' : 's'} erased, ${n} piece${n === 1 ? '' : 's'} added.`;
         }
       }
+      // The file's terraforming (Sculpt) replaces this.
+      if (res.sculpt) {
+        try {
+          const s = await decodeSculpt(res.sculpt);
+          if (s) {
+            edit.tfGround ??= groundPieces(edit.objects);
+            const before = { sculpt: edit.sculpt, heights: edit.tfHeights }, after = { sculpt: s, heights: groundHeights(s, edit.tfGround) };
+            setSculpt(after);
+            acts.push({ undo: () => setSculpt(before), redo: () => setSculpt(after) });
+            skyNote += ` Terraforming: a ${s.width} × ${s.depth} grid.`;
+          }
+        } catch (e) {
+          skyNote += ` The terraforming can't be read (${e.message}).`;
+        }
+      }
       const action = acts.length
         ? { undo: () => acts.slice().reverse().forEach((a) => a.undo()), redo: () => acts.forEach((a) => a.redo()) }
         : null;
@@ -1544,6 +1574,7 @@ export function renderStage(node, ctx) {
       const dt = Math.min(0.1, (now - last) / 1000);
       last = now;
       if (fly(dt)) dirty = true;
+      if (tfOn) tfFrame(dt);
       if (dirty) {
         dirty = false;
         draw();
@@ -1557,7 +1588,7 @@ export function renderStage(node, ctx) {
       releasePad?.();
       menu?.dispose();
       if (carry) cancelCarry(); // a carried object goes back to where it was picked up
-      store(edit.stage, edit.objects, edit.sky, fogFeatures(edit), gimmickEdits(edit));
+      store(edit.stage, edit.objects, edit.sky, fogFeatures(edit), gimmickEdits(edit), edit.sculptFile);
       if (edit.navMatch && !edit.navMatch.done) {
         // Unfinished (the worker running, or the nav still being read): the next view starts it again.
         edit.navMatch.worker?.terminate();
@@ -3907,7 +3938,7 @@ export function renderStage(node, ctx) {
       if (mode === cnMode) return;
       const why = mode ? cnBlocked(mode) : null;
       if (why) return flash(why);
-      if (mode) effectToolOff();
+      if (mode) effectToolOff(), terraformOff();
       cnStrokeEnd();
       const was = cnMode;
       cnMode = mode;
@@ -4747,6 +4778,7 @@ export function renderStage(node, ctx) {
       if (on && !fxTable) return (status.textContent = 'This stage has no effect table the editor found');
       if (on) {
         if (cnMode) setCnMode(0);
+        terraformOff();
         select(null);
         showEffects();
       } else cancelEffectDrag();
@@ -5185,7 +5217,7 @@ export function renderStage(node, ctx) {
         const [o] = collectObjects([m]);
         o.index = edit.objects.length; // after the stage's: its collision and nav owners are numbered by object
         setUpGimmick(o);
-        writeObject(o);
+        writeObject(o, tfHook);
         scene.meshes.push(m);
         meshGpu(m);
         edit.objects.push(o);
@@ -5384,6 +5416,7 @@ export function renderStage(node, ctx) {
         drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, pan: e.shiftKey, moved: false, fx: true };
         return;
       }
+      if (tfOn && e.button === 0) return tfBegin(local(e), e.ctrlKey || e.metaKey ? -1 : 1);
       if (cnMode && e.button === 0) return cnPointerDown(local(e), e.shiftKey);
       if (e.button === 0 && !gdrag) {
         const p = local(e), handle = gizmoHit(p);
@@ -5393,7 +5426,7 @@ export function renderStage(node, ctx) {
           return;
         }
       }
-      drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, pan: cnMode ? e.button === 1 : e.button !== 0 || e.shiftKey, moved: false };
+      drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, pan: cnMode || tfOn ? e.button === 1 : e.button !== 0 || e.shiftKey, moved: false };
     });
     canvas.addEventListener('pointermove', (e) => {
       if (fxDrag) return effectDragMove(local(e));
@@ -5405,6 +5438,7 @@ export function renderStage(node, ctx) {
         overlayDirty = true;
         return;
       }
+      if (tfOn && !drag) return tfPointerMove(local(e), e.ctrlKey || e.metaKey);
       if (cnMode && !drag) return cnPointerMove(local(e), e.shiftKey);
       if (!drag && fxShow.on) effectHover(local(e));
       if (!drag && fxTool) return;
@@ -5434,6 +5468,7 @@ export function renderStage(node, ctx) {
     canvas.addEventListener('pointerup', (e) => {
       if (fxDrag) return effectDragEnd();
       if (gdrag) return endGizmo();
+      if (tfStroke) return tfEnd();
       if (cnStroke) return cnStrokeEnd();
       if (boxDrag) {
         const b = boxDrag;
@@ -5455,12 +5490,13 @@ export function renderStage(node, ctx) {
       cancelEffectDrag();
       if (gdrag) cancelDrag();
       cnStrokeEnd();
+      tfEnd();
       drag = null;
       boxDrag = null;
       overlayDirty = true;
     });
     canvas.addEventListener('dblclick', (e) => {
-      if (cnMode) return;
+      if (cnMode || tfOn) return;
       const p = local(e);
       const { o, d } = rayAt(p.x, p.y);
       const hit = pick(scene, o, d);
@@ -5478,6 +5514,7 @@ export function renderStage(node, ctx) {
       (e) => {
         e.preventDefault();
         if (fxTool && fxSel && !e.altKey) return effectWheel(e);
+        if (tfOn && !e.altKey) return tfWheel(e);
         if (cnMode && cnMode !== 4 && !e.altKey) return cnWheel(e);
         cam.dist = Math.max(near(), cam.dist * Math.exp(e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0015)));
         dirty = true;
@@ -5490,6 +5527,7 @@ export function renderStage(node, ctx) {
       if (ctrl && !e.altKey && (k === 'z' || k === 'y')) {
         e.preventDefault();
         cnStrokeEnd();
+        tfEnd();
         if (k === 'y' || e.shiftKey) redo();
         else undo();
         return;
@@ -5497,6 +5535,10 @@ export function renderStage(node, ctx) {
       if (k === 'f3' && !ctrl) {
         e.preventDefault();
         return setCnMode(cnMode ? 0 : colRead?.live ? 1 : 2);
+      }
+      if (k === 'f2' && !ctrl) {
+        e.preventDefault();
+        return setTerraform(!tfOn);
       }
       if (ctrl && !e.altKey && !e.shiftKey && k === 'd') {
         e.preventDefault();
@@ -5510,6 +5552,7 @@ export function renderStage(node, ctx) {
         e.preventDefault();
         return openMenu();
       }
+      if (tfOn && !ctrl && !e.altKey && tfKey(k)) return e.preventDefault();
       if (fxTool && !ctrl && !e.altKey && effectKey(e, k)) return e.preventDefault();
       // J shows the effects and sounds, Shift+J is their move tool.
       if (k === 'j' && !ctrl && !e.altKey && (e.shiftKey || !cnMode)) {
@@ -5602,6 +5645,11 @@ export function renderStage(node, ctx) {
     };
     function setPadHint() {
       if (cnMode) return;
+      if (tfOn) {
+        const t = tfHint();
+        if (hint.textContent !== t) hint.textContent = t;
+        return;
+      }
       const t = padUsed ? (carry ? CARRY_HINT : PAD_HINT) : baseHint;
       if (hint.textContent !== t) hint.textContent = t;
     }
@@ -5758,6 +5806,7 @@ export function renderStage(node, ctx) {
     }
     function padFree(pad) {
       padFlyLook(pad);
+      if (tfOn) return padTerraform(pad);
       if (cnMode) {
         // The collision & nav editor keeps its own keys; the pad flies, looks and can leave it with B.
         if (pad.edge(PAD.B)) canvas.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
@@ -5865,6 +5914,354 @@ export function renderStage(node, ctx) {
       gridChanged();
     }
 
+    // ----- terraforming (Edit/StageTerraform.cs, F2): raise, lower, smooth, flatten and restore the ground with a brush -----
+    const TF_REACH = 80000; // how far away the brush still finds the ground (AimGround)
+    const tfM = (u) => String(Math.round(u / 10) / 10);
+    const tfStatus = () => `${BRUSH_TOOLS[tfTool]}  ·  ${tfM(tfRadius)} m  ·  ${tfStrength.toFixed(2)}×`;
+    const tfChangedGround = () => (edit.sculpt ? !edit.sculpt.isEmpty : !!edit.sculptFile);
+    const tfHint = () =>
+      padUsed
+        ? `Terraform · A: ${tfTool === RAISE ? 'raise · X: lower' : BRUSH_TOOLS[tfTool].toLowerCase()} · R3: brush · LB/RB: size · D-pad up/down: strength · D-pad left/right: undo/redo · Y: options · B: done`
+        : `Terraform · ${tfTool === RAISE ? 'Drag: raise · Ctrl+drag: lower' : `Drag: ${BRUSH_TOOLS[tfTool].toLowerCase()}`} · 1-4: brush · Wheel or [ ]: size · Ctrl+wheel or - +: strength · Right-drag: orbit · Middle-drag: pan · O: options · F2/Esc: done · Ctrl+Z/Y: undo/redo`;
+    /** The grid over the ground and the ground's height under it (EnsureSculpt); false when the stage has no ground. */
+    function tfEnsure() {
+      edit.tfGround ??= groundPieces(edit.objects);
+      if (!edit.tfGround.size) return false;
+      if (!edit.sculpt) {
+        edit.sculpt = coverGround(edit.tfGround);
+        edit.tfHeights = null;
+        if (!edit.sculpt) return false;
+      }
+      if (!edit.tfHeights) {
+        const t0 = performance.now();
+        edit.tfHeights = groundHeights(edit.sculpt, edit.tfGround);
+        const g = edit.sculpt;
+        console.info(`Map editor: terraforming: ${edit.tfGround.size} ground pieces, a ${g.width} × ${g.depth} grid every ${tfM(g.cell)} m (${Math.round(performance.now() - t0)} ms)`);
+      }
+      return true;
+    }
+    function setTerraform(on) {
+      if (on === tfOn) return;
+      if (on) {
+        if (edit.sculptJob && !edit.sculpt && !edit.sculptBroken) {
+          flash('Reading the terraforming kept for this stage…');
+          edit.sculptJob.then(() => !stopped && !tfOn && setTerraform(true));
+          return;
+        }
+        if (carry) dropCarry();
+        if (cnMode) setCnMode(0);
+        effectToolOff();
+        if (!tfEnsure()) return flash('This stage has no ground pieces to terraform');
+        if (gdrag) cancelDrag();
+        select(null);
+        tfOn = true;
+        tfReaim = true;
+        canvas.style.cursor = 'crosshair';
+        flash(`Terraforming — ${BRUSH_TOOLS[tfTool]}`);
+      } else {
+        tfEnd();
+        tfOn = false;
+        tfAim = null;
+        canvas.style.cursor = '';
+        hint.textContent = baseHint;
+        flash('Terraforming off');
+      }
+      edit.history.breakMerge();
+      setPadHint();
+      renderTerraform();
+      if (menu?.isOpen) menu.refresh();
+      dirty = overlayDirty = true;
+    }
+    terraformOff = () => setTerraform(false);
+    /** Where the brush is: the ground under the pointer (or the middle of the view on the controller). */
+    function tfAimNow() {
+      const p = tfPoint || { x: canvas.clientWidth / 2, y: canvas.clientHeight / 2 };
+      const { o, d } = rayAt(p.x, p.y);
+      const hit = pick(scene, o, d);
+      return hit && hit.dist <= TF_REACH ? hit.point : null;
+    }
+    function tfPointerMove(p, ctrl) {
+      tfPoint = p;
+      tfReaim = true;
+      if (ctrl !== tfCtrl) (tfCtrl = ctrl), (overlayDirty = true);
+    }
+    /** Each frame: aims again when the pointer or the view moved (every frame while stroking), and brushes. */
+    function tfFrame(dt) {
+      const sig = `${cam.yaw},${cam.pitch},${cam.dist},${cam.target.join(',')}`;
+      if (sig !== tfCamSig) (tfCamSig = sig), (tfReaim = true);
+      if (tfStroke || tfReaim) {
+        tfReaim = false;
+        const at = tfAimNow();
+        if (at || !tfStroke) tfAim = at;
+        overlayDirty = true;
+      }
+      if (tfStroke && tfAim) tfApply(dt);
+    }
+    function tfApply(dt) {
+      const s = tfStroke, g = edit.sculpt;
+      const rg = brushStep(g, edit.tfHeights, s.tool, s.dir, tfAim, tfRadius, tfStrength, dt, s.flattenTo);
+      if (!rg) return;
+      s.rg = s.rg ? { ax: Math.min(s.rg.ax, rg.ax), bx: Math.max(s.rg.bx, rg.bx), az: Math.min(s.rg.az, rg.az), bz: Math.max(s.rg.bz, rg.bz) } : rg;
+      tfRefresh(g.box(rg));
+    }
+    /** Writes again the objects over a world box (RefreshSculpted): the ground pieces and what rides on them. */
+    function tfRefresh([x0, z0, x1, z1]) {
+      for (const o of edit.objects) {
+        if (o.state.hidden) continue;
+        const b = o.bounds ?? stockBounds(o);
+        if (!b || b.max[0] < x0 || b.min[0] > x1 || b.max[2] < z0 || b.min[2] > z1) continue;
+        apply(o, o.state);
+      }
+    }
+    function tfRefreshAll() {
+      for (const o of edit.objects) if (!o.state.hidden) apply(o, o.state);
+    }
+    /** BeginStroke: a press on the ground starts one undo step; flatten levels to the height pressed on. */
+    function tfBegin(p, dir, pad = null) {
+      tfEnd();
+      if (p) tfPoint = p;
+      tfAim = tfAimNow();
+      overlayDirty = true;
+      if (!tfAim) return flash('Point at the ground to terraform it');
+      tfStroke = { tool: tfTool, dir: tfTool === RAISE ? dir : 1, before: edit.sculpt.delta.slice(), rg: null, flattenTo: tfAim[1], pad };
+    }
+    /** EndStroke: the points the stroke changed, before and after, as one undo step. */
+    function tfEnd() {
+      const s = tfStroke;
+      tfStroke = null;
+      if (!s?.rg) return;
+      const g = edit.sculpt, rg = s.rg;
+      const before = g.copy(rg, s.before), after = g.copy(rg);
+      if (before.every((v, i) => v === after[i])) return;
+      const box = g.box(rg);
+      const put = (v) => {
+        g.paste(rg, v);
+        if (edit.sculpt === g) tfRefresh(box), tfSave(), renderTerraform();
+      };
+      const label = s.tool === RAISE ? (s.dir < 0 ? 'Lower ground' : 'Raise ground') : ['', 'Smooth ground', 'Flatten ground', 'Restore ground'][s.tool];
+      edit.history.push([], label, null, { undo: () => put(before), redo: () => put(after) });
+      edit.history.breakMerge();
+      tfSave();
+      edited();
+      renderTerraform();
+    }
+    /** Keeps the grid with the edits in this browser (as the edits file's Sculpt), the newest one winning. */
+    function tfSave() {
+      const seq = ++tfSaveSeq;
+      encodeSculpt(edit.sculpt).then(
+        (e) => {
+          if (seq !== tfSaveSeq) return;
+          edit.sculptFile = e;
+          saveSoon();
+          if (!stopped) renderTerraform();
+        },
+        (e) => console.warn(`Map editor: the terraforming could not be kept: ${e.message}`),
+      );
+    }
+    /** Puts in a whole grid (an edits file's, or back as it was): every object is written again. */
+    function setSculpt({ sculpt, heights }) {
+      tfStroke = null;
+      edit.sculpt = sculpt;
+      edit.tfHeights = heights;
+      edit.sculptBroken = false;
+      if (!sculpt && tfOn) setTerraform(false);
+      tfRefreshAll();
+      tfSave();
+      renderTerraform();
+    }
+    function tfClear() {
+      tfEnd();
+      const g = edit.sculpt;
+      if (!g || g.isEmpty) return flash('Nothing is terraformed');
+      const before = g.delta.slice(), after = new Float32Array(before.length);
+      const put = (v) => {
+        g.delta.set(v);
+        if (edit.sculpt === g) tfRefreshAll(), tfSave(), renderTerraform();
+      };
+      put(after);
+      edit.history.push([], 'Clear terraforming', null, { undo: () => put(before), redo: () => put(after) });
+      edit.history.breakMerge();
+      edited();
+      flash('Terraforming cleared');
+    }
+    function tfChanged(msg) {
+      flash(msg ?? tfStatus());
+      setPadHint();
+      renderTerraform();
+      if (menu?.isOpen) menu.refresh();
+      overlayDirty = true;
+    }
+    function tfSetTool(t) {
+      tfEnd();
+      tfTool = ((t % BRUSH_TOOLS.length) + BRUSH_TOOLS.length) % BRUSH_TOOLS.length;
+      tfChanged();
+    }
+    const tfSetRadius = (r) => {
+      tfRadius = Math.max(MIN_BRUSH, Math.min(MAX_BRUSH, Math.round(r)));
+      tfChanged();
+    };
+    const tfSetStrength = (v) => {
+      tfStrength = Math.max(MIN_STRENGTH, Math.min(MAX_STRENGTH, Math.round(v * 100) / 100));
+      tfChanged();
+    };
+    const tfSize = (n) => tfSetRadius(tfRadius * 1.15 ** n);
+    const tfStrengthStep = (n) => tfSetStrength(tfStrength + n * 0.25);
+    /** The wheel sizes the brush; with Ctrl it sets the strength. */
+    function tfWheel(e) {
+      const n = -e.deltaY / (e.deltaMode === 1 ? 3 : e.deltaMode === 2 ? 1 : 100);
+      const steps = Math.sign(n) * Math.max(1, Math.round(Math.abs(n)));
+      if (!steps) return;
+      if (e.ctrlKey || e.metaKey) tfStrengthStep(steps);
+      else tfSize(steps);
+    }
+    /** Terraforming's keys; true when the key was one of them. */
+    function tfKey(k) {
+      if (k === 'escape') return setTerraform(false), true;
+      if (k.length === 1 && k >= '1' && k <= '4') return tfSetTool(Number(k) - 1), true;
+      if (k === '[' || k === ']') return tfSize(k === ']' ? 1 : -1), true;
+      if (k === '-' || k === '_') return tfStrengthStep(-1), true;
+      if (k === '=' || k === '+') return tfStrengthStep(1), true;
+      if (k === 'o') return tfEnd(), menu?.open(tfPage), true;
+      return k === 'delete' || k === 'home'; // nothing is selected to delete or put back
+    }
+    /** The controller while terraforming: the brush is in the middle of the view. */
+    function padTerraform(pad) {
+      if (padUsed) tfPoint = null;
+      if (tfStroke?.pad) {
+        if (!pad.held(tfStroke.pad)) tfEnd();
+      } else if (pad.edge(PAD.A)) tfBegin(null, 1, PAD.A);
+      else if (pad.edge(PAD.X) && tfTool === RAISE) tfBegin(null, -1, PAD.X);
+      if (pad.edge(PAD.B)) return setTerraform(false);
+      if (pad.edge(PAD.Y)) return tfEnd(), menu?.open(tfPage);
+      if (pad.edge(PAD.R3)) tfSetTool(tfTool + 1);
+      if (padRepeat('tf-lb', pad.held(PAD.LB))) tfSize(-1);
+      if (padRepeat('tf-rb', pad.held(PAD.RB))) tfSize(1);
+      if (padRepeat('tf-up', pad.held(PAD.UP))) tfStrengthStep(1);
+      if (padRepeat('tf-down', pad.held(PAD.DOWN))) tfStrengthStep(-1);
+      if (pad.edge(PAD.LEFT)) tfEnd(), undo();
+      else if (pad.edge(PAD.RIGHT)) tfEnd(), redo();
+    }
+    /** The brush (DrawBrush): rings at its size and half of it over the ground, and an arrow up or down. */
+    function drawTfOverlay(g2) {
+      if (!tfAim || menu?.isOpen) return;
+      const lowering = tfTool === RAISE && (tfStroke ? tfStroke.dir < 0 : tfCtrl);
+      const c = BRUSH_COLOURS[tfTool === RAISE ? (lowering ? 'lower' : 'raise') : tfTool];
+      const [x, y, z] = tfAim, g = edit.sculpt, h = edit.tfHeights;
+      const colour = (k) => `rgb(${Math.round(c[0] * k)} ${Math.round(c[1] * k)} ${Math.round(c[2] * k)} / 0.95)`;
+      g2.save();
+      const ring = (r, width, k) => {
+        g2.strokeStyle = colour(k);
+        g2.lineWidth = width;
+        g2.beginPath();
+        let open = false;
+        for (let i = 0; i <= 64; i++) {
+          const a = (i / 64) * 2 * Math.PI, px = x + Math.cos(a) * r, pz = z + Math.sin(a) * r;
+          const p = project([px, brushGroundY(g, h, px, pz, y) + 8, pz]);
+          if (!p) {
+            open = false;
+            continue;
+          }
+          if (open) g2.lineTo(p.x, p.y);
+          else g2.moveTo(p.x, p.y);
+          open = true;
+        }
+        g2.stroke();
+      };
+      ring(tfRadius, 2.5, 1);
+      ring(tfRadius / 2, 1.2, 0.75);
+      const len = Math.max(120, tfRadius * 0.25), a = project([x, y, z]), b = project([x, y + (lowering ? -len : len), z]);
+      if (a && b) {
+        g2.strokeStyle = colour(1);
+        g2.lineWidth = 2;
+        g2.beginPath();
+        g2.moveTo(a.x, a.y);
+        g2.lineTo(b.x, b.y);
+        g2.stroke();
+      }
+      g2.restore();
+    }
+    // Ctrl held shows the brush lowering before the press.
+    const tfCtrlKey = (e) => {
+      if (e.key !== 'Control' && e.key !== 'Meta') return;
+      const on = e.type === 'keydown';
+      if (on !== tfCtrl) (tfCtrl = on), (overlayDirty = true);
+    };
+    canvas.addEventListener('keydown', tfCtrlKey);
+    canvas.addEventListener('keyup', tfCtrlKey);
+    canvas.addEventListener('blur', () => (tfCtrl = false));
+    // The side panel.
+    const tfLine = el('p', { class: 'muted' });
+    const tfToolSel = el('select', { class: 'input input-sm', 'aria-label': 'Brush' }, ...BRUSH_TOOLS.map((n, i) => el('option', { value: String(i) }, n)));
+    tfToolSel.addEventListener('change', () => tfSetTool(Number(tfToolSel.value)));
+    const tfSizeIn = el('input', { type: 'number', class: 'input input-sm', min: String(MIN_BRUSH / 100), max: String(MAX_BRUSH / 100), step: '0.5', 'aria-label': 'Brush size, in metres' });
+    tfSizeIn.addEventListener('change', () => Number(tfSizeIn.value) > 0 && tfSetRadius(Number(tfSizeIn.value) * 100));
+    const tfStrIn = el('input', { type: 'number', class: 'input input-sm', min: String(MIN_STRENGTH), max: String(MAX_STRENGTH), step: '0.25', 'aria-label': 'Brush strength' });
+    tfStrIn.addEventListener('change', () => Number(tfStrIn.value) > 0 && tfSetStrength(Number(tfStrIn.value)));
+    const tfOnBtn = button('Terraform', () => setTerraform(!tfOn), { title: 'F2' });
+    const tfClearBtn = button('Clear all', () => tfClear(), { title: "Every change back to the stage's own ground (undo brings it back)" });
+    const tfNote = el('p', { class: 'muted' }, "Kept with the edits (Save edits… writes it, as the desktop HappyTool reads it). The bundle download doesn't write the terraforming yet.");
+    function renderTerraform() {
+      const ground = (edit.tfGround ??= groundPieces(edit.objects));
+      if (!ground.size) return terraformBox.replaceChildren(el('p', { class: 'muted' }, 'This stage has no ground pieces to terraform.'));
+      const changed = tfChangedGround();
+      tfLine.textContent = `${plural(ground.size, 'ground piece')} · ${changed ? 'Ground changed' : 'Ground as the stage has it'}${tfOn ? ' · terraforming' : ''}`;
+      if (document.activeElement !== tfToolSel) tfToolSel.value = String(tfTool);
+      if (document.activeElement !== tfSizeIn) tfSizeIn.value = tfM(tfRadius);
+      if (document.activeElement !== tfStrIn) tfStrIn.value = tfStrength.toFixed(2);
+      tfOnBtn.textContent = tfOn ? 'Stop terraforming' : 'Terraform';
+      tfClearBtn.disabled = !edit.sculpt || !changed;
+      if (!terraformBox.contains(tfLine))
+        terraformBox.replaceChildren(
+          tfLine,
+          el('label', { class: 'stage-fog-row' }, 'Brush', tfToolSel),
+          el('label', { class: 'stage-fog-row' }, 'Size (m)', tfSizeIn),
+          el('label', { class: 'stage-fog-row' }, 'Strength', tfStrIn),
+          el('div', { class: 'toolbar' }, tfOnBtn, tfClearBtn),
+          tfNote,
+        );
+    }
+    // The menu's Terraform page (the desktop's options page: O or Y while terraforming).
+    const tfPage = {
+      title: 'Terraform',
+      status: () => `${tfStatus()}  ·  ${tfChangedGround() ? 'Ground changed' : 'Ground as the stage has it'}`,
+      items: () => [
+        {
+          text: 'Brush',
+          value: () => BRUSH_TOOLS[tfTool],
+          activate: () => tfSetTool(tfTool + 1),
+          adjust: (dir) => tfSetTool(tfTool + dir),
+          desc: 'Raise / lower moves the ground up (or down with Ctrl or X); Smooth evens it out; Flatten levels it to where the stroke began; Restore puts it back as the stage has it.',
+        },
+        { text: 'Brush size', value: () => `${tfM(tfRadius)} m`, activate: () => tfSize(1), adjust: (dir) => tfSize(dir), desc: 'LB / RB or the mouse wheel.' },
+        { text: 'Strength', value: () => `${tfStrength.toFixed(2)}×`, activate: () => tfStrengthStep(1), adjust: (dir) => tfStrengthStep(dir), desc: 'D-pad up / down or Ctrl + wheel.' },
+        { text: 'Clear all terraforming', enabled: () => !!edit.sculpt && !edit.sculpt.isEmpty, activate: () => tfClear(), desc: "Every change back to the stage's own ground (undo brings it back)." },
+        { text: tfOn ? 'Stop terraforming' : 'Start terraforming', activate: closeThen(() => setTerraform(!tfOn)), desc: 'F2 / B' },
+        { text: 'Map editor menu…', activate: () => menu.push(mainPage), desc: 'The rest of the map editor.' },
+      ],
+    };
+    // The terraforming kept in this browser: read once per stage, then shown on the map.
+    if (edit.sculptFile && !edit.sculpt && !edit.sculptJob)
+      edit.sculptJob = decodeSculpt(edit.sculptFile).then(
+        (s) => {
+          if (!s) return void (edit.sculptBroken = true);
+          edit.tfGround ??= groundPieces(edit.objects);
+          edit.sculpt = s;
+          edit.tfHeights = groundHeights(s, edit.tfGround);
+          console.info(`Map editor: terraforming kept for ${edit.stage}: a ${s.width} × ${s.depth} grid`);
+        },
+        (e) => {
+          edit.sculptBroken = true;
+          console.warn(`Map editor: the terraforming kept for ${edit.stage} can't be read: ${e.message}`);
+        },
+      );
+    edit.sculptJob?.then(() => {
+      if (stopped || edit.sculptShown || !edit.sculpt) return;
+      edit.sculptShown = true;
+      tfRefreshAll();
+      renderTerraform();
+    });
+    renderTerraform();
+
     // ----- the menu (GUI/Forge/ForgeMenu.cs): controller Menu, F10, or Esc with nothing selected -----
     menu = forgeMenu(host, { onClose: () => !stopped && canvas.focus({ preventScroll: true }) });
     const onOff = (v) => (v ? 'on' : 'off');
@@ -5875,7 +6272,8 @@ export function renderStage(node, ctx) {
     function openMenu() {
       if (cnMode) return toast('Leave the collision & nav editor first (F3).');
       if (carry) dropCarry();
-      menu?.open(mainPage);
+      tfEnd();
+      menu?.open(tfOn ? tfPage : mainPage);
     }
     const mainPage = {
       title: 'Map editor',
@@ -5905,6 +6303,7 @@ export function renderStage(node, ctx) {
           ? { text: 'Gimmick paths', value: () => onOff(gptBox.checked), activate: toggleGpt, desc: "The routes moving gimmicks follow (Rainbow's rafts …). A raft path's ends follow their harbours when you move them; the bundle download writes the moved paths" }
           : null,
         { text: 'Collision & nav editor', activate: closeThen(() => setCnMode(colRead?.live ? 1 : 2)), desc: 'Erase or add collision, paint nav, edit waypoints (F3)' },
+        { text: tfOn ? 'Stop terraforming' : 'Terraform', activate: closeThen(() => setTerraform(!tfOn)), desc: 'Raise, lower, smooth and flatten the ground with a brush (F2)' },
         fxTable
           ? { text: 'Effects and sounds', value: () => onOff(fxShow.on), activate: toggleEffects, desc: 'Where the stage plays its particle effects and sounds (J)' }
           : null,
@@ -5971,6 +6370,7 @@ export function renderStage(node, ctx) {
         cmd('Undo', 'Ctrl+Z', press('z', { ctrlKey: true })),
         cmd('Redo', 'Ctrl+Y', press('y', { ctrlKey: true })),
         cmd(cnMode ? 'Leave the collision & nav editor' : 'Collision & nav editor', 'F3', press('F3'), 'Erase or add collision, paint nav, edit waypoints'),
+        cmd(tfOn ? 'Stop terraforming' : 'Terraform', 'F2', press('F2'), 'Raise, lower, smooth and flatten the ground with a brush'),
         cmd('Collision lines on or off', 'H', press('h')),
         cmd('Nav lines on or off', 'P', press('p')),
         cmd('Frame the selected object', 'F', press('f')),
@@ -5982,7 +6382,15 @@ export function renderStage(node, ctx) {
         cmd('Add to the selection', 'Ctrl+click, Ctrl+drag', () => canvas.focus(), 'Ctrl+click adds or takes out one object, Ctrl+drag a box of them (Ctrl+Shift+drag takes them out)'),
         cmd('Fly the camera', 'W A S D  Q E', () => canvas.focus(), 'Click the map, then hold the keys; drag to look, wheel to zoom'),
       ];
-      if (cnMode) {
+      if (tfOn) {
+        BRUSH_TOOLS.forEach((n, i) => list.push(cmd(`${n} brush`, String(i + 1), press(String(i + 1)))));
+        list.push(
+          cmd('Bigger or smaller brush', '] [', () => canvas.focus(), 'Or the mouse wheel'),
+          cmd('Stronger or weaker brush', '+ -', () => canvas.focus(), 'Or Ctrl + the mouse wheel'),
+          cmd('Terraform options', 'O', press('o')),
+          cmd('Stop terraforming', 'Esc', press('Escape')),
+        );
+      } else if (cnMode) {
         CN_NAMES.slice(1).forEach((n, i) => list.push(cmd(`${n} tool`, String(i + 1), press(String(i + 1)))));
         list.push(cmd('Next tool', 'Tab', press('Tab')), cmd('Leave the tool or deselect', 'Esc', press('Escape')));
       } else {

@@ -218,8 +218,9 @@ export function shortObjectName(name) {
 /**
  * Rewrites an object's vertices in its mesh from the baked copy, placed by its state (UpdateObjectVertices). A hidden
  * object collapses to its pivot, so its triangles draw and pick nothing. Updates the object's and the mesh's bounds.
+ * after(o), when given, changes the written vertices before the bounds are taken (the terraforming).
  */
-export function writeObject(o) {
+export function writeObject(o, after = null) {
   const m = o.mesh;
   if (!m.baked) m.baked = { positions: m.positions.slice(), normals: m.normals.slice() };
   const P = m.baked.positions, N = m.baked.normals, pos = m.positions, nrm = m.normals;
@@ -251,6 +252,7 @@ export function writeObject(o) {
     nrm[i + 1] = ay / l;
     nrm[i + 2] = az / l;
   }
+  after?.(o);
   o.bounds = boundsOf(pos, o.firstVertex, o.vertexCount);
   for (let k = 0; k < 3; k++) {
     m.bounds.min[k] = Math.min(m.bounds.min[k], o.bounds.min[k]);
@@ -302,9 +304,9 @@ export const stageKey = (name) => name.replace(/\\/g, '/').split('/').pop().repl
 
 /**
  * The edits in the desktop sidecar's shape: {Version, Stage, Objects: {index: {Name, Translate, Rotate?, Scale?, Pivot?,
- * Deleted, Solid?}}, Sky?}; a sky makes it version 5, as the desktop writes it.
+ * Deleted, Solid?}}, Sky?, Sculpt?}; a sky or terraforming makes it version 5, as the desktop writes it.
  */
-export function editsFile(stage, objects, sky = null, features = null, gimmicks = null) {
+export function editsFile(stage, objects, sky = null, features = null, gimmicks = null, sculpt = null) {
   const Objects = {};
   let solid = false;
   for (const o of objects) {
@@ -320,8 +322,9 @@ export function editsFile(stage, objects, sky = null, features = null, gimmicks 
   }
   const hasFeatures = !!features && Object.keys(features).length > 0;
   const hasGimmicks = Array.isArray(gimmicks) && gimmicks.length > 0;
-  const file = { Version: hasFeatures ? 6 : sky || hasGimmicks ? 5 : solid ? 4 : 2, Stage: stage, Objects };
+  const file = { Version: hasFeatures ? 6 : sky || hasGimmicks || sculpt ? 5 : solid ? 4 : 2, Stage: stage, Objects };
   if (sky) file.Sky = sky;
+  if (sculpt) file.Sculpt = sculpt;
   if (hasGimmicks) file.Gimmicks = gimmicks;
   if (hasFeatures) file.Features = features;
   return file;
@@ -335,7 +338,7 @@ const vec = (v, fallback) => (Array.isArray(v) && v.length === 3 && v.every(Numb
  */
 export function readEditsFile(json, objects) {
   const isObj = (v) => !!v && typeof v === 'object';
-  if (!isObj(json) || (!isObj(json.Objects) && !isObj(json.Sky) && !isObj(json.Features) && !Array.isArray(json.Gimmicks)))
+  if (!isObj(json) || (!isObj(json.Objects) && !isObj(json.Sky) && !isObj(json.Features) && !Array.isArray(json.Gimmicks) && !isObj(json.Sculpt)))
     throw new Error('This is not a HappyTool stage edits file.');
   const byName = new Map(objects.filter((o) => !o.gimmick).map((o) => [o.name.toLowerCase(), o]));
   const changed = [], unmatched = [];
@@ -352,7 +355,7 @@ export function readEditsFile(json, objects) {
   }
   return {
     changed, unmatched, sky: isObj(json.Sky) ? json.Sky : null, features: isObj(json.Features) ? json.Features : {},
-    gimmicks: Array.isArray(json.Gimmicks) ? json.Gimmicks.filter(isObj) : [],
+    gimmicks: Array.isArray(json.Gimmicks) ? json.Gimmicks.filter(isObj) : [], sculpt: isObj(json.Sculpt) ? json.Sculpt : null,
   };
 }
 
@@ -365,11 +368,11 @@ export function loadStored(stage) {
   }
 }
 
-export function store(stage, objects, sky = null, features = null, gimmicks = null) {
-  const file = editsFile(stage, objects, sky, features, gimmicks);
+export function store(stage, objects, sky = null, features = null, gimmicks = null, sculpt = null) {
+  const file = editsFile(stage, objects, sky, features, gimmicks, sculpt);
   const key = STORE + stage.toLowerCase();
   try {
-    if (Object.keys(file.Objects).length || file.Sky || file.Features || file.Gimmicks) localStorage.setItem(key, JSON.stringify(file));
+    if (Object.keys(file.Objects).length || file.Sky || file.Features || file.Gimmicks || file.Sculpt) localStorage.setItem(key, JSON.stringify(file));
     else localStorage.removeItem(key);
   } catch (e) {
     console.warn(`Map editor: edits could not be kept in this browser: ${e.message}`);
