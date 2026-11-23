@@ -516,6 +516,13 @@ span.twisty { cursor: default; }
 .stage-skipped { font-size: 12px; margin: 8px 0 0; }
 .stage-gimmicks p { margin: 0 0 6px; }
 .stage-gimmick-list { max-height: 280px; overflow: auto; margin-top: 4px; }
+.stage-zone-toggles { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-bottom: 4px; }
+.stage-zone-head { margin: 8px 0 2px; font-weight: 600; font-size: 12px; }
+.stage-zone { padding-left: 4px; flex-wrap: wrap; }
+.stage-zone .stage-layer-name { flex: 1 0 auto; max-width: calc(100% - 16px); }
+.stage-zone-acts { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.stage-zone-swatch { flex: 0 0 auto; width: 10px; height: 10px; border-radius: 2px; }
+.stage-side .btn-sm { padding: 1px 7px; font-size: 12px; }
 .stage-gimmick { padding-left: 4px; border-radius: 4px; cursor: pointer; }
 .stage-gimmick:hover, .stage-gimmick:focus-visible { background: rgba(127, 127, 127, 0.14); }
 .stage-gimmick.on { color: var(--accent); }

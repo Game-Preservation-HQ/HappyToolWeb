@@ -56,6 +56,11 @@ import {
   COLNAV_KEY, CN_SHAPES, CN_SIZES, CN_MIN_BRUSH, CN_MAX_BRUSH, readColNav, cloneColNav, colNavFeature, removedFlags,
   setRemovedFlags, volumeTriangles, rayTriangle, rayTris, eraseAt,
 } from '../formats/stage-colnav.js';
+import {
+  STAGE_VOLUMES_KEY, removedFromFeature, volumesFeature, parseStageVolumes, readTrapZones, volumeFrame, gimmickFrame,
+  carried as carriedFrame, trapLines, volumeLines, volumeBounds, ownerOf, trapKindName, trapKindColour, VOLUME_COLOUR, cssColour,
+  describeVolume, describeTrap, movedVolumeRecord, rewriteStageVolumes,
+} from './stage-zones.js';
 
 const FOV = Math.PI / 4;
 const MAX_GRAB = 3000; // cm: a box select leaves out objects this wide or tall (MaxGrabSize), gimmicks excepted
@@ -99,6 +104,9 @@ function fogFeatures(e) {
   // Gimmick setup (StageViewerForm.GimmickSetup.cs): only tags the loaded table has; with no table, every edit as read.
   const gs = setupFeature(e.gimmickSetup, e.gimmickTags?.() ?? null);
   if (gs) out[SETUP_KEY] = gs;
+  // Stage collision left out of the map (StageViewerForm.Zones.cs StageVolumeEdits).
+  const sv = volumesFeature(e.zoneRemoved);
+  if (sv) out[STAGE_VOLUMES_KEY] = sv;
   return Object.keys(out).length ? out : null;
 }
 const lower = (s) => (s ? s.toLowerCase() : s);
@@ -497,6 +505,7 @@ function setUpEdits(scene, model) {
     storedLinks: null, // the stored "links" feature, until then
     colnav: readColNav(null), // collision erased by hand and pieces added (the "colnav" feature)
     gimmickSetup: {}, // tag → {Team, Build, RamTarget, Number}: gimmicks set up differently (the "gimmickSetup" feature)
+    zoneRemoved: new Set(), // names of the stage collision entries left out of the map (the "stagevolumes" feature)
     gimmickTags: scene.gimmicks ? () => new Set(scene.gimmicks.placements.map((g) => g.tag)) : null,
     fogPreview: fogPreviewOn(),
   };
@@ -523,8 +532,9 @@ function setUpEdits(scene, model) {
     }
     edit.sky = cloneSky(stored.Sky);
     if (stored.Features && typeof stored.Features === 'object' && !Array.isArray(stored.Features)) {
-      const { fog, [COLNAV_KEY]: cn, links, [SETUP_KEY]: gs, ...rest } = stored.Features;
+      const { fog, [COLNAV_KEY]: cn, links, [SETUP_KEY]: gs, [STAGE_VOLUMES_KEY]: sv, ...rest } = stored.Features;
       Object.assign(edit.gimmickSetup, setupFromFeature(gs));
+      edit.zoneRemoved = removedFromFeature(sv);
       edit.storedFog = fogFromFeature(fog);
       edit.storedLinks = links ?? null;
       edit.colnav = readColNav(cn);
@@ -614,6 +624,7 @@ export function renderStage(node, ctx) {
   const modelBox = el('div', { class: 'stage-sky' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const gimmickBox = el('div', { class: 'stage-gimmicks' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const cnBox = el('div', { class: 'stage-sky stage-cn' }, el('p', { class: 'muted' }, 'Reading the stage…'));
+  const zoneBox = el('div', { class: 'stage-sky stage-zones' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const canvas = el('canvas', { class: 'stage-canvas', tabindex: '0', 'aria-label': 'Stage map' });
   const overlay = el('canvas', { class: 'stage-overlay', 'aria-hidden': 'true' });
   const hint = el(
@@ -639,14 +650,14 @@ export function renderStage(node, ctx) {
   gptLabel.hidden = true;
   const resetBtn = button('Reset view', null, { title: 'Frame the whole stage (R)' });
   // The side panel (Placement … Layers): the ☰ button hides it to give the map the room, kept for the next visit.
-  const side = el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Gimmicks'), gimmickBox, el('h3', {}, 'Collision edits'), cnBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Export 3D model'), modelBox, el('h3', {}, 'Layers'), layersBox);
+  const side = el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Gimmicks'), gimmickBox, el('h3', {}, 'Collision edits'), cnBox, el('h3', {}, 'Invisible zones'), zoneBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Export 3D model'), modelBox, el('h3', {}, 'Layers'), layersBox);
   const panelBtn = button('☰', null, { class: 'btn btn-icon' });
   const showPanel = (on) => {
     const what = on ? 'Hide the side panel' : 'Show the side panel';
     side.hidden = !on;
     panelBtn.setAttribute('aria-expanded', String(on));
     panelBtn.setAttribute('aria-label', what);
-    panelBtn.title = `${what} (Placement, Inspect, Gimmicks, Sky, Fog, Download, Layers)`;
+    panelBtn.title = `${what} (Placement, Inspect, Gimmicks, Collision edits, Invisible zones, Sky, Fog, Download, Layers)`;
   };
   panelBtn.addEventListener('click', () => {
     const on = side.hidden;
@@ -755,6 +766,8 @@ export function renderStage(node, ctx) {
     let hover = -1; // gizmo handle under the pointer
     let gdrag = null; // gizmo drag in progress
     let dirty = true, overlayDirty = true;
+    // The invisible zones' panel, lines and labels (set up with the gimmicks, below).
+    let zoneRefresh = () => {}, drawZones = () => {}, drawZoneLabels = () => {};
     let vp = null, viewW = 1, viewH = 1;
     const keys = new Set();
     let flyMul = 1; // the controller's fly speed (LB/RB), also for WASD
@@ -876,6 +889,7 @@ export function renderStage(node, ctx) {
       }
       if (lineProg) drawCollision(vp, eye);
       if (lineProg) drawNav(vp, eye);
+      if (lineProg) drawZones(vp, eye);
       if (drawGrid) drawGrid(grid, { vp, eye, f, viewH, fov: FOV, far });
       gl.bindVertexArray(null);
       overlayDirty = true;
@@ -971,6 +985,7 @@ export function renderStage(node, ctx) {
       g2.clearRect(0, 0, w, h);
       g2.setTransform(dpr, 0, 0, dpr, 0, 0);
       drawGimmickPaths(g2);
+      drawZoneLabels(g2);
       if (cnMode) drawCnOverlay(g2);
       // The axis indicator sits in the bottom-left corner, above the hint line that runs along the bottom.
       if (grid.axes) drawAxisIndicator(g2, hint.offsetParent ? hint.offsetTop - overlay.offsetTop : overlay.clientHeight, basis());
@@ -1175,6 +1190,7 @@ export function renderStage(node, ctx) {
       syncPanel();
       downloadRefresh();
       gimmickRefresh();
+      zoneRefresh();
       dirty = true;
     }
     function undo() {
@@ -1402,7 +1418,16 @@ export function renderStage(node, ctx) {
         if (sky?.Mode === 'picture' && !picture) skyNote += ' Choose the picture again in the Sky panel to see it.';
       }
       // The file's fog (a "fog" feature), and the features this page doesn't edit, kept as they are.
-      const { fog: fileFog, [COLNAV_KEY]: fileCn, links: fileLinks, [SETUP_KEY]: fileSetup, ...rest } = res.features;
+      const { fog: fileFog, [COLNAV_KEY]: fileCn, links: fileLinks, [SETUP_KEY]: fileSetup, [STAGE_VOLUMES_KEY]: fileSv, ...rest } = res.features;
+      // The file's removed stage collision (a "stagevolumes" feature) replaces this.
+      if (fileSv && typeof fileSv === 'object' && !Array.isArray(fileSv)) {
+        const before = new Set(edit.zoneRemoved), after = removedFromFeature(fileSv);
+        if (JSON.stringify(volumesFeature(before)) !== JSON.stringify(volumesFeature(after))) {
+          setZoneRemoved(after);
+          acts.push({ undo: () => setZoneRemoved(before), redo: () => setZoneRemoved(after) });
+          skyNote += ` Stage collision: ${after.size} removed.`;
+        }
+      }
       // The file's gimmick setup (a "gimmickSetup" feature) replaces this one.
       if (fileSetup && typeof fileSetup === 'object' && !Array.isArray(fileSetup)) {
         const before = setupFromFeature(edit.gimmickSetup), after = setupFromFeature(fileSetup);
@@ -4023,6 +4048,273 @@ export function renderStage(node, ctx) {
     const gimmickList = el('div', { class: 'stage-gimmick-list' });
     const setupBox = el('div', { class: 'stage-gimmick-setup', hidden: true });
     const byText = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+    // ----- invisible zones (StageViewerForm.Zones.cs) -----
+    // The gimmicks' trigger zones (from their behaviour files in json/gimmick) and the gimmick table's extra stage
+    // collision (collisionEntries_), drawn over the map. A collision entry inside a movable stage object moves, turns and
+    // goes with it; any one can be removed (undoable), and Download gimmick table writes the change.
+    const zoneShow = job.zoneShow || (job.zoneShow = { traps: false, volumes: false });
+    const zoneVolumes = parseStageVolumes(scene.gimmicks?.table.text ?? null);
+    let trapZones = null; // gimmick type → its zones, once read
+    // Each entry's stage object (null: none): the smallest movable one whose box, as built, holds its footprint.
+    const zoneOwners = new Map();
+    if (zoneVolumes.length) {
+      const cands = [];
+      for (const o of edit.objects) {
+        if (o.gimmick || o.mesh.sky) continue;
+        const b = boundsOf(o.mesh.baked?.positions ?? o.mesh.positions, o.firstVertex, o.vertexCount);
+        if (!(b.min[0] <= b.max[0])) continue;
+        if (Math.max(b.max[0] - b.min[0], b.max[2] - b.min[2]) >= MAX_GRAB || b.max[1] - b.min[1] >= MAX_GRAB) continue; // the ground stays put
+        cands.push({ o, b });
+      }
+      for (const v of zoneVolumes) zoneOwners.set(v.name, ownerOf(v, cands));
+    }
+    const zoneOwner = (v) => zoneOwners.get(v.name) ?? null;
+    /** Removed by hand, or its object was hidden. */
+    const zoneGone = (v) => edit.zoneRemoved.has(v.name) || !!zoneOwner(v)?.state.hidden;
+    /** Its object moved, turned or scaled it. */
+    const zoneMoved = (v) => {
+      const o = zoneOwner(v);
+      return !!o && !o.state.hidden && !isIdentityTransform(o.state);
+    };
+    /** Its frame now: as the table has it, carried by its object. */
+    const zoneFrame = (v) => {
+      const o = zoneOwner(v), f = volumeFrame(v);
+      return o ? carriedFrame(f, o.state, o.pivot) : f;
+    };
+    const zoneStateText = (v) => (edit.zoneRemoved.has(v.name) ? 'Removed' : zoneGone(v) ? 'Gone with its object' : zoneMoved(v) ? 'Moved with its object' : 'Kept');
+    const volumesEdited = () => zoneVolumes.some((v) => zoneGone(v) || zoneMoved(v));
+    /** The gimmick table with the gone entries left out and the moved ones' records rewritten. */
+    function withVolumeEdits(table) {
+      const byName = new Map();
+      for (const v of zoneVolumes) if (!byName.has(v.name)) byName.set(v.name, v);
+      return rewriteStageVolumes(table, (name, record) => {
+        const v = byName.get(name);
+        if (!v) return record;
+        if (zoneGone(v)) return null;
+        return zoneMoved(v) ? movedVolumeRecord(record, v, zoneFrame(v)) : record;
+      });
+    }
+    /** The export's summary line for the stage collision, or null when it is as the table has it. */
+    function volumesLine() {
+      if (!volumesEdited()) return null;
+      const gone = zoneVolumes.filter(zoneGone).length, moved = zoneVolumes.filter((v) => !zoneGone(v) && zoneMoved(v)).length;
+      return 'Stage collision: ' + (gone ? `${gone} extra volume(s) left out of the map's gimmick table` : '') + (gone && moved ? ', ' : '') +
+        (moved ? `${moved} moved with their objects` : '') + '.';
+    }
+    /** A placement as it is now (its object's state read back), or as the table has it when it has no model. */
+    const livePlacement = (g) => {
+      const o = gimmickObjects.get(g);
+      return o ? placementFromState(o) : g;
+    };
+    function setZoneRemoved(next) {
+      edit.zoneRemoved = new Set(next);
+      dirty = overlayDirty = true;
+    }
+    function showZones(which) {
+      zoneShow[which] = true;
+      (which === 'traps' ? zoneTrapsBox : zoneVolBox).checked = true;
+      dirty = overlayDirty = true;
+    }
+    /** Remove or keep an entry, undoable as "Remove <name>" / "Keep <name>" (ToggleStageVolume). */
+    function toggleZone(v) {
+      const before = new Set(edit.zoneRemoved), next = new Set(before), removing = !next.has(v.name);
+      if (removing) next.add(v.name);
+      else next.delete(v.name);
+      setZoneRemoved(next);
+      const label = `${removing ? 'Remove' : 'Keep'} ${v.name}`;
+      edit.history.push([], label, null, { undo: () => setZoneRemoved(before), redo: () => setZoneRemoved(next) });
+      edit.history.breakMerge();
+      showZones('volumes');
+      edited();
+      status.textContent = label;
+    }
+    /** The camera looks down at an entry (LookAtStageVolume). */
+    function lookAtZone(v) {
+      const { min, max } = volumeBounds(v, zoneFrame(v));
+      cam.target = min.map((x, k) => (x + max[k]) / 2);
+      cam.dist = Math.max(1200, Math.hypot(max[0] - min[0], max[1] - min[1], max[2] - min[2]) * 1.6);
+      cam.pitch = Math.min(cam.pitch, -0.45);
+      showZones('volumes');
+    }
+    const zoneTrapsBox = el('input', { type: 'checkbox' }), zoneVolBox = el('input', { type: 'checkbox' });
+    zoneTrapsBox.checked = zoneShow.traps;
+    zoneVolBox.checked = zoneShow.volumes;
+    for (const [box, key] of [[zoneTrapsBox, 'traps'], [zoneVolBox, 'volumes']])
+      box.addEventListener('change', () => {
+        zoneShow[key] = box.checked;
+        dirty = overlayDirty = true;
+      });
+    const zoneToggles = el(
+      'div',
+      { class: 'stage-zone-toggles' },
+      el('label', {
+        class: 'check',
+        title: "Where gimmicks react to players, from their behaviour files: a gate's opening box and the push plate in its doorway, a ram's " +
+          'hand-in sphere, the bomb stones’ climb-on cylinders, launch pads … They move with their gimmick.',
+      }, zoneTrapsBox, ' Gimmick trigger zones'),
+      el('label', {
+        class: 'check',
+        title: "Boxes and spheres the stage's gimmick table adds to the ground (collisionEntries_): players stand on and bump into them, but no model shows them.",
+      }, zoneVolBox, ' Stage collision'),
+    );
+    const zoneNote = el('p', { class: 'muted stage-count' });
+    const zoneList = el('div', { class: 'stage-gimmick-list stage-zone-list' });
+    function renderZones() {
+      const gm = scene.gimmicks;
+      if (!gm) {
+        zoneBox.replaceChildren(
+          el('p', { class: 'muted' }, ctx.dataFiles?.('json/stage').length
+            ? 'No gimmick table found for this stage, so no trigger zones or extra collision to show.'
+            : "Open the game's Data folder to see this stage's trigger zones and extra collision (json/gimmick and the stage's gimmick table)."),
+        );
+        return;
+      }
+      const placed = gm.placements.map(livePlacement).filter((g) => !g.removed);
+      const gone = zoneVolumes.filter(zoneGone).length;
+      zoneNote.textContent = (trapZones ? `${placed.filter((g) => trapZones.has(g.type)).length} gimmicks with zones` : 'Reading the trigger zones…') +
+        ` · ${zoneVolumes.length} collision${gone ? ` (${gone} removed)` : ''}`;
+      const rows = [];
+      if (zoneVolumes.length) rows.push(el('div', { class: 'stage-zone-head' }, 'Stage collision'));
+      for (const v of zoneVolumes) {
+        const o = zoneOwner(v), removed = edit.zoneRemoved.has(v.name);
+        const about = `${v.signature} at ${v.trans.map((x) => x.toFixed(0)).join(', ')}.` +
+          (o ? ` Belongs to ${shortObjectName(o.name)}: it moves, turns and goes with it.` : ' Stays where it is when the map changes.') +
+          " Removed: the exported map's gimmick table leaves it out, so the game no longer adds it.";
+        rows.push(el(
+          'div',
+          { class: 'stage-layer stage-zone', title: about },
+          el('span', { class: 'stage-zone-swatch', style: `background: ${cssColour(VOLUME_COLOUR)}` }),
+          el('span', { class: 'stage-layer-name' }, `${v.name} · ${describeVolume(v)}`),
+          el(
+            'span',
+            { class: 'stage-zone-acts' },
+            el('span', { class: 'muted' }, zoneStateText(v)),
+            button('Look at', () => lookAtZone(v), { class: 'btn btn-sm', title: `Point the camera at ${v.name}` }),
+            button(removed ? 'Keep' : 'Remove', () => toggleZone(v), {
+              class: 'btn btn-sm',
+              title: removed ? 'Keep it: the game adds it again' : 'Remove it: the downloaded gimmick table leaves it out',
+            }),
+          ),
+        ));
+      }
+      if (trapZones) {
+        const kinds = new Map();
+        for (const g of placed)
+          for (const z of trapZones.get(g.type) ?? []) {
+            const k = trapKindName(z.kind), e = kinds.get(k);
+            if (e) e.n++;
+            else kinds.set(k, { n: 1, z });
+          }
+        if (kinds.size) rows.push(el('div', { class: 'stage-zone-head' }, 'Trigger zones on this map'));
+        for (const [k, { n, z }] of [...kinds].sort((a, b) => a[0].localeCompare(b[0], 'en')))
+          rows.push(el(
+            'div',
+            { class: 'stage-layer stage-zone' },
+            el('span', { class: 'stage-zone-swatch', style: `background: ${cssColour(trapKindColour(z.kind))}` }),
+            el('span', { class: 'stage-layer-name' }, k),
+            el('span', { class: 'muted' }, `${n} × ${describeTrap(z)}`),
+          ));
+      }
+      zoneList.replaceChildren(...rows);
+      zoneList.hidden = !rows.length;
+      if (!zoneBox.contains(zoneList)) zoneBox.replaceChildren(zoneToggles, zoneNote, zoneList);
+    }
+    // The lines (one buffer, a run per colour) and the labels drawn over them.
+    const zoneGpu = {};
+    let zoneLabelList = [];
+    function drawZonesNow(vp, eye) {
+      zoneLabelList = [];
+      const gm = scene.gimmicks;
+      if (!gm || (!zoneShow.traps && !zoneShow.volumes)) return;
+      const groups = new Map(), labels = [];
+      const into = (c) => {
+        const k = c.join();
+        let g = groups.get(k);
+        if (!g) groups.set(k, (g = { c, lines: [] }));
+        return g.lines;
+      };
+      if (zoneShow.traps && trapZones?.size)
+        for (const g0 of gm.placements) {
+          const zones = trapZones.get(g0.type);
+          if (!zones) continue;
+          const g = livePlacement(g0);
+          if (g.removed) continue;
+          const f = gimmickFrame(g.position, g.rotation);
+          for (const z of zones) {
+            const c = trapKindColour(z.kind), top = trapLines(into(c), z, f);
+            labels.push({ at: [top[0], top[1] + 60, top[2]], text: trapKindName(z.kind) + (z.team ? ` · ${z.team.toLowerCase()}` : ''), c });
+          }
+        }
+      if (zoneShow.volumes)
+        for (const v of zoneVolumes) {
+          if (zoneGone(v)) continue;
+          const f = zoneFrame(v);
+          volumeLines(into(VOLUME_COLOUR), v, f);
+          const { min, max } = volumeBounds(v, f);
+          labels.push({ at: [(min[0] + max[0]) / 2, max[1] + 60, (min[2] + max[2]) / 2], text: `${v.name} · invisible collision`, c: VOLUME_COLOUR });
+        }
+      zoneLabelList = labels;
+      if (!groups.size) return;
+      const data = [], runs = [];
+      for (const { c, lines } of groups.values()) {
+        runs.push({ c, first: data.length / 3, count: lines.length / 3 });
+        for (const x of lines) data.push(x);
+      }
+      fillLines(zoneGpu, data, []);
+      // Two passes, as the desktop draws them: faint through the ground, then solid where they are in view. WebGL
+      // draws lines 1 px wide.
+      gl.useProgram(lineProg.program);
+      gl.uniformMatrix4fv(lineProg.u.uViewProj, false, vp);
+      gl.uniform3fv(lineProg.u.uEye, eye);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.depthMask(false);
+      gl.bindVertexArray(zoneGpu.vao);
+      for (const [depth, alpha] of [[false, 0.5], [true, 1]]) {
+        if (depth) gl.enable(gl.DEPTH_TEST);
+        else gl.disable(gl.DEPTH_TEST);
+        for (const r of runs) {
+          gl.uniform4f(lineProg.u.uColor, r.c[0], r.c[1], r.c[2], alpha);
+          gl.drawArrays(gl.LINES, r.first, r.count);
+        }
+      }
+      gl.disable(gl.BLEND);
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthMask(true);
+      gl.useProgram(prog.program);
+    }
+    function drawZoneLabelsNow(g2) {
+      if (!zoneLabelList.length) return;
+      g2.save();
+      g2.font = '12px system-ui, sans-serif';
+      g2.textAlign = 'center';
+      for (const l of zoneLabelList) {
+        const q = project(l.at);
+        if (!q || q.x < -300 || q.y < -40 || q.x > viewW + 300 || q.y > viewH + 40) continue;
+        g2.fillStyle = 'rgb(0 0 0 / 0.6)';
+        g2.fillText(l.text, q.x + 1, q.y + 1);
+        g2.fillStyle = cssColour(l.c);
+        g2.fillText(l.text, q.x, q.y);
+      }
+      g2.restore();
+    }
+    zoneRefresh = renderZones;
+    drawZones = drawZonesNow;
+    drawZoneLabels = drawZoneLabelsNow;
+    renderZones();
+    if (scene.gimmicks && ctx.dataFiles)
+      (job.trapZones || (job.trapZones = readTrapZones(ctx.dataFiles))).then(
+        (z) => {
+          if (stopped) return;
+          trapZones = z;
+          console.info(`Map editor: trigger zones for ${z.size} gimmick types; ${zoneVolumes.length} stage collision entries`);
+          renderZones();
+          dirty = overlayDirty = true;
+        },
+        (e) => console.warn(`Map editor: the gimmicks' trigger zones could not be read: ${e.message}`),
+      );
+    else trapZones = new Map();
+
     function renderGimmicks() {
       const gm = scene.gimmicks;
       if (!gm) {
@@ -4046,7 +4338,7 @@ export function renderStage(node, ctx) {
         (changed.length || setUp
           ? `Edited: ${moved} moved, ${removed} removed${added ? `, ${added} added` : ''}${setUp ? `, ${setUp} set up differently` : ''}.`
           : 'Select one to move, turn or remove (Del) it, or set up its team.');
-      gimmickBtn.disabled = !changed.length && !setupWrites;
+      gimmickBtn.disabled = !changed.length && !setupWrites && !volumesEdited();
       renderSetup();
       if (!gimmickBox.contains(gimmickList))
         gimmickBox.replaceChildren(gimmickNote, el('div', { class: 'toolbar' }, gimmickBtn, addBtn), catalogBox, setupBox, gimmickList);
@@ -4208,7 +4500,9 @@ export function renderStage(node, ctx) {
       let r;
       try {
         r = editedGimmickTable(gm.table.text, gm.placements, setupRules.setupFields);
-        if (r) files.push([await gimmickTableBytes(gm.table, r.text), gm.table.name, 'application/json']);
+        // The stage collision removed or moved with its object (WithStageVolumeEdits), on top of the gimmicks' edits.
+        const text = volumesEdited() ? withVolumeEdits(r?.text ?? gm.table.text) : r?.text;
+        if (text != null && text !== gm.table.text) files.push([await gimmickTableBytes(gm.table, text), gm.table.name, 'application/json']);
         // The installed copies the setup changes, wrapped like them and named as the desktop export names them.
         const nutName = `${edit.stage}_ssn_stage_setting.nut`, tacticsName = `${edit.stage}_stage_tactics.json`;
         if (sx && !sx.planEmpty && setupFiles.loose)
@@ -4225,6 +4519,8 @@ export function renderStage(node, ctx) {
           : 'No gimmick has been moved, turned, removed or set up yet.');
       for (const f of files) downloadBytes(...f);
       const lines = r ? [`Gimmicks: ${r.moved} moved, ${r.removed} removed, ${r.added} added — table written to ${gm.table.name}.`] : [];
+      const vl = volumesLine();
+      if (vl) lines.push(vl);
       toast([...lines, ...(sx?.lines ?? [])].join(' '), 'ok', 10000);
     }
     /** An edited companion table, wrapped like the installed one and read back (WriteCompanion). */

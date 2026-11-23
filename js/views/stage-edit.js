@@ -81,7 +81,7 @@ export function turnAbout(p, origin, axis, deg) {
 }
 
 /** The degrees about X, Y, Z that rotation() turns back into R (R = Rz·Ry·Rx). */
-function eulerOf(R) {
+export function eulerOf(R) {
   const tidy = (d) => Math.round(wrapDegrees(d / DEG) * 1e6) / 1e6;
   if (Math.abs(R[6]) > 1 - 1e-9) return [0, tidy(R[6] < 0 ? Math.PI / 2 : -Math.PI / 2), tidy(Math.atan2(-R[1], R[4]))];
   return [tidy(Math.atan2(R[7], R[8])), tidy(Math.asin(-R[6])), tidy(Math.atan2(R[3], R[0]))];
