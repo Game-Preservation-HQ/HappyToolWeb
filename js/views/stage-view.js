@@ -66,6 +66,7 @@ import { PLAY, PlayWorld, isCharacterLayer, newPlayer, playStep, playCamera, pla
 import { startAvatar, avatarStep, avatarHud, avatarDrawer } from './stage-avatar.js';
 import { gimmickUse, writePosed } from './stage-gimmick-play.js';
 import { shadowInputs, eraseShadows } from '../formats/stage-shadows.js';
+import { validateExport } from '../formats/stage-validate.js';
 import { loadAvatar } from '../formats/avatar.js';
 import {
   EFFECTS_KEY, EFFECT_COLOUR, SOUND_COLOUR, FILTERS as EFFECT_FILTERS, effectName, movedFromFeature, effectsFeature,
@@ -2468,6 +2469,13 @@ export function renderStage(node, ctx) {
           archive = { ...archive, entries: archive.entries.slice() };
           const line = await bakeNav(archive, touched, warp);
           if (line) lines.push(line);
+        }
+        {
+          // Every resource changed so far read back before anything else goes in (ValidateExport, after the nav as on the desktop).
+          status.textContent = 'Checking the bundle…';
+          await pause();
+          const checked = await validateExport(model.entries, archive.entries);
+          console.info(`Map editor export: ${checked.length} changed resource(s) read back: ${checked.join(', ') || 'none'}`);
         }
         if (parts.includes('gimmick paths')) {
           const line = await bakeGimmickPaths(archive);
