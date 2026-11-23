@@ -4,6 +4,7 @@
 // (CollectDescriptors / TryEmitSubmesh) for non-ModelData packs, Xbox One .rmd and Xbox 360 .rrmv stages.
 import { parseRrm, parseStageRrm, stripTextureExtension } from './rrm.js';
 import { splitIntoPieceObjects } from './stage-pieces.js';
+import { readRrmVertexNodes } from './rrm-nodes.js';
 
 const MODELDATA_MAGIC = 0x0132b421;
 const MAT_STRIDE = 0x390;
@@ -484,8 +485,10 @@ const stemOf = (name) => stripTextureExtension(name) || name;
  * Builds the renderable meshes of a Steam stage bundle (port of AppendSteamMeshes). Each mesh:
  * {name, kind: 'terrain'|'model'|'pack', positions, normals, uvs, uvs2, indices, batches:[{firstIndex,indexCount,texture,lightmap}], objects?}
  * @param {{name:string, data:Uint8Array}[]} entries bundle entries with their payloads
+ * @param {{animationNodes?:boolean}} [opts] animationNodes (gimmick models): read which animation node each vertex of a
+ *   single-record model follows (mesh.vertexNode), so the pieces of different nodes stay apart
  */
-export function buildSteamStage(entries) {
+export function buildSteamStage(entries, { animationNodes = false } = {}) {
   const dds = textureIndex(entries);
   const meshes = [];
   const skipped = [];
@@ -530,7 +533,10 @@ export function buildSteamStage(entries) {
       });
       // Little-endian ModelData terrain is one record (its base is cached at 0x8C); export patches it in place.
       const record = isInlineModelData(bytes) && rd(bytes).u32(0x90) === 1 ? rd(bytes).u32(0x8C) : null;
-      if (record != null) meshes[meshes.length - 1].sourceResource = e.name;
+      if (record != null) {
+        meshes[meshes.length - 1].sourceResource = e.name;
+        if (animationNodes) meshes[meshes.length - 1].vertexNode = readRrmVertexNodes(bytes, vc);
+      }
       splitIntoPieceObjects(meshes[meshes.length - 1], record);
       continue;
     }

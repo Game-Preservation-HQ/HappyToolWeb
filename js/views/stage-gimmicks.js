@@ -11,6 +11,8 @@
 import { decodeLayers, encodeLayers } from '../formats/wrappers.js';
 import { parseBres } from '../formats/bres.js';
 import { buildSteamStage } from '../formats/steam-stage.js';
+import { readRrmNodes } from '../formats/rrm-nodes.js';
+import { parseRra } from '../formats/rra.js';
 import { stripTextureExtension } from '../formats/rrm.js';
 import { decodeDds } from '../formats/dds.js';
 import { IDENTITY, rotation, wrapDegrees } from './stage-edit.js';
@@ -220,15 +222,31 @@ const ddsNames = (arc) => new Set(arc.entries.filter((e) => /\.dds$/i.test(e.nam
 /** A gimmick bundle's geometry, built as a stage's (AppendSteamMeshes). Throws when it has none, as LoadAssetStage. */
 async function buildModel(arc) {
   const rrm = [];
+  // Its rig for play test (RigOf): the nodes of the first .rrm that has them, and its .rra clips by name.
+  const rig = { nodes: [], clips: new Map() };
   for (const e of arc.entries) {
-    if (!/\.rrm$/i.test(e.name) || e.pointer || !e.data?.length) continue;
-    rrm.push({ name: e.name, pointer: false, data: (await decodeLayers(e.data)).payload });
+    if (e.pointer || !e.data?.length) continue;
+    try {
+      if (/\.rrm$/i.test(e.name)) {
+        const data = (await decodeLayers(e.data)).payload;
+        rrm.push({ name: e.name, pointer: false, data });
+        if (!rig.nodes.length) rig.nodes = readRrmNodes(data);
+      } else if (/\.rra$/i.test(e.name)) {
+        const d = parseRra((await decodeLayers(e.data)).payload, e.name);
+        if (d && d.bones.length && d.frameCount > 0) rig.clips.set(e.name.replace(/\.[^.\/]*$/, ''), d);
+      }
+    } catch (err) {
+      console.warn(`Gimmick rig: ${e.name}: ${err.message}`);
+    }
   }
+  // By name, case-insensitive (the desktop's SortedDictionary with OrdinalIgnoreCase).
+  const up = (s) => s.toUpperCase();
+  rig.clips = new Map([...rig.clips].sort((a, b) => (up(a[0]) < up(b[0]) ? -1 : up(a[0]) > up(b[0]) ? 1 : 0)));
   const dds = arc.entries.filter((e) => /\.dds$/i.test(e.name)).map((e) => ({ name: e.name, pointer: true, data: null }));
-  const built = buildSteamStage([...rrm, ...dds]);
+  const built = buildSteamStage([...rrm, ...dds], { animationNodes: true });
   const meshes = built.meshes.filter((m) => m.positions.length >= 9 && m.indices.length >= 3);
   if (!meshes.length) throw new Error('It has no Steam stage geometry.');
-  return { meshes, need: built.textures };
+  return { meshes, need: built.textures, rig };
 }
 
 /** One buffer for a model: its meshes merged, texture names turned into the keys the decoded pictures are kept under. */
@@ -240,11 +258,14 @@ function mergeModel(meshes, keyOf) {
   }
   const positions = new Float32Array(vc * 3), normals = new Float32Array(vc * 3);
   const uvs = new Float32Array(vc * 2), uvs2 = new Float32Array(vc * 2), indices = new Uint32Array(ic);
+  // The animation node of each vertex (0 where a mesh has none), when any mesh has them.
+  const vertexNode = meshes.some((m) => m.vertexNode) ? new Int32Array(vc) : null;
   const batches = [];
   let anyUv = false, anyUv2 = false, v = 0, ii = 0;
   for (const m of meshes) {
     const n = m.positions.length / 3;
     positions.set(m.positions, v * 3);
+    if (vertexNode && m.vertexNode?.length === n) vertexNode.set(m.vertexNode, v);
     if (m.normals?.length === m.positions.length) normals.set(m.normals, v * 3);
     if (m.uvs?.length === n * 2) {
       uvs.set(m.uvs, v * 2);
@@ -259,7 +280,7 @@ function mergeModel(meshes, keyOf) {
     v += n;
     ii += m.indices.length;
   }
-  return { positions, normals, uvs: anyUv ? uvs : null, uvs2: anyUv && anyUv2 ? uvs2 : null, indices, batches };
+  return { positions, normals, uvs: anyUv ? uvs : null, uvs2: anyUv && anyUv2 ? uvs2 : null, indices, batches, vertexNode };
 }
 
 /** A placement's mesh: the model at the table's position (not turned: the object's rotation turns it). */
@@ -273,6 +294,8 @@ export function placementMesh(tpl, g) {
   return {
     name: `gimmick/${g.tag}`, kind: 'gimmick', gimmick: g, positions, normals: tpl.normals.slice(), uvs: tpl.uvs, uvs2: tpl.uvs2,
     indices: tpl.indices, batches: tpl.batches.map((b) => ({ ...b })),
+    // Play test's gimmick use (stage-gimmick-play.js): the node each vertex follows and the model's nodes and clips.
+    vertexNode: tpl.vertexNode ?? null, rig: tpl.rig ?? null,
   };
 }
 
@@ -367,7 +390,7 @@ export function gimmickKit({ dataFiles, textures, report = () => {} }) {
         const arc = !file ? null : file === md.file ? md.arc : await readArc(file);
         keys.set(t, arc ? await decode(file, arc, t) : null);
       }
-      templates.set(m, mergeModel(md.meshes, (n) => (n ? keys.get(lower(n)) ?? null : null)));
+      templates.set(m, { ...mergeModel(md.meshes, (n) => (n ? keys.get(lower(n)) ?? null : null)), rig: md.rig });
     }
     return new Map(list.map((m) => [lower(m), templates.get(lower(m)) ?? null]));
   }

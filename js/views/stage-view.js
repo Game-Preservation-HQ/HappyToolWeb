@@ -64,6 +64,7 @@ import {
 } from './stage-zones.js';
 import { PLAY, PlayWorld, isCharacterLayer, newPlayer, playStep, playCamera, playWheel, shadowPoint, hudText, playDrawer } from './stage-play.js';
 import { startAvatar, avatarStep, avatarHud, avatarDrawer } from './stage-avatar.js';
+import { gimmickUse, writePosed } from './stage-gimmick-play.js';
 import { loadAvatar } from '../formats/avatar.js';
 import {
   EFFECTS_KEY, EFFECT_COLOUR, SOUND_COLOUR, FILTERS as EFFECT_FILTERS, effectName, movedFromFeature, effectsFeature,
@@ -1224,6 +1225,10 @@ export function renderStage(node, ctx) {
     function apply(o, st) {
       o.state = st;
       writeObject(o, tfHook);
+      upload(o);
+    }
+    /** An object's written vertices to the GPU. */
+    function upload(o) {
       const g = gpu.get(o.mesh), a = o.firstVertex * 3, z = (o.firstVertex + o.vertexCount) * 3;
       gl.bindBuffer(gl.ARRAY_BUFFER, g.pos);
       gl.bufferSubData(gl.ARRAY_BUFFER, a * 4, o.mesh.positions.subarray(a, z));
@@ -5925,11 +5930,11 @@ export function renderStage(node, ctx) {
     // Walks the map as a stand-in player against its collision as it is now: the stage's (the character layer when
     // there is one) lifted with the terraforming, moved objects' collision where they are, Solid objects, the collision
     // editor's pieces, the gimmick table's extra collision and the gimmicks' own models.
-    const PLAY_HINT = 'Play test · WASD: walk · Shift: run · Space: jump · Drag: look around · Wheel: camera distance · H / P: collision / nav lines · Esc or F5: stop';
-    const PLAY_PAD_HINT = 'Play test · Left stick: walk · RB or L3: run · A: jump · Right stick: look around · B, Menu, View or D-pad up: stop';
+    const PLAY_HINT = 'Play test · WASD: walk · Shift: run · Space: jump · E: use · Drag: look around · Wheel: camera distance · H / P: collision / nav lines · Esc or F5: stop';
+    const PLAY_PAD_HINT = 'Play test · Left stick: walk · RB or L3: run · A: jump · X: use · Right stick: look around · B, Menu, View or D-pad up: stop';
     // With the warrior: the game's buttons. Guard is Shift here, not the desktop's Ctrl: Ctrl+W would close the tab.
-    const AVATAR_HINT = 'Play test · WASD: walk · Space: attack · Q: strong attack · Shift: guard · Drag: look around · Wheel: camera distance · H / P: collision / nav lines · Esc or F5: stop';
-    const AVATAR_PAD_HINT = 'Play test · Left stick: walk · X: attack · Y: strong attack · LB or LT: guard · Right stick: look around · B, Menu, View or D-pad up: stop';
+    const AVATAR_HINT = 'Play test · WASD: walk · Space: attack · Q: strong attack · Shift: guard · E: use · Drag: look around · Wheel: camera distance · H / P: collision / nav lines · Esc or F5: stop';
+    const AVATAR_PAD_HINT = 'Play test · Left stick: walk · X: attack · Y: strong attack · LB or LT: guard · A: use · Right stick: look around · B, Menu, View or D-pad up: stop';
     const playPitch = (p) => Math.max(-1.45, Math.min(0.9, p));
     /** The triangles the player collides with (BuildPlayWorld). */
     function buildPlayWorld() {
@@ -6045,18 +6050,31 @@ export function renderStage(node, ctx) {
       const avatar = job?.avatar ?? null;
       play = { world: w, p: newPlayer(spawn, Math.atan2(f[0], f[2])), avatar, camDist: PLAY.camDist, shadow: null, move: [0, 0], run: false, jump: false, attack: false, blow: false, guard: false };
       if (avatar) startAvatar(avatar, play.p);
+      // Using gimmicks (GimmickPlay): E / the pad's use button plays a gimmick's clip; an open gate's collision is left out.
+      play.gim = gimmickUse({
+        gimmicks: () => gimmickObjects,
+        live: livePlacement,
+        zonesOf: (type) => trapZones?.get(type) ?? [],
+        pose: (o, deltaOf) => {
+          writePosed(o, deltaOf, tfHook);
+          upload(o);
+        },
+        rest: (o) => apply(o, o.state),
+      });
+      w.off = play.gim.off;
       if (cam.pitch > -0.05) cam.pitch = -0.3;
       cam.pitch = playPitch(cam.pitch);
       keys.clear();
       drag = null;
       playCam();
       canvas.style.cursor = '';
-      flash(`Play mode — ${w.count.toLocaleString()} collision triangles` + (avatar ? ' · Space / X attack, Q / Y strong attack, Shift / LB guard' : ''));
+      flash(`Play mode — ${w.count.toLocaleString()} collision triangles` + (avatar ? ' · Space / X attack, Q / Y strong attack, Shift / LB guard, E / A use' : ''));
       setPadHint();
       dirty = true;
     }
     function stopPlay() {
       if (!play) return;
+      play.gim.end();
       play = null;
       keys.clear();
       drag = null;
@@ -6090,6 +6108,8 @@ export function renderStage(node, ctx) {
       if (keys.has('a') || keys.has('arrowleft')) mv[0] -= 1;
       const l = Math.hypot(mv[0], mv[1]);
       if (l > 1) (mv[0] /= l), (mv[1] /= l);
+      const used = play.gim.tick(dt, keys.has('e') || !!play.use, play.p.pos);
+      if (used) flash(used);
       const msg = play.avatar
         ? avatarStep(play.world, play.avatar, play.p, dt, mv, keys.has(' ') || play.attack, keys.has('q') || play.blow, keys.has('shift') || play.guard, basis().f, cam.yaw)
         : playStep(play.world, play.p, dt, mv, keys.has('shift') || play.run, keys.has(' ') || play.jump, basis().f, cam.yaw);
@@ -6106,7 +6126,7 @@ export function renderStage(node, ctx) {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (k === 'h') return toggleCollision();
       if (k === 'p') return toggleNav();
-      if (['w', 'a', 's', 'd', 'shift', ' ', 'q', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) {
+      if (['w', 'a', 's', 'd', 'shift', ' ', 'q', 'e', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) {
         keys.add(k);
         e.preventDefault();
       }
@@ -6123,7 +6143,11 @@ export function renderStage(node, ctx) {
         play.attack = pad.held(PAD.X);
         play.blow = pad.held(PAD.Y);
         play.guard = pad.held(PAD.LB) || pad.lt > 64 / 255;
-      } else play.jump = pad.held(PAD.A);
+        play.use = pad.held(PAD.A);
+      } else {
+        play.jump = pad.held(PAD.A);
+        play.use = pad.held(PAD.X); // X: use a gimmick
+      }
     }
     /** The HUD box in the top-left corner (DrawPlayHud). */
     function drawPlayHud(g2) {

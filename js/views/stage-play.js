@@ -84,9 +84,12 @@ export class PlayWorld {
     this.stampNo = 0;
     return this;
   }
-  /** The triangles whose cells meet the box (x0, z0)–(x1, z1), each once, and the big ones (PlayQuery). */
+  /**
+   * The triangles whose cells meet the box (x0, z0)–(x1, z1), each once, and the big ones (PlayQuery), leaving out those
+   * whose owner is in this.off (an open gate's, PlayOff).
+   */
   query(x0, z0, x1, z1) {
-    const out = [], s = ++this.stampNo, C = PLAY.cell;
+    const out = [], s = ++this.stampNo, C = PLAY.cell, off = this.off?.size ? this.off : null;
     const gx0 = Math.floor(x0 / C), gx1 = Math.floor(x1 / C), gz0 = Math.floor(z0 / C), gz1 = Math.floor(z1 / C);
     for (let gx = gx0; gx <= gx1; gx++)
       for (let gz = gz0; gz <= gz1; gz++) {
@@ -95,10 +98,10 @@ export class PlayWorld {
           for (const i of l)
             if (this.stamp[i] !== s) {
               this.stamp[i] = s;
-              out.push(i);
+              if (!off || !off.has(this.owner[i])) out.push(i);
             }
       }
-    for (const i of this.big) out.push(i);
+    for (const i of this.big) if (!off || !off.has(this.owner[i])) out.push(i);
     return out;
   }
   /** The nearest triangle along a ray within maxDist: { t, tri } or null (PlayRaycast). */
