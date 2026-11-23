@@ -1,5 +1,5 @@
 // HappyTool web: open Happy Wars data files, unwrap them, browse and edit, save with the original wrappers.
-import { el, button, toast, pickFiles, openDialog, ask } from './ui.js';
+import { el, button, toast, pickFiles, openDialog, ask, confirmBox } from './ui.js';
 import { decodeLayers, encodeLayers, writableLayers } from './formats/wrappers.js';
 import { parseBres, writeBres } from './formats/bres.js';
 import { parseLng, writeLng, validateLng } from './formats/lng.js';
@@ -12,6 +12,7 @@ import { renderText } from './views/text-view.js';
 import { renderNut } from './views/nut-view.js';
 import { renderMedia } from './views/media-view.js';
 import { renderHex } from './views/hex-view.js';
+import { dataRootOf, preferredLng, isSearchable } from './formats/lng-refs.js';
 import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictures } from './browser.js';
 import { loadHandle, saveHandle, forgetHandle, readDirectory } from './data-folder.js';
 import { openPalette, setAppCommands } from './palette.js';
@@ -244,6 +245,31 @@ async function openChild(index) {
   render();
 }
 
+/**
+ * Opens the game's .lng at a text key (the script editor's "Open text key in .lng editor"): the .lng HappyTool
+ * prefers under the open file's Data folder, or the .lng entry of plxDict_en.bres / Dict_en.bres. Returns a message
+ * when there is none.
+ */
+async function openTextKey(key) {
+  const paths = files.map((r) => r.path);
+  const root = dataRootOf(current?.path ?? '');
+  const hit = preferredLng(paths, root);
+  if (!hit) return `No .lng file under ${root || 'the open files'}.`;
+  const rec = files.find((r) => r.path === hit.path);
+  pendingJump = { key };
+  if (!hit.bundle) return void openFile(rec);
+  await openFile(rec);
+  if (current !== rec || !rec.stack) return null;
+  const entries = rec.stack[0].model?.entries ?? [];
+  const index = entries.findIndex((e) => /\.lng$/i.test(e.name) && !e.pointer);
+  if (index < 0) return (pendingJump = null), `${baseName(rec.path)} has no .lng entry.`;
+  if (rec.stack[1]?.entry === entries[index]) return null; // already open there: the render above took the key
+  if (rec.stack.length > 1 && !(await popTo(0))) return null;
+  pendingJump = { key };
+  await openChild(index);
+  return null;
+}
+
 /** Close levels above `level`, folding each one's edits into its parent first. */
 async function popTo(level) {
   const s = stack();
@@ -418,6 +444,16 @@ function renderView() {
       // keeps its edits until it is saved.
       close: () => (stack().length > 1 ? popTo(stack().length - 2) : browseTo(browse ?? '')),
       closeLabel: stack().length > 1 ? 'Close (back to the bundle)' : 'Close',
+      /** Back to the last saved bytes (inside a bundle: the last ones folded into it), as HappyTool's Reload. */
+      reload: async () => {
+        if (node.dirty && !(await confirmBox('Discard unsaved changes?', 'Discard', true))) return;
+        loadModel(node);
+        node.dirty = false;
+        current.dirty = current.stack.some((n) => n.dirty);
+        if (!current.dirty) current.li?.classList.remove('dirty');
+        updateSave();
+        render();
+      },
     },
     showHex: () => ((node.showHex = true), renderInfo(), renderView()),
     /** The stage bundles among the open files (the map editor's "another stage's sky"), read from disk when asked. */
@@ -453,6 +489,22 @@ function renderView() {
       pendingJump = null;
       return j;
     },
+    /** The .nut / .json / .zson files of the open file's Data folder (every open file when it has none), for the text key search. */
+    searchFiles: () => {
+      const root = dataRootOf(current?.path ?? '');
+      const base = root ? root.toLowerCase() + '/' : '';
+      const list = files.filter((r) => r.path.toLowerCase().startsWith(base) && isSearchable(r.path));
+      return { root, label: root, files: list.map((r) => ({ path: r.path, size: r.file.size, read: async () => new Uint8Array(await r.file.arrayBuffer()) })) };
+    },
+    /** Opens a text key search hit at its line (1-based), the key selected there; false when the file isn't open. */
+    openAt: (path, line, key) => {
+      const rec = files.find((r) => r.path === path);
+      if (!rec) return toast(`${path} is not among the open files. Open its Data folder to edit it.`, 'warn'), false;
+      pendingJump = { line: line - 1, name: /^\w+$/.test(key ?? '') ? key : undefined };
+      openFile(rec);
+      return true;
+    },
+    openTextKey,
   };
   let view;
   try {

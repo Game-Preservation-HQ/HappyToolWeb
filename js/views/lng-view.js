@@ -10,10 +10,29 @@ import { fileFromRows, validateRows, statisticsReport, fillMissing, mergeLng, me
 import { catalogToCsv, importCsv as csvToCatalog, catalogToXlsx, importXlsx as xlsxToCatalog, importMessage } from '../formats/lng-sheets.js';
 import { hasFontText, colorsIn, parseColor, normalizeHex, toHex6, wrapColor, stripMarkup, renderPreview } from '../formats/lng-markup.js';
 import { baseName } from '../util.js';
+import { showKeyReferences } from './lng-refs-dialog.js';
 
 const ROW_H = 24;
 const MAX_KEY = 256;
 const TIP_MAX = 12000;
+const KEYS_STORE = 'happytool-web-lng-keys'; // the selected key per file, restored when it opens again (as the desktop's session)
+function readKeys() {
+  try {
+    return JSON.parse(localStorage.getItem(KEYS_STORE)) || {};
+  } catch {
+    return {};
+  }
+}
+function writeKey(id, key) {
+  try {
+    const all = readKeys();
+    delete all[id];
+    all[id] = key;
+    const ids = Object.keys(all);
+    for (const old of ids.slice(0, Math.max(0, ids.length - 30))) delete all[old];
+    localStorage.setItem(KEYS_STORE, JSON.stringify(all));
+  } catch {}
+}
 const ordinal = (a, b) => (a < b ? -1 : a > b ? 1 : 0); // HappyTool compares and sorts keys ordinally
 const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const isTyping = (t) =>
@@ -37,7 +56,9 @@ export function renderLng(node, ctx) {
   const file = node.model;
   const langs = file.languages;
   const ui = (node.ui ??= {});
-  if (ui.file !== file) {
+  const fresh = ui.file !== file;
+  const keyId = (ctx.filePath ?? '') + (node.parent ? `>${node.name}` : '');
+  if (fresh) {
     Object.assign(ui, { file, rows: buildRows(file), aligned: false, filter: '', missing: false, markup: false, sort: null,
       sel: new Set(), focus: null, detail: null, sticky: 0, scroll: 0, scrollLeft: 0, extra: new Set(), hex: '#2dc6ff',
       find: { text: '', repl: '', scope: 'all', matchCase: false, pos: null, open: false } });
@@ -328,11 +349,13 @@ export function renderLng(node, ctx) {
       return;
     }
     ui.detail = { row, lang: li };
+    if (row.key) saveKeySoon(row.key);
     caption.textContent = `${row.key}  —  ${langs[li].name}`;
     memo.disabled = false;
     memo.value = row.t[li] ?? '';
     renderPreview(memo.value, preview);
   }
+  const saveKeySoon = debounce((key) => writeKey(keyId, key), 300);
   const repaintSoon = debounce(() => (paint(), status()), 150);
   memo.addEventListener('input', () => {
     const d = ui.detail;
@@ -456,6 +479,26 @@ export function renderLng(node, ctx) {
     if (!row) return toast(`No row matches key "${key}".`, 'warn');
     focusCell(row, langs.length ? 0 : -1);
     grid.focus();
+  }
+  // ---- find in scripts, opened at a key (HappyTool's Find in scripts/JSON… and SelectPendingKeyIfAny) ----
+  function findInScripts() {
+    const key = ui.detail?.row.key.trim() || focusedRow()?.key || '';
+    if (!key) return message('Find in scripts', 'Select a string row first.');
+    showKeyReferences(key, {
+      searchFiles: ctx.searchFiles ?? (() => ({ root: '', label: '', files: [] })),
+      open: (path, line) => ctx.openAt?.(path, line, key) ?? false,
+    });
+  }
+  /** The first visible row whose key is exactly `key`, in the first language; else (when asked) the key goes in the filter. */
+  function selectPendingKey(key, filterIfMissing) {
+    const row = vis.find((r) => r.key === key);
+    if (row) return focusCell(row, langs.length ? 0 : -1), true;
+    if (!filterIfMissing) return false;
+    ui.filter = key;
+    filterBox.value = key;
+    ui.extra.clear();
+    refresh();
+    return true;
   }
   function insertLineBreak() {
     if (!ui.detail) return toast('Select a text cell to edit first.', 'warn');
@@ -819,9 +862,11 @@ export function renderLng(node, ctx) {
     {
       label: 'File',
       items: () => [
-        file_?.open && { label: 'Open…', run: file_.open },
+        file_?.open && { label: 'Open…', run: file_.open, enabled: () => !node.parent },
         file_?.save && { label: 'Save', keys: 'Ctrl+S', run: file_.save },
         file_?.saveAs && { label: 'Save as…', run: file_.saveAs },
+        null,
+        file_?.reload && { label: 'Reload', run: file_.reload },
         null,
         { label: 'Export Excel…', run: () => exportSheet(false) },
         { label: 'Import Excel…', run: () => importSheet(false) },
@@ -830,7 +875,9 @@ export function renderLng(node, ctx) {
         { label: 'Export CSV…', run: () => exportSheet(true) },
         { label: 'Import CSV…', run: () => importSheet(true) },
         null,
-        file_?.close && { label: file_.closeLabel || 'Close', run: file_.close },
+        { label: 'Find in scripts/JSON…', run: findInScripts },
+        null,
+        file_?.close && { label: node.parent ? 'Back to bundle' : 'Close', run: file_.close },
       ].filter((x) => x !== undefined && x !== false),
     },
     {
@@ -883,7 +930,10 @@ export function renderLng(node, ctx) {
   root.append(
     el('div', { class: 'meta-row' },
       el('strong', {}, `${langs.length} language${langs.length === 1 ? '' : 's'}`),
-      el('span', { class: 'muted' }, `Happy Wars text resource (.lng)${order} · version ${file.ver} · ${langs.map((l) => `${l.name}: ${l.entries.length.toLocaleString()} strings`).join(' · ')}`)),
+      el('span', { class: 'muted' }, `Happy Wars text resource (.lng)${order} · version ${file.ver} · ` +
+        `${node.parent ? 'Payload' : 'File'} size: ${(node.parent ? node.payload : node.raw).length.toLocaleString()} bytes · ` +
+        `${langs.map((l) => `${l.name}: ${l.entries.length.toLocaleString()} strings`).join(' · ')}`),
+      node.parent ? el('span', { class: 'muted' }, `${node.name}  —  embedded in bundle; Back to bundle updates the BRES entry, Save writes the .bres file`) : null),
     el('div', { class: 'toolbar lng-toolbar' },
       menuBar(menus, 'Text table menu'),
       el('label', { class: 'lng-lbl' }, 'Filter:'), filterBox,
@@ -907,9 +957,13 @@ export function renderLng(node, ctx) {
   computeVisible();
   const d = ui.detail && ui.rows.includes(ui.detail.row) ? ui.detail : null;
   loadDetail(d?.row, d?.lang);
+  // Opened at a key (from a script) or reopened (the key last selected in this file): picked once the grid is on screen.
+  const jumpKey = ctx.takeJump?.()?.key;
+  const pending = jumpKey ?? (fresh ? readKeys()[keyId] : null);
   requestAnimationFrame(() => {
     grid.scrollTop = ui.scroll;
     grid.scrollLeft = ui.scrollLeft;
+    if (pending != null && selectPendingKey(pending, jumpKey != null) && jumpKey != null) grid.focus();
     paint();
   });
   paint();

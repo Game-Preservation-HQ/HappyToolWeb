@@ -11,6 +11,8 @@ import { decodeLayers } from '../formats/wrappers.js';
 import { tokenize, outline, lineIndex, wordAt, callAt, KEYWORDS } from '../formats/squirrel.js';
 import { setViewCommands } from '../palette.js';
 import { menuBar, contextMenu } from '../menubar.js';
+import { textKeyAt } from '../formats/lng-refs.js';
+import { showKeyReferences } from './lng-refs-dialog.js';
 
 const INDENT = 4; // the desktop indents with 4 spaces
 const ZOOM_KEY = 'happytool-web-nut-zoom';
@@ -664,6 +666,21 @@ export function renderNut(node, ctx) {
     ctx.openScript(hit.path, pos);
     return true;
   }
+  // ---- text keys (HappyTool's Find text key references / Open text key in .lng editor) ----
+  // `wide`: the commands also take any upper-case key-shaped word (the Revival's keys miss the desktop's prefixes);
+  // Ctrl+click and F12 keep the desktop's narrower test, so they still reach function names.
+  const keyAtCaret = (wide) => textKeyAt(ta.value, ta.selectionStart, wide);
+  function keyReferences(key = keyAtCaret(true)) {
+    if (!key) return say('Put the caret on a text resource key (e.g. TXCMA00311) first.', 'bad');
+    showKeyReferences(key, { searchFiles: ctx.searchFiles ?? (() => ({ root: '', label: '', files: [] })), open: (path, line) => (remember(), ctx.openAt?.(path, line, key) ?? false) });
+  }
+  async function openKeyInLng() {
+    const key = keyAtCaret(true);
+    if (!key) return say('Put the caret on a text resource key (e.g. TXCMA00311) first.', 'bad');
+    if (!ctx.openTextKey) return say('There is no .lng editor here.', 'bad');
+    const problem = await ctx.openTextKey(key);
+    if (problem) say(problem, 'bad');
+  }
   async function goToDefinition() {
     const text = ta.value;
     const a = ta.selectionStart;
@@ -673,8 +690,11 @@ export function renderNut(node, ctx) {
       const str = text.slice(tok.s + 1, tok.e - 1);
       if (/\.nut$/i.test(str)) return openScriptByName(str);
     }
+    // 2. a text resource key: its references in the Data folder's scripts and JSON
+    const tk = textKeyAt(text, a);
+    if (tk) return keyReferences(tk);
     let w = wordAt(text, a);
-    // 2. RunScriptFunction(x, "name"): the function named in the string
+    // 3. RunScriptFunction(x, "name"): the function named in the string
     if (tok?.t === 'string') {
       const c = callAt(text, tok.s);
       const name = text.slice(tok.s + 1, tok.e - 1);
@@ -682,7 +702,7 @@ export function renderNut(node, ctx) {
     }
     if (!w) return say('Put the caret on a name first.');
     const name = w.word;
-    // 3. this script (read by the scanner, so commented-out code doesn't count)
+    // 4. this script (read by the scanner, so commented-out code doesn't count)
     const mine = items.filter((i) => i.name === name);
     if (mine.length) {
       const best = mine.find((i) => !i.owner) || mine[0];
@@ -690,7 +710,7 @@ export function renderNut(node, ctx) {
       gotoLine(best.line, best.name);
       return say(mine.length > 1 ? `${name}: ${mine.length} definitions here (${mine.map((i) => `line ${i.line + 1}`).join(', ')}).` : `${name}: line ${best.line + 1}.`);
     }
-    // 4. the Data folder's other scripts: top-level definitions first, then the same folder, then by path
+    // 5. the Data folder's other scripts: top-level definitions first, then the same folder, then by path
     const idx = scriptIndex(ctx, indexProgress);
     if (!idx.done) say(`Indexing the Data folder's scripts (${idx.count} of ${idx.total})…`);
     await idx.ready;
@@ -952,6 +972,8 @@ export function renderNut(node, ctx) {
     if (ctrl && k === '0') return setZoom(100), true;
     if (k === 'F3') return step(e.shiftKey ? -1 : 1), true;
     if (k === 'F12') return goToDefinition(), true;
+    if (ctrl && e.shiftKey && !e.altKey && k.toLowerCase() === 'r') return keyReferences(), true;
+    if (ctrl && e.shiftKey && !e.altKey && k.toLowerCase() === 'l') return openKeyInLng(), true;
     if (e.altKey && !ctrl && (k === 'ArrowLeft' || k === 'ArrowRight')) return goBack(k === 'ArrowLeft' ? -1 : 1);
     if (e.target !== ta) return false;
     if (k === 'Tab' && !ctrl && !e.altKey) {
@@ -1070,6 +1092,8 @@ export function renderNut(node, ctx) {
         { label: 'Forward', keys: 'Alt+→', run: () => goBack(1), enabled: () => history.fwd.length > 0 },
         null,
         definitionItem,
+        { label: 'Find text key references…', keys: 'Ctrl+Shift+R', run: () => keyReferences() },
+        { label: 'Open text key in .lng editor…', keys: 'Ctrl+Shift+L', run: openKeyInLng },
         null,
         { label: 'Previous function', keys: 'Ctrl+Shift+↑', run: () => nextFunction(-1) },
         { label: 'Next function', keys: 'Ctrl+Shift+↓', run: () => nextFunction(1) },

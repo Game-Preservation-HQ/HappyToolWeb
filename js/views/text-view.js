@@ -75,6 +75,20 @@ export function renderText(node, ctx) {
     );
   }
   validate();
+  // Opened from a text key search: the caret goes to that line, with the key selected when it is on it.
+  const jump = ctx.takeJump?.();
+  if (jump?.line != null)
+    requestAnimationFrame(() => {
+      const ls = ta.value.split('\n');
+      const line = Math.max(0, Math.min(ls.length - 1, jump.line));
+      let s = 0;
+      for (let i = 0; i < line; i++) s += ls[i].length + 1;
+      const k = jump.name ? ls[line].indexOf(jump.name) : -1;
+      ta.focus({ preventScroll: true });
+      ta.setSelectionRange(k >= 0 ? s + k : s, k >= 0 ? s + k + jump.name.length : s);
+      const lh = parseFloat(getComputedStyle(ta).lineHeight) || 18;
+      ta.scrollTop = Math.max(0, line * lh - ta.clientHeight / 3);
+    });
   const lines = model.text.length ? model.text.split('\n').length : 0;
   return el(
     'div',
