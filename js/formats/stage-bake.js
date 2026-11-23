@@ -8,9 +8,13 @@
 // hidden object's triangles are dropped; everything else stays where it is. Solid objects get collision generated from
 // their own shapes (SolidCollision, CollisionSized, SolidTriangles, FlatTriangles, AppendCollisionGroups), appended to the
 // character and environment layers. Collision erased by hand in the Collision panel (removedByHand) neither stays nor
-// travels with its object.
+// travels with its object. Terraformed ground (StageHeightWarp, WarpVertices, UvLift): ground pieces that sit where the
+// stage has them are reshaped vertex by vertex (normals and tangents through the warp, colour UVs on cliff faces slid
+// along), anything else over the sculpted ground drops with the ground under its base, and the collision no moved
+// object takes along is reshaped in place.
 
-import { isIdentityTransform, rotation } from '../views/stage-edit.js';
+import { isIdentityTransform, placePoint, rotation } from '../views/stage-edit.js';
+import { stockBounds } from '../views/stage-terraform.js';
 import { parseCollisionGroups } from '../views/stage-collision.js';
 import { makeShape, ensureBounds } from '../views/stage-collision-match.js';
 
@@ -178,11 +182,12 @@ function orthonormal(r) {
   return true;
 }
 
-/** Rewrites one edited object's vertices (PatchVertices without the ground warp). Returns how many it wrote. */
-function patchVertices(dv, rec, e, touched) {
+/** Rewrites one edited object's vertices (PatchVertices). Returns how many it wrote. */
+function patchVertices(dv, rec, e, touched, uvLift = null) {
   const node = e.nodeMatrix ? e.nodeMatrix.map(Math.fround) : null;
   const nodeInv = node ? Affine.invert(node) : null;
   if (node && !nodeInv) throw new Error(`${e.name}: its scene node transform can't be inverted.`);
+  if (!e.deleted && e.warp) return warpVertices(dv, rec, e, node, nodeInv, touched, uvLift);
   let local = null, normalMat = null, collapse = null;
   if (e.deleted) {
     const p = e.pivot ?? [0, 0, 0];
@@ -220,6 +225,106 @@ function patchVertices(dv, rec, e, touched) {
     }
   }
   return count;
+}
+
+/**
+ * Writes reshaped ground (WarpVertices): each vertex goes through e.warp in world space (through its scene node and
+ * back), its normal through the warp's inverse-transpose Jacobian and its tangents through the Jacobian. Only vertices
+ * the warp moves are written and marked.
+ */
+function warpVertices(dv, rec, e, node, nodeInv, touched, uvLift) {
+  const nodeN = node ? Affine.normalMatrix(node) : null, invN = nodeInv ? Affine.normalMatrix(nodeInv) : null;
+  // Colour UVs on cliff faces slide with the warp so a lowered wall keeps its texture scale (cropped, not squashed);
+  // lightmap UVs stay. Read from the unwarped record, once per record.
+  let lift = null;
+  if (rec.uvStreams.length && uvLift) {
+    lift = uvLift.get(rec.base);
+    if (!lift) uvLift.set(rec.base, (lift = uvLiftOf(dv, rec, node)));
+  }
+  const uv0 = rec.uvStreams.length ? rec.uvStreams[0] : -1, w = e.warp;
+  const count = e.vertices ? e.vertices.length : rec.vertexCount;
+  let written = 0;
+  for (let k = 0; k < count; k++) {
+    const v = e.vertices ? e.vertices[k] : k;
+    if (!(v >= 0 && v < rec.vertexCount)) throw new Error(`${e.name}: vertex ${v} is outside its record.`);
+    const pa = rec.positionAbs + v * 12;
+    const p = node ? Affine.point(node, f32(dv, pa), f32(dv, pa + 4), f32(dv, pa + 8)) : [f32(dv, pa), f32(dv, pa + 4), f32(dv, pa + 8)];
+    if (!w.moves(p[0], p[1], p[2])) continue;
+    touched[v] = 1;
+    written++;
+    const ny = w.mapY(p[0], p[1], p[2]);
+    const q = nodeInv ? Affine.point(nodeInv, p[0], ny, p[2]) : [p[0], ny, p[2]];
+    w32(dv, pa, q[0]);
+    w32(dv, pa + 4, q[1]);
+    w32(dv, pa + 8, q[2]);
+    if (lift && uv0 >= 0 && (lift[v * 2] !== 0 || lift[v * 2 + 1] !== 0)) {
+      const dy = ny - p[1], ua = uv0 + v * 8;
+      w32(dv, ua, f32(dv, ua) + lift[v * 2] * dy);
+      w32(dv, ua + 4, f32(dv, ua + 4) + lift[v * 2 + 1] * dy);
+    }
+    for (let s = 0; s < rec.directionStreams.length; s++) {
+      const na = rec.directionStreams[s] + v * 12;
+      const ax = f32(dv, na), ay = f32(dv, na + 4), az = f32(dv, na + 8);
+      if (ax * ax + ay * ay + az * az < 1e-12) continue;
+      let dir = node ? Affine.direction(s === 0 ? nodeN : node, ax, ay, az) : [ax, ay, az];
+      dir = s === 0 ? w.normal(p[0], p[1], p[2], dir) : w.tangent(p[0], p[1], p[2], dir);
+      if (nodeInv) dir = Affine.direction(s === 0 ? invN : nodeInv, dir[0], dir[1], dir[2]);
+      const len = Math.sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+      if (len < 1e-12) continue;
+      w32(dv, na, dir[0] / len);
+      w32(dv, na + 4, dir[1] / len);
+      w32(dv, na + 8, dir[2] / len);
+    }
+  }
+  return written;
+}
+
+/**
+ * Per vertex, how much its colour UV changes per unit of world height along the steep faces it belongs to (UvLift:
+ * du/dy, dv/dy, area-weighted over its steep triangles; zero for vertices only on flatter ground, whose UVs are laid
+ * out from above and must stay).
+ */
+function uvLiftOf(dv, rec, node) {
+  const vc = rec.vertexCount, uv0 = rec.uvStreams[0];
+  const sum = new Float64Array(vc * 2), wsum = new Float64Array(vc);
+  const P = (v) => {
+    const pa = rec.positionAbs + v * 12;
+    return node ? Affine.point(node, f32(dv, pa), f32(dv, pa + 4), f32(dv, pa + 8)) : [f32(dv, pa), f32(dv, pa + 4), f32(dv, pa + 8)];
+  };
+  for (let i = 0; i + 2 < rec.indexCount; i += 3) {
+    const a = indexAt(dv, rec, i), b = indexAt(dv, rec, i + 1), c = indexAt(dv, rec, i + 2);
+    if (a < 0 || a >= vc || b < 0 || b >= vc || c < 0 || c >= vc) continue;
+    const p0 = P(a), p1 = P(b), p2 = P(c);
+    const e1x = p1[0] - p0[0], e1y = p1[1] - p0[1], e1z = p1[2] - p0[2];
+    const e2x = p2[0] - p0[0], e2y = p2[1] - p0[1], e2z = p2[2] - p0[2];
+    const nx = e1y * e2z - e1z * e2y, ny = e1z * e2x - e1x * e2z, nz = e1x * e2y - e1y * e2x;
+    const nl = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    if (nl < 1e-9 || Math.abs(ny) / nl > 0.5) continue; // only cliff-like faces
+    // In-plane gradient G of each UV component: G·e1 = d1, G·e2 = d2, G = s·e1 + t·e2 (Gram system).
+    const g11 = e1x * e1x + e1y * e1y + e1z * e1z, g12 = e1x * e2x + e1y * e2y + e1z * e2z, g22 = e2x * e2x + e2y * e2y + e2z * e2z;
+    const det = g11 * g22 - g12 * g12;
+    if (det < 1e-9) continue;
+    const area = nl * 0.5;
+    for (let comp = 0; comp < 2; comp++) {
+      const t0 = f32(dv, uv0 + a * 8 + comp * 4), t1 = f32(dv, uv0 + b * 8 + comp * 4), t2 = f32(dv, uv0 + c * 8 + comp * 4);
+      const d1 = t1 - t0, d2 = t2 - t0;
+      const s = (d1 * g22 - d2 * g12) / det, t = (d2 * g11 - d1 * g12) / det;
+      const gy = s * e1y + t * e2y;
+      sum[a * 2 + comp] += gy * area;
+      sum[b * 2 + comp] += gy * area;
+      sum[c * 2 + comp] += gy * area;
+    }
+    wsum[a] += area;
+    wsum[b] += area;
+    wsum[c] += area;
+  }
+  const lift = new Float32Array(vc * 2);
+  for (let v = 0; v < vc; v++)
+    if (wsum[v] > 0) {
+      lift[v * 2] = sum[v * 2] / wsum[v];
+      lift[v * 2 + 1] = sum[v * 2 + 1] / wsum[v];
+    }
+  return lift;
 }
 
 /**
@@ -315,32 +420,50 @@ function recomputeBounds(dv, rec, touched, aabbBatch) {
 // ===================== edits =====================
 
 /**
- * The placement edits to write, from the map editor's objects (CollectExportEdits, without the ground warp): every
- * moved or hidden object whose mesh can be written back. Returns {edits, skipped} (objects that moved but can't be
- * written, e.g. an Xbox 360 model).
+ * The placement edits to write, from the map editor's objects (CollectExportEdits): every moved or hidden object whose
+ * mesh can be written back. With terraforming (warp, from sculptWarp; ground: the ground pieces' Set), ground pieces
+ * where the stage has them follow the warp vertex by vertex and anything else over the sculpted ground drops with the
+ * ground under its base, written even when that's no drop at all so its collision is taken along whole instead of being
+ * squeezed with the ground's. Returns {edits, skipped} (objects that would change but can't be written, e.g. an Xbox
+ * 360 model).
  */
-export function collectExportEdits(objects) {
+export function collectExportEdits(objects, warp = null, ground = null) {
   const edits = [];
   let skipped = 0;
   for (const o of objects) {
     const s = o.state;
-    if (o.gimmick || (!s.hidden && isIdentityTransform(s))) continue; // gimmicks are written to their table
+    if (o.gimmick) continue; // gimmicks are written to their table
+    let warpGround = false, warpStanding = false, drop = 0;
+    const b = warp && !s.hidden ? stockBounds(o) : null;
+    if (b && warp.affects(b.min[0], b.min[2], b.max[0], b.max[2], b.max[1])) {
+      if (ground?.has(o) && isIdentityTransform(s)) warpGround = true;
+      else {
+        warpStanding = true;
+        let foot = [(b.min[0] + b.max[0]) * 0.5, b.min[1], (b.min[2] + b.max[2]) * 0.5];
+        if (!isIdentityTransform(s)) foot = placePoint(s, o.pivot, foot);
+        drop = warp.mapY(foot[0], foot[1], foot[2]) - foot[1];
+      }
+    }
+    if (!s.hidden && isIdentityTransform(s) && !warpGround && !warpStanding) continue;
     const mesh = o.mesh;
     if (!mesh.sourceResource || o.recordOffset == null || o.recordOffset < 0) {
       skipped++;
       continue;
     }
     const pivot = o.pivot.map(Math.fround);
+    const world = s.hidden ? null : placementMatrix(s, pivot);
+    if (world) world[7] += drop;
     edits.push({
       name: o.name,
       resource: mesh.sourceResource,
       recordOffset: o.recordOffset,
       nodeMatrix: o.nodeMatrix ?? null,
       vertices: mesh.sourceVertex ? mesh.sourceVertex.subarray(o.firstVertex, o.firstVertex + o.vertexCount) : null,
-      world: s.hidden ? null : placementMatrix(s, pivot),
+      world,
       deleted: !!s.hidden,
       pivot,
       shape: o.index,
+      warp: warpGround ? warp : null,
     });
   }
   return { edits, skipped };
@@ -351,7 +474,7 @@ export function collectExportEdits(objects) {
  * {changed: Map name → Uint8Array, report: {objectsWritten, objectsHidden, verticesWritten, batchesRebounded}}.
  */
 export async function bakeEdits(edits, read) {
-  const report = { objectsWritten: 0, objectsHidden: 0, verticesWritten: 0, batchesRebounded: 0 };
+  const report = { objectsWritten: 0, objectsHidden: 0, verticesWritten: 0, batchesRebounded: 0, groundReshaped: 0 };
   const perResource = new Map();
   for (const e of edits) {
     if (!e?.resource) continue;
@@ -367,16 +490,17 @@ export async function bakeEdits(edits, read) {
     const dv = view(data);
     if (data.length < 0x200 || u32(dv, 0) !== MODELDATA_MAGIC) throw new Error(`${name} is not a Steam ModelData file.`);
     // Records first take note of which batch cube their AABB repeats (before any vertex moves).
-    const touched = new Map(), aabbBatch = new Map();
+    const touched = new Map(), aabbBatch = new Map(), uvLift = new Map();
     for (const e of list) {
       const rec = readRecord(data, e.recordOffset, name);
       if (!touched.has(rec.base)) {
         touched.set(rec.base, new Uint8Array(rec.vertexCount));
         aabbBatch.set(rec.base, findBatchRepeatedByAabb(dv, rec));
       }
-      report.verticesWritten += patchVertices(dv, rec, e, touched.get(rec.base));
+      report.verticesWritten += patchVertices(dv, rec, e, touched.get(rec.base), uvLift);
       report.objectsWritten++;
       if (e.deleted) report.objectsHidden++;
+      else if (e.warp) report.groundReshaped++;
     }
     for (const [base, t] of touched) report.batchesRebounded += recomputeBounds(dv, readRecord(data, base, name), t, aabbBatch.get(base));
     changed.set(name, data);
@@ -400,7 +524,7 @@ const groupNear = (g, s, m) =>
  * first-use order, optionally placed by world. keepBounds (the source's 43 CCB floats) keeps the authored sphere and box,
  * which still enclose a subset; otherwise they are fitted fresh. The boxes and diagonal extents are always refitted.
  */
-function buildGroup(src, tris, world, keepBounds) {
+function buildGroup(src, tris, world, keepBounds, warp = null) {
   const remap = new Map(), verts = [], idx = new Int32Array(tris.length * 3);
   for (let k = 0; k < tris.length; k++)
     for (let j = 0; j < 3; j++) {
@@ -411,6 +535,7 @@ function buildGroup(src, tris, world, keepBounds) {
         remap.set(v, nv);
         let x = src.vertices[v * 3], y = src.vertices[v * 3 + 1], z = src.vertices[v * 3 + 2];
         if (world) [x, y, z] = Affine.point(world, x, y, z);
+        if (warp) y = warp.mapY(x, y, z);
         verts.push(x, y, z);
       }
       idx[k * 3 + j] = nv;
@@ -615,7 +740,7 @@ function tileGroups(node, tris, count) {
  * shape. removed: per triangle in file order, truthy for the ones erased by hand (ColNav's RemovedCollision), or null.
  * report gains warnings, log lines and triangle counts.
  */
-export function patchCollision(d, name, edits, objects, owners, report, removed = null) {
+export function patchCollision(d, name, edits, objects, owners, report, removed = null, warp = null) {
   report.warnings ??= [];
   report.log ??= [];
   const groups = parseCollisionGroups(d);
@@ -650,11 +775,27 @@ export function patchCollision(d, name, edits, objects, owners, report, removed 
         }
     });
   const gone = (gi, t) => handGroups[gi] && removed[firstTri[gi] + t];
+  // Reshaped ground: every triangle no moved object takes along (the ground's own, and collision no object claims) goes
+  // through the warp where it stands, so the ground's collision follows the ground. Ground pieces carrying the warp
+  // aren't moved objects: their triangles stay and are reshaped.
+  const warpGroups = new Uint8Array(groups.length);
+  let warpedTotal = 0;
+  if (warp)
+    groups.forEach((g, gi) => {
+      const vv = g.vertices;
+      for (let i = 0; i + 2 < vv.length; i += 3)
+        if (warp.moves(vv[i], vv[i + 1], vv[i + 2])) {
+          warpGroups[gi] = 1;
+          warpedTotal++;
+          break;
+        }
+    });
+  const moving = edits.filter((e) => e && !e.warp);
   const editOf = new Map();
-  if (edits.length && (!owners || owners.length !== triCount)) {
+  if (moving.length && (!owners || owners.length !== triCount)) {
     report.warnings.push(`${name}: the collision matching doesn't fit this file, so the edited objects' collision stays where it was.`);
-    if (!handTotal) return null;
-  } else for (const e of edits) if (e && e.shape != null && objects[e.shape]) editOf.set(e.shape, e);
+    if (!handTotal && !warpedTotal) return null;
+  } else for (const e of moving) if (e.shape != null && objects[e.shape]) editOf.set(e.shape, e);
   // Shapes that matter: the edited objects, at their stock place (what the collision was matched against).
   const wanted = [];
   for (const i of editOf.keys()) {
@@ -662,7 +803,7 @@ export function patchCollision(d, name, edits, objects, owners, report, removed 
     const s = makeShape(i, o.mesh.baked?.positions ?? o.mesh.positions, o.triangles);
     if (ensureBounds(s)) wanted.push(s);
   }
-  if (!wanted.length && !handTotal) return null;
+  if (!wanted.length && !handTotal && !warpedTotal) return null;
 
   // Owners that move, only for groups near an edited shape (as the desktop limits its matching).
   const own = new Array(groups.length).fill(null);
@@ -680,13 +821,13 @@ export function patchCollision(d, name, edits, objects, owners, report, removed 
     }
     own[gi] = a;
   });
-  if (!ownedTotal && !handTotal) return null;
+  if (!ownedTotal && !handTotal && !warpedTotal) return null;
 
-  let moved = 0, dropped = 0, erased = 0, newGroups = 0, droppedGroups = 0;
+  let moved = 0, dropped = 0, erased = 0, newGroups = 0, droppedGroups = 0, warped = 0;
   const out = [];
   groups.forEach((g, gi) => {
     let a = own[gi];
-    if (!a && !handGroups[gi]) {
+    if (!a && !handGroups[gi] && !warpGroups[gi]) {
       out.push(d.subarray(g.start, g.start + g.length));
       return;
     }
@@ -709,7 +850,11 @@ export function patchCollision(d, name, edits, objects, owners, report, removed 
       }
     }
     // What stays keeps the authored sphere and box (they still enclose a subset); an emptied group is dropped.
-    if (!leaving) out.push(d.subarray(g.start, g.start + g.length));
+    // Reshaped ground warps what stays (fresh bounds).
+    if (warpGroups[gi] && stays.length) {
+      out.push(buildGroup(g, stays, null, null, warp));
+      warped += stays.length;
+    } else if (!leaving) out.push(d.subarray(g.start, g.start + g.length));
     else if (stays.length) {
       const kept = [];
       for (let k = 0; k < 43; k++) kept.push(f32(dv, g.ccb + k * 4));
@@ -734,9 +879,10 @@ export function patchCollision(d, name, edits, objects, owners, report, removed 
   report.trianglesMoved = (report.trianglesMoved || 0) + moved;
   report.trianglesRemoved = (report.trianglesRemoved || 0) + dropped;
   report.trianglesErased = (report.trianglesErased || 0) + erased;
+  report.trianglesWarped = (report.trianglesWarped || 0) + warped;
   report.log.push(
     `${name}: ${moved} triangle(s) moved (${newGroups} new group(s)), ${dropped} removed, ${erased} erased by hand, ` +
-      `${droppedGroups} emptied group(s) dropped; ` +
+      `${warped} reshaped with the ground, ${droppedGroups} emptied group(s) dropped; ` +
       `${groups.length} -> ${out.length} groups`,
   );
 

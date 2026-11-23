@@ -59,6 +59,13 @@ export class Sculpt {
     const az = Math.max(0, Math.floor((z0 - this.originZ) / this.cell)), bz = Math.min(this.depth - 1, Math.ceil((z1 - this.originZ) / this.cell));
     return ax > bx || az > bz ? null : { ax, bx, az, bz };
   }
+  /** True when any point that influences the world box (x0, z0)-(x1, z1) is non-zero (Touches). */
+  touches(x0, z0, x1, z1) {
+    const ax = Math.max(0, Math.floor((x0 - this.originX) / this.cell)), bx = Math.min(this.width - 1, Math.ceil((x1 - this.originX) / this.cell));
+    const az = Math.max(0, Math.floor((z0 - this.originZ) / this.cell)), bz = Math.min(this.depth - 1, Math.ceil((z1 - this.originZ) / this.cell));
+    for (let z = az; z <= bz; z++) for (let x = ax; x <= bx; x++) if (this.delta[z * this.width + x] !== 0) return true;
+    return false;
+  }
   /** A copy of the points in a range (row by row). */
   copy({ ax, bx, az, bz }, src = this.delta) {
     const w = bx - ax + 1, out = new Float32Array(w * (bz - az + 1));
@@ -265,6 +272,63 @@ export function brushStep(sculpt, heights, tool, dir, at, r, strength, dt, flatt
       d[i] = Math.max(-LIMIT, Math.min(LIMIT, d[i]));
     }
   return rg;
+}
+
+// ---------- export: the grid as a height warp ----------
+
+const unit = (x, y, z, f) => {
+  const l = Math.sqrt(x * x + y * y + z * z);
+  return l < 1e-12 ? [f[0], f[1], f[2]] : [x / l, y / l, z / l];
+};
+
+/**
+ * The terraforming as the bundle download writes it (StageHeightWarp.SculptOnly: no hills, every height in a column
+ * moves by the grid): mapY gives a point's new height, normals go through the warp's inverse-transpose Jacobian and
+ * tangents through its Jacobian. Null when nothing is sculpted.
+ */
+export function sculptWarp(sculpt) {
+  if (!sculpt || sculpt.isEmpty) return null;
+  return {
+    sculpt,
+    mapY: (x, y, z) => y + sculpt.at(x, z),
+    moves: (x, y, z) => sculpt.at(x, z) !== 0,
+    /** True when the warp can move anything inside the box (Affects). */
+    affects: (x0, z0, x1, z1) => sculpt.touches(x0, z0, x1, z1),
+    normal(x, y, z, n) {
+      const [a, c] = sculpt.gradient(x, z);
+      return unit(n[0] - a * n[1], n[1], n[2] - c * n[1], n);
+    },
+    tangent(x, y, z, t) {
+      const [a, c] = sculpt.gradient(x, z);
+      return unit(t[0], a * t[0] + t[1] + c * t[2], t[2], t);
+    },
+  };
+}
+
+/** Moves the nav cells' corners and the waypoints with the warp (StageHeightWarp.Apply). Returns {cells, waypoints} moved. */
+export function warpNav(warp, nav, path) {
+  let cells = 0, waypoints = 0;
+  if (nav)
+    for (const c of nav.cells) {
+      let moved = false;
+      for (let k = 0; k < 3; k++) {
+        const y = c.v[k * 3 + 1], ny = warp.mapY(c.v[k * 3], y, c.v[k * 3 + 2]);
+        if (ny !== y) {
+          c.v[k * 3 + 1] = ny;
+          moved = true;
+        }
+      }
+      if (moved) cells++;
+    }
+  if (path)
+    for (const n of path.nodes) {
+      const ny = warp.mapY(n.x, n.y, n.z);
+      if (ny !== n.y) {
+        n.y = Math.fround(ny);
+        waypoints++;
+      }
+    }
+  return { cells, waypoints };
 }
 
 // ---------- the edits file ----------

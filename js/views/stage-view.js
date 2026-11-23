@@ -5,7 +5,7 @@
 // The sky can be swapped for another stage's, a picture or a colour preset (slice 3, see stage-sky.js).
 // The stage's collision can be erased by hand and added to with walls, blocks, floors and ramps (see stage-colnav.js).
 import { el, button, toast, downloadBlob, pickFiles, confirmBox, debounce, openDialog } from '../ui.js';
-import { BRUSH_TOOLS, RAISE, MIN_BRUSH, MAX_BRUSH, MIN_STRENGTH, MAX_STRENGTH, BRUSH_COLOURS, stockBounds, groundPieces, coverGround, groundHeights, sculptObject, brushGroundY, brushStep, encodeSculpt, decodeSculpt } from './stage-terraform.js';
+import { BRUSH_TOOLS, RAISE, MIN_BRUSH, MAX_BRUSH, MIN_STRENGTH, MAX_STRENGTH, BRUSH_COLOURS, stockBounds, groundPieces, coverGround, groundHeights, sculptObject, brushGroundY, brushStep, encodeSculpt, decodeSculpt, sculptWarp, warpNav } from './stage-terraform.js';
 import { decodeLayers, encodeLayers, writableLayers } from '../formats/wrappers.js';
 import { writeBres } from '../formats/bres.js';
 import {
@@ -46,7 +46,7 @@ import {
   loadGimmicks, stateOfPlacement, placementFromState, placementChanged, gimmickEdit, applyGimmickEdit, editedGimmickTable,
   gimmickTableBytes, placementMesh, newPlacement, newGimmickTag, newPlacementsOf,
 } from './stage-gimmicks.js';
-import { readNav, navLines, writeNavMesh, writePathGraph, is360Spd, spd360ToSteam } from '../formats/stage-nav.js';
+import { readNav, navLines, parseNavMesh, parsePathGraph, writeNavMesh, writePathGraph, is360Spd, spd360ToSteam } from '../formats/stage-nav.js';
 import { parseGpt, writeGpt, followedPath, movedPaths } from '../formats/gimmick-paths.js';
 import { latin1 } from '../formats/gimmick-script.js';
 import {
@@ -2188,6 +2188,7 @@ export function renderStage(node, ctx) {
     function bakeParts() {
       const parts = [];
       if (edit.objects.some((o) => !o.gimmick && !isEmpty(o.state))) parts.push('objects');
+      if (edit.sculpt ? !edit.sculpt.isEmpty : !!edit.sculptFile) parts.push('terraforming');
       if (Object.keys(edit.colnav.RemovedCollision).length || edit.colnav.Volumes.length) parts.push('collision');
       if (navHandEdited()) parts.push('bot navigation');
       if (edit.sky && edit.sky.Mode !== 'dungeon') parts.push('sky');
@@ -2204,22 +2205,14 @@ export function renderStage(node, ctx) {
     }
     /**
      * The nav files rewritten as the live nav stands (CollectExportNav, StageNavBaker.Apply): the nav mesh and the
-     * waypoint graph each only when it changed, a 360 file written back in its own byte order. Returns the summary
-     * line, or null when the stage has no nav or nothing in the bundle can change it.
+     * waypoint graph each only when it changed, a 360 file written back in its own byte order. With terraforming (warp)
+     * the cells' corners and the waypoints then follow the reshaped ground (WarpExportNav). Returns the summary line, or
+     * null when the stage has no nav or nothing in the bundle can change it.
      */
-    async function bakeNav(archive, touched) {
+    async function bakeNav(archive, touched, warp = null) {
       const r = navRead;
-      if (!r || (!r.nav && !r.path) || (!touched && !navHandEdited())) return null;
-      for (let nm = edit.navMatch; nm && !nm.done && !stopped; nm = edit.navMatch) {
-        status.textContent = 'Matching the nav to the objects…';
-        await new Promise((ok) => setTimeout(ok, 250));
-      }
-      const nm = edit.navMatch;
-      if (!nm?.done) return "Bot navigation was left as it was (matching wasn't finished when you exported).";
-      if (nm.error) return `Bot navigation was left as it was (it couldn't be matched to the objects: ${nm.error}).`;
-      navNow(true);
-      const live = navLive;
-      if (!live) return "Bot navigation was left as it was (the rebuild failed; the console has why).";
+      const rebuild = touched || navHandEdited();
+      if (!r || (!r.nav && !r.path) || (!rebuild && !warp)) return null;
       const put = async (name, bytes) => {
         const i = archive.entries.findIndex((e) => e.name.toLowerCase() === name.toLowerCase());
         if (i < 0) return;
@@ -2228,9 +2221,36 @@ export function renderStage(node, ctx) {
         archive.entries[i] = { ...e, pointer: false, size: bytes.length, data: bytes };
         console.info(`Map editor export: ${name}: rewritten (${bytes.length} bytes)`);
       };
-      if (live.nav && r.navName && navChanged(live)) await put(r.navName, writeNavMesh(live.nav));
-      if (live.path && r.pathName && pathChanged(live)) await put(r.pathName, writePathGraph(live.path));
-      return navChanged(live) || pathChanged(live) ? navSummary(live) : null;
+      let line = null, live = null, navBytes = null, pathBytes = null;
+      if (rebuild) {
+        for (let nm = edit.navMatch; nm && !nm.done && !stopped; nm = edit.navMatch) {
+          status.textContent = 'Matching the nav to the objects…';
+          await new Promise((ok) => setTimeout(ok, 250));
+        }
+        const nm = edit.navMatch;
+        if (!nm?.done) return "Bot navigation was left as it was (matching wasn't finished when you exported).";
+        if (nm.error) return `Bot navigation was left as it was (it couldn't be matched to the objects: ${nm.error}).`;
+        navNow(true);
+        live = navLive;
+        if (!live) return "Bot navigation was left as it was (the rebuild failed; the console has why).";
+        if (live.nav && r.navName && navChanged(live)) navBytes = writeNavMesh(live.nav);
+        if (live.path && r.pathName && pathChanged(live)) pathBytes = writePathGraph(live.path);
+        if (navBytes || pathBytes) line = navSummary(live);
+      }
+      if (warp) {
+        // Copies of the nav as it now stands (rebuilt, or the stage's own), so the live nav on the map stays as it is.
+        const navCur = live?.nav ?? r.nav, pathNow = live?.path ?? r.path;
+        const nav = r.navName && navCur ? parseNavMesh(navBytes ?? writeNavMesh(navCur)) : null;
+        const path = r.pathName && pathNow ? parsePathGraph(pathBytes ?? writePathGraph(pathNow)) : null;
+        const { cells, waypoints } = warpNav(warp, nav, path);
+        if (cells && nav) navBytes = writeNavMesh(nav);
+        if (waypoints && path) pathBytes = writePathGraph(path);
+        const w = `Reshaped ground: ${cells.toLocaleString()} nav cell(s) and ${waypoints.toLocaleString()} waypoint(s) follow it.`;
+        line = line ? `${line} ${w}` : w;
+      }
+      if (navBytes) await put(r.navName, navBytes);
+      if (pathBytes) await put(r.pathName, pathBytes);
+      return line;
     }
     /** The bundle's stage_setting.nut with the setup's teams, build states and bundles written in (GimmickSetupExport). */
     async function bakeStageScript(archive) {
@@ -2250,7 +2270,7 @@ export function renderStage(node, ctx) {
       const parts = bakeParts();
       downloadNote.textContent = parts.length
         ? `Writes the ${listOf(parts)} into a copy of ${edit.stage}.bres.`
-        : 'Move, hide or make objects Solid, change the sky, fog or minimap, edit the collision, or set up the castle gimmicks, to write them into a copy of the bundle.';
+        : 'Move, hide or make objects Solid, terraform the ground, change the sky, fog or minimap, edit the collision, or set up the castle gimmicks, to write them into a copy of the bundle.';
       bakeBtn.disabled = !parts.length;
       if (!downloadBox.contains(bakeBtn)) downloadBox.replaceChildren(downloadNote, el('div', { class: 'toolbar' }, bakeBtn));
     }
@@ -2272,18 +2292,20 @@ export function renderStage(node, ctx) {
      * The collision written as the desktop export does: the edited objects' triangles moved along in every .ccp layer
      * (PatchCollision, once the collision is matched to the objects), the triangles erased by hand left out, Solid
      * objects' generated collision and the pieces added by hand appended to the _Chit and _Ehit layers (SolidCollision),
-     * and the changed layers' stale .mtf copies dropped. Returns {entries, line} or null when there's nothing to do; the
-     * entries are replaced in place (at: lower-case name -> index).
+     * the collision no moved object takes along reshaped with terraformed ground (warp), and the changed layers' stale
+     * .mtf copies dropped. Returns {entries, line} or null when there's nothing to do; the entries are replaced in place
+     * (at: lower-case name -> index).
      */
-    async function bakeCollision(edits, solids, added, entries, at) {
+    async function bakeCollision(edits, solids, added, entries, at, warp = null) {
       const ccp = [];
       entries.forEach((e, i) => /\.ccp$/i.test(e.name || '') && !e.pointer && e.data?.length && ccp.push(i));
       if (!ccp.length && !solids.length && !added.length) return null;
       const erased = Object.keys(edit.colnav.RemovedCollision).length > 0;
+      const moving = edits.filter((e) => !e.warp); // ground pieces carrying the warp keep their collision, reshaped
       const notes = [];
       let col = null, owners = null;
-      if ((edits.length || erased) && ccp.length) {
-        const lost = [edits.length ? "doesn't follow the moved objects" : '', erased ? 'keeps the triangles erased by hand' : ''].filter(Boolean).join(' and ');
+      if ((moving.length || erased) && ccp.length) {
+        const lost = [moving.length ? "doesn't follow the moved objects" : '', erased ? 'keeps the triangles erased by hand' : ''].filter(Boolean).join(' and ');
         status.textContent = 'Reading the collision…';
         try {
           col = await (job.collision || (job.collision = readCollision(model)));
@@ -2293,7 +2315,7 @@ export function renderStage(node, ctx) {
         if (col && !col.live) {
           notes.push(`The collision has an unfamiliar layout, so it ${lost}.`);
           col = null;
-        } else if (col && edits.length) {
+        } else if (col && moving.length) {
           if (!edit.colMatch) startMatching(col);
           for (let m = edit.colMatch; m && !m.owners && !m.error; m = edit.colMatch) {
             status.textContent = `Matching the collision to the objects… ${m.pct ?? 0}%`;
@@ -2315,7 +2337,8 @@ export function renderStage(node, ctx) {
         const name = entries[i].name;
         const li = col ? col.layers.findIndex((l) => l.name.toLowerCase() === name.toLowerCase()) : -1;
         const removed = li >= 0 && erased ? removedFlags(edit.colnav, name, col.layers[li].indices.length / 3) : null;
-        let out = li >= 0 && (owners || removed) ? patchCollision(data, name, owners ? edits : [], edit.objects, owners ? owners[li] : null, rep, removed) : null;
+        const own = owners && li >= 0 ? owners[li] : null;
+        let out = (li >= 0 && (own || removed)) || warp ? patchCollision(data, name, own ? edits : [], edit.objects, own, rep, removed, warp) : null;
         const add = extra.get(name);
         if (add?.length) {
           out = appendCollisionGroups(out ?? data, add);
@@ -2330,6 +2353,7 @@ export function renderStage(node, ctx) {
       const what = [];
       if (owners) what.push(`${(rep.trianglesMoved || 0).toLocaleString()} triangles moved, ${(rep.trianglesRemoved || 0).toLocaleString()} removed`);
       if (rep.trianglesErased) what.push(`${rep.trianglesErased.toLocaleString()} erased by hand`);
+      if (rep.trianglesWarped) what.push(`${rep.trianglesWarped.toLocaleString()} reshaped with the ground`);
       if (rep.collisionTrianglesGenerated) {
         const p = Math.min(added.length, rep.solidObjects || 0), k = (rep.solidObjects || 0) - p;
         const who = [k ? `${k.toLocaleString()} Solid object${k === 1 ? '' : 's'}` : '', p ? `${p.toLocaleString()} added piece${p === 1 ? '' : 's'}` : ''].filter(Boolean);
@@ -2352,10 +2376,20 @@ export function renderStage(node, ctx) {
       try {
         let archive = model;
         const lines = [];
-        if (parts.includes('objects') || parts.includes('collision')) {
+        let warp = null;
+        if (parts.includes('terraforming')) {
+          if (!edit.sculpt && edit.sculptJob) {
+            status.textContent = 'Reading the terraforming…';
+            await edit.sculptJob;
+          }
+          warp = sculptWarp(edit.sculpt);
+          if (!edit.sculpt) lines.push("Terraforming: left out (the grid kept with the edits can't be read).");
+          else if (warp) edit.tfGround ??= groundPieces(edit.objects);
+        }
+        if (parts.includes('objects') || parts.includes('collision') || warp) {
           status.textContent = 'Writing the objects…';
           await pause();
-          const { edits, skipped } = collectExportEdits(edit.objects);
+          const { edits, skipped } = collectExportEdits(edit.objects, warp, warp ? edit.tfGround : null);
           const solids = exportSolids(), added = exportPieces();
           const erased = Object.keys(edit.colnav.RemovedCollision).length > 0;
           const at = new Map();
@@ -2377,14 +2411,15 @@ export function renderStage(node, ctx) {
                 `${n.verticesWritten.toLocaleString()} vertices, ${n.batchesRebounded.toLocaleString()} batch bounds refitted.` +
                 (skipped ? ` ${skipped.toLocaleString()} moved object(s) can't be written back (no Steam record).` : ''),
             );
-          const c = edits.length || solids.length || added.length || erased ? await bakeCollision(edits, solids, added, entries, at) : null;
+          if (warp) lines.push(`Ground reshaped: ${n.groundReshaped.toLocaleString()} ground piece(s) follow the terraforming.`);
+          const c = edits.length || solids.length || added.length || erased || warp ? await bakeCollision(edits, solids, added, entries, at, warp) : null;
           if (c) lines.push(c.line);
           archive = { ...archive, entries: c ? c.entries : entries };
         }
         {
           const touched = parts.includes('objects') || parts.includes('collision');
           archive = { ...archive, entries: archive.entries.slice() };
-          const line = await bakeNav(archive, touched);
+          const line = await bakeNav(archive, touched, warp);
           if (line) lines.push(line);
         }
         if (parts.includes('gimmick paths')) {
@@ -6199,7 +6234,7 @@ export function renderStage(node, ctx) {
     tfStrIn.addEventListener('change', () => Number(tfStrIn.value) > 0 && tfSetStrength(Number(tfStrIn.value)));
     const tfOnBtn = button('Terraform', () => setTerraform(!tfOn), { title: 'F2' });
     const tfClearBtn = button('Clear all', () => tfClear(), { title: "Every change back to the stage's own ground (undo brings it back)" });
-    const tfNote = el('p', { class: 'muted' }, "Kept with the edits (Save edits… writes it, as the desktop HappyTool reads it). The bundle download doesn't write the terraforming yet.");
+    const tfNote = el('p', { class: 'muted' }, 'Kept with the edits (Save edits… writes it, as the desktop HappyTool reads it). Download bundle writes it into the stage: the ground reshaped, what stands on it dropped with it, and its collision and bot navigation following.');
     function renderTerraform() {
       const ground = (edit.tfGround ??= groundPieces(edit.objects));
       if (!ground.size) return terraformBox.replaceChildren(el('p', { class: 'muted' }, 'This stage has no ground pieces to terraform.'));
