@@ -61,6 +61,10 @@ import {
   carried as carriedFrame, trapLines, volumeLines, volumeBounds, ownerOf, trapKindName, trapKindColour, VOLUME_COLOUR, cssColour,
   describeVolume, describeTrap, movedVolumeRecord, rewriteStageVolumes,
 } from './stage-zones.js';
+import {
+  EFFECTS_KEY, EFFECT_COLOUR, SOUND_COLOUR, FILTERS as EFFECT_FILTERS, effectName, movedFromFeature, effectsFeature,
+  loadEffectTable, movedEffectTable, effectTableBytes, postOf, markerLines, rangeRing, oneDecimal, describeEffect,
+} from './stage-effects.js';
 
 const FOV = Math.PI / 4;
 const MAX_GRAB = 3000; // cm: a box select leaves out objects this wide or tall (MaxGrabSize), gimmicks excepted
@@ -107,6 +111,9 @@ function fogFeatures(e) {
   // Stage collision left out of the map (StageViewerForm.Zones.cs StageVolumeEdits).
   const sv = volumesFeature(e.zoneRemoved);
   if (sv) out[STAGE_VOLUMES_KEY] = sv;
+  // Effects and sounds moved by hand (StageViewerForm.Effects.cs EffectEdits).
+  const fx = effectsFeature(e.effectMoved);
+  if (fx) out[EFFECTS_KEY] = fx;
   return Object.keys(out).length ? out : null;
 }
 const lower = (s) => (s ? s.toLowerCase() : s);
@@ -162,6 +169,16 @@ async function loadScene(model, report, source = null) {
       gimmicks = null;
     }
   }
+  // The stage's effects and sounds (its effect table; StageViewerForm.Effects.cs LoadEffects).
+  let effects = null;
+  if (source?.dataFiles) {
+    try {
+      effects = await loadEffectTable({ ids: [gimmicks?.table.stageId, ...source.ids], dataFiles: source.dataFiles });
+      if (effects) console.info(`Map viewer: ${effects.log}`);
+    } catch (e) {
+      console.warn(`Map viewer: the effect table could not be read: ${e.message}`);
+    }
+  }
   for (const m of meshes) {
     m.sky = m.kind !== 'gimmick' && /sky/i.test(m.name);
     if (m.sky) m.kind = 'sky';
@@ -174,6 +191,7 @@ async function loadScene(model, report, source = null) {
   return {
     meshes,
     gimmicks,
+    effects,
     skipped: built.skipped,
     textures,
     missing: [...built.textures].filter((k) => !textures.has(k)),
@@ -506,6 +524,7 @@ function setUpEdits(scene, model) {
     colnav: readColNav(null), // collision erased by hand and pieces added (the "colnav" feature)
     gimmickSetup: {}, // tag → {Team, Build, RamTarget, Number}: gimmicks set up differently (the "gimmickSetup" feature)
     zoneRemoved: new Set(), // names of the stage collision entries left out of the map (the "stagevolumes" feature)
+    effectMoved: new Map(), // effect and sound ids → where they were moved by hand (the "effects" feature)
     gimmickTags: scene.gimmicks ? () => new Set(scene.gimmicks.placements.map((g) => g.tag)) : null,
     fogPreview: fogPreviewOn(),
   };
@@ -532,9 +551,10 @@ function setUpEdits(scene, model) {
     }
     edit.sky = cloneSky(stored.Sky);
     if (stored.Features && typeof stored.Features === 'object' && !Array.isArray(stored.Features)) {
-      const { fog, [COLNAV_KEY]: cn, links, [SETUP_KEY]: gs, [STAGE_VOLUMES_KEY]: sv, ...rest } = stored.Features;
+      const { fog, [COLNAV_KEY]: cn, links, [SETUP_KEY]: gs, [STAGE_VOLUMES_KEY]: sv, [EFFECTS_KEY]: fx, ...rest } = stored.Features;
       Object.assign(edit.gimmickSetup, setupFromFeature(gs));
       edit.zoneRemoved = removedFromFeature(sv);
+      edit.effectMoved = movedFromFeature(fx);
       edit.storedFog = fogFromFeature(fog);
       edit.storedLinks = links ?? null;
       edit.colnav = readColNav(cn);
@@ -625,6 +645,7 @@ export function renderStage(node, ctx) {
   const gimmickBox = el('div', { class: 'stage-gimmicks' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const cnBox = el('div', { class: 'stage-sky stage-cn' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const zoneBox = el('div', { class: 'stage-sky stage-zones' }, el('p', { class: 'muted' }, 'Reading the stage…'));
+  const effectBox = el('div', { class: 'stage-sky stage-zones' }, el('p', { class: 'muted' }, 'Reading the stage…'));
   const canvas = el('canvas', { class: 'stage-canvas', tabindex: '0', 'aria-label': 'Stage map' });
   const overlay = el('canvas', { class: 'stage-overlay', 'aria-hidden': 'true' });
   const hint = el(
@@ -650,14 +671,14 @@ export function renderStage(node, ctx) {
   gptLabel.hidden = true;
   const resetBtn = button('Reset view', null, { title: 'Frame the whole stage (R)' });
   // The side panel (Placement … Layers): the ☰ button hides it to give the map the room, kept for the next visit.
-  const side = el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Gimmicks'), gimmickBox, el('h3', {}, 'Collision edits'), cnBox, el('h3', {}, 'Invisible zones'), zoneBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Export 3D model'), modelBox, el('h3', {}, 'Layers'), layersBox);
+  const side = el('aside', { class: 'stage-side' }, el('h3', {}, 'Placement'), placeBox, el('h3', {}, 'Inspect'), inspectBox, el('h3', {}, 'Gimmicks'), gimmickBox, el('h3', {}, 'Collision edits'), cnBox, el('h3', {}, 'Invisible zones'), zoneBox, el('h3', {}, 'Effects and sounds'), effectBox, el('h3', {}, 'Sky'), skyBox, el('h3', {}, 'Fog'), fogBox, el('h3', {}, 'Download'), downloadBox, el('h3', {}, 'Export 3D model'), modelBox, el('h3', {}, 'Layers'), layersBox);
   const panelBtn = button('☰', null, { class: 'btn btn-icon' });
   const showPanel = (on) => {
     const what = on ? 'Hide the side panel' : 'Show the side panel';
     side.hidden = !on;
     panelBtn.setAttribute('aria-expanded', String(on));
     panelBtn.setAttribute('aria-label', what);
-    panelBtn.title = `${what} (Placement, Inspect, Gimmicks, Collision edits, Invisible zones, Sky, Fog, Download, Layers)`;
+    panelBtn.title = `${what} (Placement, Inspect, Gimmicks, Collision edits, Invisible zones, Effects and sounds, Sky, Fog, Download, Layers)`;
   };
   panelBtn.addEventListener('click', () => {
     const on = side.hidden;
@@ -768,6 +789,7 @@ export function renderStage(node, ctx) {
     let dirty = true, overlayDirty = true;
     // The invisible zones' panel, lines and labels (set up with the gimmicks, below).
     let zoneRefresh = () => {}, drawZones = () => {}, drawZoneLabels = () => {};
+    let effectRefresh = () => {}, drawEffects = () => {}, drawEffectLabels = () => {}, effectToolOff = () => {};
     let vp = null, viewW = 1, viewH = 1;
     const keys = new Set();
     let flyMul = 1; // the controller's fly speed (LB/RB), also for WASD
@@ -890,6 +912,7 @@ export function renderStage(node, ctx) {
       if (lineProg) drawCollision(vp, eye);
       if (lineProg) drawNav(vp, eye);
       if (lineProg) drawZones(vp, eye);
+      if (lineProg) drawEffects(vp, eye);
       if (drawGrid) drawGrid(grid, { vp, eye, f, viewH, fov: FOV, far });
       gl.bindVertexArray(null);
       overlayDirty = true;
@@ -986,6 +1009,7 @@ export function renderStage(node, ctx) {
       g2.setTransform(dpr, 0, 0, dpr, 0, 0);
       drawGimmickPaths(g2);
       drawZoneLabels(g2);
+      drawEffectLabels(g2);
       if (cnMode) drawCnOverlay(g2);
       // The axis indicator sits in the bottom-left corner, above the hint line that runs along the bottom.
       if (grid.axes) drawAxisIndicator(g2, hint.offsetParent ? hint.offsetTop - overlay.offsetTop : overlay.clientHeight, basis());
@@ -1191,6 +1215,7 @@ export function renderStage(node, ctx) {
       downloadRefresh();
       gimmickRefresh();
       zoneRefresh();
+      effectRefresh();
       dirty = true;
     }
     function undo() {
@@ -1418,7 +1443,16 @@ export function renderStage(node, ctx) {
         if (sky?.Mode === 'picture' && !picture) skyNote += ' Choose the picture again in the Sky panel to see it.';
       }
       // The file's fog (a "fog" feature), and the features this page doesn't edit, kept as they are.
-      const { fog: fileFog, [COLNAV_KEY]: fileCn, links: fileLinks, [SETUP_KEY]: fileSetup, [STAGE_VOLUMES_KEY]: fileSv, ...rest } = res.features;
+      const { fog: fileFog, [COLNAV_KEY]: fileCn, links: fileLinks, [SETUP_KEY]: fileSetup, [STAGE_VOLUMES_KEY]: fileSv, [EFFECTS_KEY]: fileFx, ...rest } = res.features;
+      // The file's moved effects and sounds (an "effects" feature) replace these.
+      if (fileFx && typeof fileFx === 'object' && !Array.isArray(fileFx)) {
+        const before = new Map(edit.effectMoved), after = movedFromFeature(fileFx);
+        if (JSON.stringify(effectsFeature(before)) !== JSON.stringify(effectsFeature(after))) {
+          setEffectMoved(after);
+          acts.push({ undo: () => setEffectMoved(before), redo: () => setEffectMoved(after) });
+          skyNote += ` Effects and sounds: ${after.size} moved.`;
+        }
+      }
       // The file's removed stage collision (a "stagevolumes" feature) replaces this.
       if (fileSv && typeof fileSv === 'object' && !Array.isArray(fileSv)) {
         const before = new Set(edit.zoneRemoved), after = removedFromFeature(fileSv);
@@ -3587,6 +3621,7 @@ export function renderStage(node, ctx) {
       if (mode === cnMode) return;
       const why = mode ? cnBlocked(mode) : null;
       if (why) return flash(why);
+      if (mode) effectToolOff();
       cnStrokeEnd();
       const was = cnMode;
       cnMode = mode;
@@ -4315,6 +4350,431 @@ export function renderStage(node, ctx) {
       );
     else trapZones = new Map();
 
+    // ----- effects and sounds (StageViewerForm.Effects.cs) -----
+    // The stage's effect table: the particle effects it places and its sound emitters, drawn as markers (J). The move
+    // tool (Shift+J) drags one on its level and the wheel raises or lowers it, each change one undo step; Download
+    // effect table writes the moved numbers into a copy of the table.
+    const fxTable = scene.effects ?? null;
+    const fxList = fxTable?.effects ?? [];
+    const fxShow = job.effectShow || (job.effectShow = { on: false, filter: 0 });
+    let fxTool = false, fxSel = null, fxHover = null, fxDrag = null, fxWheelTimer = 0, fxRows = [];
+    const fxAt = (e) => edit.effectMoved.get(e.id) ?? e.position;
+    const fxMoved = (e) => edit.effectMoved.has(e.id);
+    const fxPasses = (e) => fxShow.filter === 0 || (fxShow.filter === 1) === (e.kind === 'effect');
+    const fxShown = (e) => fxShow.on && fxPasses(e);
+    const fxKind = (e) => (e.kind === 'sound' ? 'sound' : 'effect');
+    const fxSame = (a, b) => (a && b ? a.every((x, k) => Math.abs(x - b[k]) <= 0.05) : a === b);
+    const fxCounts = () => {
+      const n = fxList.filter((e) => e.kind === 'effect').length;
+      return `${n} effects, ${fxList.length - n} sounds`;
+    };
+    const fxHud = (e) => `Effects and sounds — ${fxKind(e)} ${effectName(e)} (${e.key}) · at ${fxAt(e).map((x) => x.toFixed(0)).join(', ')}` +
+      (fxMoved(e) ? ' · moved by hand' : '');
+    const fxOrder = (a, b) => byText(effectName(a), effectName(b)) || byText(a.key, b.key);
+    /** Puts one at p; null, or where the stage has it, puts it back. */
+    function placeEffect(e, p) {
+      if (!p || fxSame(p, e.position)) edit.effectMoved.delete(e.id);
+      else edit.effectMoved.set(e.id, p.slice());
+      dirty = overlayDirty = true;
+    }
+    function setEffectMoved(next) {
+      edit.effectMoved = new Map([...next].map(([id, p]) => [id, p.slice()]));
+      dirty = overlayDirty = true;
+    }
+    /**
+     * One undo step for a change to one (EndEffectChange): from before (null: where the stage has it) to where it is
+     * now. Steps with the same merge key (a held key, a turn of the wheel) make one.
+     */
+    function effectStep(e, before, label, mergeKey = null) {
+      const after = edit.effectMoved.get(e.id)?.slice() ?? null;
+      if (fxSame(before, after) && !mergeKey) return;
+      const act = {
+        after,
+        undo: () => placeEffect(e, before),
+        redo: () => placeEffect(e, act.after),
+        merge: (next) => ((act.after = next.after), true),
+        drop: () => fxSame(before, act.after),
+      };
+      edit.history.push([], label, mergeKey, act);
+      if (!mergeKey) edit.history.breakMerge();
+      edited();
+      status.textContent = fxHud(e);
+    }
+    const fxWas = (e) => edit.effectMoved.get(e.id)?.slice() ?? null;
+    function nudgeEffect(e, d, mergeKey) {
+      const was = fxWas(e), p = fxAt(e);
+      placeEffect(e, [p[0] + d[0], p[1] + d[1], p[2] + d[2]]);
+      effectStep(e, was, `Move ${fxKind(e)} ${effectName(e)}`, mergeKey);
+    }
+    /** Back where the stage has it, undoable as "Put back <name>" (ResetEffect). */
+    function putBackEffect(e) {
+      const was = fxWas(e);
+      if (!was) return (status.textContent = `${effectName(e)} is where the stage has it`);
+      placeEffect(e, null);
+      effectStep(e, was, `Put back ${effectName(e)}`);
+      status.textContent = `${effectName(e)} is back where the stage has it`;
+    }
+    function putBackAllEffects() {
+      const was = new Map(edit.effectMoved);
+      if (!was.size) return (status.textContent = 'Every effect and sound is where the stage has it');
+      setEffectMoved(new Map());
+      edit.history.push([], 'Put back every effect and sound', null, { undo: () => setEffectMoved(was), redo: () => setEffectMoved(new Map()) });
+      edit.history.breakMerge();
+      edited();
+      status.textContent = `${was.size} put back where the stage has them`;
+    }
+    function selectEffect(e) {
+      if (fxSel !== e) edit.history.breakMerge();
+      fxSel = e;
+      if (e) status.textContent = fxHud(e);
+      renderEffects();
+      dirty = overlayDirty = true;
+    }
+    /** Shows them (and this one, past the filter). */
+    function showEffects(e = null) {
+      fxShow.on = fxShowBox.checked = true;
+      if (e && !fxPasses(e)) {
+        fxShow.filter = 0;
+        fxFilter.value = '0';
+        renderEffects(true);
+      }
+      dirty = overlayDirty = true;
+    }
+    /** The camera looks down at one (LookAtEffect). */
+    function lookAtEffect(e) {
+      showEffects(e);
+      cam.target = fxAt(e).slice();
+      cam.pitch = Math.min(cam.pitch, -0.45);
+      cam.dist = Math.max(1200, (e.range ?? 0) * 1.6);
+      dirty = true;
+    }
+    function toggleEffects() {
+      if (!fxTable) return (status.textContent = 'This stage has no effect table the editor found');
+      fxShow.on = fxShowBox.checked = !fxShow.on;
+      if (!fxShow.on && fxTool) setEffectTool(false);
+      status.textContent = fxShow.on ? `Effects and sounds shown (${fxCounts()})` : 'Effects and sounds hidden';
+      dirty = overlayDirty = true;
+    }
+    const FX_HINT = 'Effects and sounds: click one to select it, drag to move, wheel to raise or lower, arrows and PgUp/PgDn to nudge, Tab the next one, Delete puts it back — Shift+J done';
+    function setEffectTool(on) {
+      if (on === fxTool) return;
+      if (on && !fxTable) return (status.textContent = 'This stage has no effect table the editor found');
+      if (on) {
+        if (cnMode) setCnMode(0);
+        select(null);
+        showEffects();
+      } else cancelEffectDrag();
+      fxTool = on;
+      fxHover = null;
+      canvas.style.cursor = '';
+      status.textContent = on ? FX_HINT : 'Effects and sounds: done';
+      edit.history.breakMerge();
+      renderEffects();
+      dirty = overlayDirty = true;
+    }
+    effectToolOff = () => setEffectTool(false);
+    /** The next shown one in the list's order, the camera on it (Tab). */
+    function cycleEffect(d) {
+      const list = fxList.filter(fxShown).sort(fxOrder);
+      if (!list.length) return;
+      const i = list.indexOf(fxSel), e = list[i < 0 ? (d > 0 ? 0 : list.length - 1) : (i + d + list.length) % list.length];
+      selectEffect(e);
+      lookAtEffect(e);
+    }
+    /** The shown one drawn nearest a point of the view, within 24 px of its post (EffectNear). */
+    function effectNear(p) {
+      let best = 24 * 24, found = null;
+      for (const e of fxList) {
+        if (!fxShown(e)) continue;
+        const a = fxAt(e), q = project([a[0], a[1] + 60, a[2]]);
+        if (!q) continue;
+        const d = (q.x - p.x) ** 2 + (q.y - p.y) ** 2;
+        if (d < best) {
+          best = d;
+          found = e;
+        }
+      }
+      return found;
+    }
+    function effectHover(p) {
+      const h = fxShow.on ? effectNear(p) : null;
+      if (h === fxHover) return;
+      fxHover = h;
+      dirty = overlayDirty = true;
+      if (fxTool) canvas.style.cursor = h ? 'pointer' : '';
+    }
+    /** Where a view ray meets the level y. */
+    function fxOnLevel(p, y) {
+      const { o, d } = rayAt(p.x, p.y);
+      if (Math.abs(d[1]) < 1e-6) return null;
+      const t = (y - o[1]) / d[1];
+      return t > 0 ? [o[0] + d[0] * t, y, o[2] + d[2] * t] : null;
+    }
+    /** Left on a marker selects it and grabs it on its level; the drag starts past 4 px (BeginEffectChange). */
+    function effectPointerDown(p) {
+      const e = effectNear(p);
+      if (!e) return false;
+      selectEffect(e);
+      const at = fxAt(e), hit = fxOnLevel(p, at[1]);
+      fxDrag = { e, was: fxWas(e), x0: p.x, y0: p.y, moving: false, off: hit ? [at[0] - hit[0], 0, at[2] - hit[2]] : [0, 0, 0], y: at[1] };
+      return true;
+    }
+    function effectDragMove(p) {
+      const g = fxDrag;
+      if (!g.moving && Math.hypot(p.x - g.x0, p.y - g.y0) <= 4) return;
+      g.moving = true;
+      const hit = fxOnLevel(p, g.y);
+      if (!hit) return;
+      placeEffect(g.e, [hit[0] + g.off[0], g.y, hit[2] + g.off[2]]);
+      status.textContent = fxHud(g.e);
+    }
+    function effectDragEnd() {
+      const g = fxDrag;
+      fxDrag = null;
+      if (g?.moving) effectStep(g.e, g.was, `Move ${fxKind(g.e)} ${effectName(g.e)}`);
+    }
+    function cancelEffectDrag() {
+      const g = fxDrag;
+      fxDrag = null;
+      if (g?.moving) {
+        placeEffect(g.e, g.was);
+        status.textContent = fxHud(g.e);
+      }
+    }
+    /** The wheel raises or lowers the selected one: 50 a notch, Shift 10. */
+    function effectWheel(ev) {
+      const d = ev.deltaY || ev.deltaX; // Shift turns the wheel sideways in some browsers
+      if (!d) return;
+      nudgeEffect(fxSel, [0, (d < 0 ? 1 : -1) * (ev.shiftKey ? 10 : 50), 0], `fxw:${fxSel.id}`);
+      clearTimeout(fxWheelTimer);
+      fxWheelTimer = setTimeout(() => edit.history.breakMerge(), 600);
+    }
+    /** The tool's keys (EffectKey); true when one was used. */
+    function effectKey(ev, k) {
+      if (k === 'escape') {
+        if (fxDrag) cancelEffectDrag();
+        else if (fxSel) selectEffect(null);
+        else setEffectTool(false);
+        return true;
+      }
+      if (k === 'tab') return cycleEffect(ev.shiftKey ? -1 : 1), true;
+      const e = fxSel;
+      if (!e || fxDrag) return false;
+      if (k === 'delete' || k === 'home') return putBackEffect(e), true;
+      if (k === 'pageup' || k === 'pagedown') return nudgeEffect(e, [0, (k === 'pageup' ? 1 : -1) * (ev.shiftKey ? 250 : 50), 0], `fxk:${e.id}`), true;
+      const arrows = { arrowup: [1, 0], arrowdown: [-1, 0], arrowleft: [0, -1], arrowright: [0, 1] }[k];
+      if (!arrows) return false;
+      // Along the view, flattened: up away from the camera, right to the view's right.
+      const { f, r } = basis(), s = ev.shiftKey ? 500 : 50;
+      const flat = (v) => {
+        const n = Math.hypot(v[0], v[2]);
+        return n > 1e-6 ? [v[0] / n, 0, v[2] / n] : [0, 0, 0];
+      };
+      const fw = flat(f), rt = flat(r);
+      nudgeEffect(e, [0, 1, 2].map((i) => (fw[i] * arrows[0] + rt[i] * arrows[1]) * s), `fxk:${e.id}`);
+      return true;
+    }
+    async function downloadEffectTable() {
+      if (!fxTable) return;
+      let r, bytes;
+      try {
+        r = movedEffectTable(fxTable, (rec) => edit.effectMoved.get(rec.id) ?? null);
+        if (!r) return toast('No effect or sound has been moved yet.');
+        bytes = await effectTableBytes(fxTable, r.text);
+      } catch (e) {
+        console.error(e);
+        return toast(`The effect table could not be written: ${e.message}`, 'error');
+      }
+      downloadBytes(bytes, fxTable.name, 'application/json');
+      const parts = [];
+      if (r.effects) parts.push(`${r.effects} effect${r.effects === 1 ? '' : 's'}`);
+      if (r.sounds) parts.push(`${r.sounds} sound${r.sounds === 1 ? '' : 's'}`);
+      toast(`Effects and sounds: ${parts.join(' and ')} moved by hand — written to ${fxTable.name}.`, 'ok', 10000);
+    }
+    // The panel: show and filter, the tool, the list (Look at, Put back) and the download.
+    const fxShowBox = el('input', { type: 'checkbox' });
+    fxShowBox.checked = fxShow.on;
+    fxShowBox.addEventListener('change', () => {
+      if (fxShowBox.checked !== fxShow.on) toggleEffects();
+    });
+    const fxFilter = el('select', { title: 'Which ones to show and list' }, ...EFFECT_FILTERS.map((t, i) => el('option', { value: String(i) }, t)));
+    fxFilter.value = String(fxShow.filter);
+    fxFilter.addEventListener('change', () => {
+      fxShow.filter = Number(fxFilter.value);
+      if (fxSel && !fxPasses(fxSel)) fxSel = null;
+      renderEffects(true);
+      dirty = overlayDirty = true;
+    });
+    const fxToolBtn = button('Move tool', () => setEffectTool(!fxTool), {
+      class: 'btn btn-sm',
+      title: 'Click an effect or sound to select it, drag it on its level, the wheel raises or lowers it (Shift+J)',
+    });
+    const fxBackAllBtn = button('Put back all', putBackAllEffects, { class: 'btn btn-sm', title: 'Put back every effect and sound' });
+    const fxDownloadBtn = button('Download effect table', downloadEffectTable, {
+      class: 'btn btn-sm',
+      title: "Write the moved effects and sounds into a copy of the stage's effect table (<stage>_stage_effect.json), every other byte as it was",
+    });
+    const fxNote = el('p', { class: 'muted stage-count' });
+    const fxInfo = el('p', { class: 'muted stage-effect-info' });
+    const fxListBox = el('div', { class: 'stage-gimmick-list stage-zone-list' });
+    function effectRow(e) {
+      const state = el('span', { class: 'muted' });
+      const back = button('Put back', () => putBackEffect(e), { class: 'btn btn-sm', title: `Put ${effectName(e)} back where the stage has it` });
+      const c = e.kind === 'sound' ? SOUND_COLOUR : EFFECT_COLOUR;
+      const row = el(
+        'div',
+        { class: 'stage-layer stage-zone', title: describeEffect(e, e.position, false) },
+        el('span', { class: 'stage-zone-swatch', style: `background: ${cssColour(c)}` }),
+        el('span', { class: 'stage-layer-name' }, effectName(e) + (e.name && e.name !== e.key ? `  ·  ${e.key}` : '')),
+        el(
+          'span',
+          { class: 'stage-zone-acts' },
+          state,
+          button('Look at', () => (selectEffect(e), lookAtEffect(e)), { class: 'btn btn-sm', title: `Point the camera at ${effectName(e)}` }),
+          back,
+        ),
+      );
+      row.update = () => {
+        state.textContent = fxMoved(e) ? 'moved' : '';
+        back.disabled = !fxMoved(e);
+        row.classList.toggle('active', fxSel === e);
+      };
+      return row;
+    }
+    function renderEffects(rebuild = false) {
+      if (!fxTable) {
+        effectBox.replaceChildren(
+          el('p', { class: 'muted' }, ctx.dataFiles?.('json/stage').length
+            ? 'No effect table found for this stage (json/stage/<stage>_stage_effect.json), so no effects or sounds to show.'
+            : "Open the game's Data folder to see this stage's effects and sounds (json/stage/<stage>_stage_effect.json)."),
+        );
+        return;
+      }
+      const moved = fxList.filter(fxMoved).length;
+      fxNote.textContent = `${fxCounts()}${moved ? ` · ${moved} moved` : ''} · ${fxTable.name}`;
+      fxToolBtn.setAttribute('aria-pressed', String(fxTool));
+      fxBackAllBtn.disabled = fxDownloadBtn.disabled = !moved;
+      fxInfo.hidden = !fxSel;
+      fxInfo.textContent = fxSel ? describeEffect(fxSel, fxAt(fxSel), fxMoved(fxSel)) : '';
+      if (rebuild || !fxRows.length) {
+        fxRows = fxList.filter(fxPasses).sort(fxOrder).map(effectRow);
+        fxListBox.replaceChildren(...fxRows);
+      }
+      for (const r of fxRows) r.update();
+      if (!effectBox.contains(fxListBox))
+        effectBox.replaceChildren(
+          el('div', { class: 'stage-zone-toggles' }, el('label', {
+            class: 'check',
+            title: 'Where the stage plays its particle effects (orange, a diamond on top) and its sounds (green, a ring where they are heard) (J)',
+          }, fxShowBox, ' Show'), fxFilter),
+          fxNote,
+          el('div', { class: 'toolbar' }, fxToolBtn, fxBackAllBtn, fxDownloadBtn),
+          fxInfo,
+          fxListBox,
+        );
+    }
+    // The markers (one buffer, a run per colour and pass) and the labels drawn over them.
+    const fxGpu = {};
+    let fxLabelList = [];
+    function drawEffectsNow(vp, eye) {
+      fxLabelList = [];
+      if (!fxTable || !fxShow.on) return;
+      const aimed = fxDrag ? fxDrag.e : fxHover, sel = fxSel;
+      const focus = (e) => e === aimed || e === sel;
+      const lines = { effect: [], sound: [], ring: [], fxFocus: [], seFocus: [], fxBack: [], seBack: [] };
+      const near = [];
+      for (const e of fxList) {
+        if (!fxShown(e)) continue;
+        const p = fxAt(e), snd = e.kind === 'sound';
+        if (focus(e)) {
+          const out = snd ? lines.seFocus : lines.fxFocus;
+          markerLines(out, e, p);
+          if (snd && e.range > 0) rangeRing(out, p, e.range);
+          if (fxMoved(e)) (snd ? lines.seBack : lines.fxBack).push(...e.position, ...p);
+          continue;
+        }
+        markerLines(snd ? lines.sound : lines.effect, e, p);
+        if (snd && e.range > 0) rangeRing(lines.ring, p, e.range);
+        const d = (p[0] - eye[0]) ** 2 + (p[1] - eye[1]) ** 2 + (p[2] - eye[2]) ** 2;
+        if (d < 3000 * 3000) near.push({ d, e, p });
+      }
+      // Labels: the few nearest the camera, then the aimed and the selected one with more.
+      near.sort((a, b) => a.d - b.d);
+      const label = (e, p, more) => {
+        let text = effectName(e);
+        if (more) {
+          if (e.name && e.name !== e.key) text += `  ·  ${e.key}`;
+          if (e.kind === 'sound' && e.range > 0) text += `  ·  heard within ${oneDecimal(e.range / 100)} m`;
+          if (fxMoved(e)) text += '  ·  moved';
+        }
+        fxLabelList.push({ at: [p[0], p[1] + postOf(e) + 40, p[2]], text, c: e.kind === 'sound' ? SOUND_COLOUR : EFFECT_COLOUR, a: more ? 1 : 200 / 255 });
+      };
+      for (const { e, p } of near.slice(0, 12)) label(e, p, false);
+      for (const e of new Set([aimed, sel])) if (e && fxShown(e)) label(e, fxAt(e), true);
+      const brighter = (c) => c.map((x) => Math.min(1, x + 0.2));
+      const runs = [], data = [];
+      const run = (list, c, a, both) => {
+        if (!list.length) return;
+        runs.push({ c, a, both, first: data.length / 3, count: list.length / 3 });
+        for (const x of list) data.push(x);
+      };
+      run(lines.effect, EFFECT_COLOUR, 1, true);
+      run(lines.sound, SOUND_COLOUR, 1, true);
+      run(lines.ring, SOUND_COLOUR, 0.7, true);
+      run(lines.fxFocus, brighter(EFFECT_COLOUR), 1, false);
+      run(lines.seFocus, brighter(SOUND_COLOUR), 1, false);
+      run(lines.fxBack, EFFECT_COLOUR, 0.5, false);
+      run(lines.seBack, SOUND_COLOUR, 0.5, false);
+      if (!runs.length) return;
+      fillLines(fxGpu, data, []);
+      // Faint through the ground, then solid where they are in view; the aimed and the selected one on top.
+      gl.useProgram(lineProg.program);
+      gl.uniformMatrix4fv(lineProg.u.uViewProj, false, vp);
+      gl.uniform3fv(lineProg.u.uEye, eye);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.depthMask(false);
+      gl.bindVertexArray(fxGpu.vao);
+      for (const [depth, alpha] of [[false, 0.22], [true, 0.9]]) {
+        if (depth) gl.enable(gl.DEPTH_TEST);
+        else gl.disable(gl.DEPTH_TEST);
+        for (const r of runs)
+          if (r.both) {
+            gl.uniform4f(lineProg.u.uColor, r.c[0], r.c[1], r.c[2], alpha * r.a);
+            gl.drawArrays(gl.LINES, r.first, r.count);
+          }
+      }
+      gl.disable(gl.DEPTH_TEST);
+      for (const r of runs)
+        if (!r.both) {
+          gl.uniform4f(lineProg.u.uColor, r.c[0], r.c[1], r.c[2], r.a);
+          gl.drawArrays(gl.LINES, r.first, r.count);
+        }
+      gl.disable(gl.BLEND);
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthMask(true);
+      gl.useProgram(prog.program);
+    }
+    function drawEffectLabelsNow(g2) {
+      if (!fxLabelList.length) return;
+      g2.save();
+      g2.font = '12px system-ui, sans-serif';
+      g2.textAlign = 'center';
+      for (const l of fxLabelList) {
+        const q = project(l.at);
+        if (!q || q.x < -300 || q.y < -40 || q.x > viewW + 300 || q.y > viewH + 40) continue;
+        g2.fillStyle = 'rgb(0 0 0 / 0.6)';
+        g2.fillText(l.text, q.x + 1, q.y + 1);
+        g2.fillStyle = `rgb(${l.c.map((x) => Math.trunc(x * 255)).join(' ')} / ${l.a.toFixed(3)})`;
+        g2.fillText(l.text, q.x, q.y);
+      }
+      g2.restore();
+    }
+    effectRefresh = renderEffects;
+    drawEffects = drawEffectsNow;
+    drawEffectLabels = drawEffectLabelsNow;
+    renderEffects();
+
     function renderGimmicks() {
       const gm = scene.gimmicks;
       if (!gm) {
@@ -4632,6 +5092,12 @@ export function renderStage(node, ctx) {
     canvas.addEventListener('pointerdown', (e) => {
       canvas.focus();
       canvas.setPointerCapture(e.pointerId);
+      if (fxTool && e.button === 0) {
+        // The effects tool: a marker is grabbed; anywhere else turns the view, and a click there lets go of the selection.
+        if (effectPointerDown(local(e))) return;
+        drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, pan: e.shiftKey, moved: false, fx: true };
+        return;
+      }
       if (cnMode && e.button === 0) return cnPointerDown(local(e), e.shiftKey);
       if (e.button === 0 && !gdrag) {
         const p = local(e), handle = gizmoHit(p);
@@ -4644,6 +5110,7 @@ export function renderStage(node, ctx) {
       drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, pan: cnMode ? e.button === 1 : e.button !== 0 || e.shiftKey, moved: false };
     });
     canvas.addEventListener('pointermove', (e) => {
+      if (fxDrag) return effectDragMove(local(e));
       if (gdrag) return moveGizmo(local(e), e);
       if (boxDrag) {
         const p = local(e);
@@ -4653,6 +5120,8 @@ export function renderStage(node, ctx) {
         return;
       }
       if (cnMode && !drag) return cnPointerMove(local(e), e.shiftKey);
+      if (!drag && fxShow.on) effectHover(local(e));
+      if (!drag && fxTool) return;
       if (!drag) {
         const h = gizmoHit(local(e));
         if (h !== hover) {
@@ -4677,6 +5146,7 @@ export function renderStage(node, ctx) {
       dirty = true;
     });
     canvas.addEventListener('pointerup', (e) => {
+      if (fxDrag) return effectDragEnd();
       if (gdrag) return endGizmo();
       if (cnStroke) return cnStrokeEnd();
       if (boxDrag) {
@@ -4690,11 +5160,13 @@ export function renderStage(node, ctx) {
       const d = drag;
       drag = null;
       if (!d || d.moved || e.button !== 0) return;
+      if (d.fx) return selectEffect(null);
       const p = local(e);
       const { o, d: dir } = rayAt(p.x, p.y);
       inspect(pick(scene, o, dir));
     });
     canvas.addEventListener('pointercancel', () => {
+      cancelEffectDrag();
       if (gdrag) cancelDrag();
       cnStrokeEnd();
       drag = null;
@@ -4719,6 +5191,7 @@ export function renderStage(node, ctx) {
       'wheel',
       (e) => {
         e.preventDefault();
+        if (fxTool && fxSel && !e.altKey) return effectWheel(e);
         if (cnMode && cnMode !== 4 && !e.altKey) return cnWheel(e);
         cam.dist = Math.max(near(), cam.dist * Math.exp(e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0015)));
         dirty = true;
@@ -4750,6 +5223,12 @@ export function renderStage(node, ctx) {
       if (k === 'f10') {
         e.preventDefault();
         return openMenu();
+      }
+      if (fxTool && !ctrl && !e.altKey && effectKey(e, k)) return e.preventDefault();
+      // J shows the effects and sounds, Shift+J is their move tool.
+      if (k === 'j' && !ctrl && !e.altKey && (e.shiftKey || !cnMode)) {
+        e.preventDefault();
+        return e.shiftKey ? setEffectTool(!fxTool) : toggleEffects();
       }
       if (cnMode && !ctrl && cnKey(e, k)) return e.preventDefault();
       if (k === 'u' && !e.altKey) {
@@ -5140,6 +5619,12 @@ export function renderStage(node, ctx) {
           ? { text: 'Gimmick paths', value: () => onOff(gptBox.checked), activate: toggleGpt, desc: "The routes moving gimmicks follow (Rainbow's rafts …). A raft path's ends follow their harbours when you move them; the bundle download writes the moved paths" }
           : null,
         { text: 'Collision & nav editor', activate: closeThen(() => setCnMode(colRead?.live ? 1 : 2)), desc: 'Erase or add collision, paint nav, edit waypoints (F3)' },
+        fxTable
+          ? { text: 'Effects and sounds', value: () => onOff(fxShow.on), activate: toggleEffects, desc: 'Where the stage plays its particle effects and sounds (J)' }
+          : null,
+        fxTable
+          ? { text: 'Move effects and sounds', activate: closeThen(() => setEffectTool(true)), desc: 'Drag one on its level, the wheel raises or lowers it; Download effect table writes them (Shift+J)' }
+          : null,
         {
           text: 'Textures',
           value: () => onOff(texBox.checked),

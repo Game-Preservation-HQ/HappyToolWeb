@@ -522,6 +522,8 @@ span.twisty { cursor: default; }
 .stage-zone .stage-layer-name { flex: 1 0 auto; max-width: calc(100% - 16px); }
 .stage-zone-acts { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 .stage-zone-swatch { flex: 0 0 auto; width: 10px; height: 10px; border-radius: 2px; }
+.stage-zone.active { background: var(--accent-soft); border-radius: 4px; }
+.stage-effect-info { white-space: pre-line; margin: 4px 0; }
 .stage-side .btn-sm { padding: 1px 7px; font-size: 12px; }
 .stage-gimmick { padding-left: 4px; border-radius: 4px; cursor: pointer; }
 .stage-gimmick:hover, .stage-gimmick:focus-visible { background: rgba(127, 127, 127, 0.14); }
