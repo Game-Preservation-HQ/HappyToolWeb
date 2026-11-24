@@ -24,10 +24,11 @@ import { dataRootOf, preferredLng, isSearchable } from './formats/lng-refs.js';
 import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictures } from './browser.js';
 import { loadHandle, saveHandle, forgetHandle, readDirectory } from './data-folder.js';
 import { openPalette, setAppCommands } from './palette.js';
-import { menuBar } from './menubar.js';
+import { menuBar, contextMenu } from './menubar.js';
 import { openQuickOpen } from './views/quick-open.js';
 import { showFindInFiles } from './views/find-in-files.js';
 import { showCompareFolders } from './views/compare-folders.js';
+import { showBresCompare } from './views/bres-compare.js';
 import { startGamepad } from './gamepad.js';
 
 const $ = (id) => document.getElementById(id);
@@ -156,7 +157,25 @@ const folderActions = {
     renderView();
   },
   togglePin,
+  menu: (target, x, y, keyboard) => contextMenu(browserMenu(target), x, y, keyboard),
 };
+
+/**
+ * The file browser's right-click menu, the desktop's (GameDataEditor ctxTree) less what a browser cannot do: Open in
+ * Explorer, Install or check this stage… and Delete…; Open with BRES editor is left out too, as every .bres here
+ * already opens in the bundle view. The full path is the path among the open files.
+ */
+function browserMenu({ rec = null, stage = false, dir = null }) {
+  const path = rec ? rec.path : dir.path;
+  const copy = (s) => navigator.clipboard.writeText(s).catch(() => {});
+  return [
+    { label: 'Open with editor', run: () => (stage ? openStage(rec) : openFile(rec)), enabled: () => !!rec },
+    { label: 'Compare .rrm / .rmd models with other .bres…', run: () => compareBundlesOf(path), enabled: () => !!rec && /\.bres$/i.test(path) },
+    { label: 'Copy full path', run: () => copy(path) },
+    { label: 'Copy name', run: () => copy(baseName(path.replace(/[\\/]+$/, ''))) },
+    { label: prefs.pins.includes(path) ? 'Unpin from Places' : 'Pin to Places', run: () => togglePin(path) },
+  ];
+}
 
 // ---------- nodes: one decoded level (a file, or an entry inside a bundle) ----------
 
@@ -981,10 +1000,17 @@ function compareFolders() {
   showCompareFolders({ files: toolFiles, root: toolsRoot, open: openToolFile });
 }
 
+/** Compare two bundles on the .bres `path` among the open files (the browser's context menu), or on none (Tools). */
+function compareBundlesOf(path = null) {
+  const rec = path ? findFile(tree, path) : null;
+  showBresCompare({ workshop: rec ? { path: rec.path, read: async () => new Uint8Array(await rec.file.arrayBuffer()) } : null });
+}
+
 const toolItems = [
   { label: 'Quick Open…', keys: 'Ctrl+P', hint: 'Find a file in the Data folder by name (fuzzy)', run: quickOpen },
   { label: 'Find in files…', hint: 'Search the text of every file under a folder', run: findInFiles },
   { label: 'Compare two folders…', hint: 'List the files two folders do not share or that differ', run: compareFolders },
+  { label: 'Compare two bundles…', hint: 'Pair the .rrm / .rmd models of two .bres bundles (renamed, changed, gone, new)', run: () => compareBundlesOf() },
 ];
 $('btn-find').before(menuBar([{ label: 'Tools', items: toolItems }], 'Tools'));
 

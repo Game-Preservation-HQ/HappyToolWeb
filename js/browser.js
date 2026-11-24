@@ -186,6 +186,18 @@ export function findFile(tree, path) {
  * @param {{tree, browse: string, mode: 'icons'|'details', pins: string[]}} s
  * @param {{browse(path:string):void, openRec(rec):void, openStage(rec):void, setMode(m:string):void, togglePin(path:string):void}} act
  */
+/**
+ * Right-click (or the menu key) on a tile or a row: `act.menu(target, x, y, keyboard)` shows the browser's context
+ * menu. `target` is {rec, stage?} for a file or {dir} for a folder.
+ */
+const menuOn = (act, target) => (e) => {
+  if (!act.menu) return;
+  e.preventDefault();
+  const keyboard = e.clientX === 0 && e.clientY === 0;
+  const r = e.currentTarget.getBoundingClientRect();
+  act.menu(target, keyboard ? r.left : e.clientX, keyboard ? r.bottom : e.clientY, keyboard);
+};
+
 export function renderFolder(s, act) {
   const dir = s.tree.dirs.get(s.browse) ?? s.tree.root;
   const subdirs = sortedDirs(dir);
@@ -228,7 +240,7 @@ export function renderFolder(s, act) {
             const pic = s.pics?.get(id.toLowerCase());
             return el(
               'button',
-              { type: 'button', class: `tile stage-tile${r.dirty ? ' dirty' : ''}`, title: `${r.path}\nOpen the map`, onclick: () => act.openStage(r) },
+              { type: 'button', class: `tile stage-tile${r.dirty ? ' dirty' : ''}`, title: `${r.path}\nOpen the map`, onclick: () => act.openStage(r), oncontextmenu: menuOn(act, { rec: r, stage: true }) },
               pic ? el('span', { class: 'stage-pic' }, pic) : iconEl(stageArtSvg(), 'stage-pic'),
               el('span', { class: 'tile-name' }, id),
               el('span', { class: 'tile-note' }, stageTableId(id)),
@@ -243,12 +255,12 @@ export function renderFolder(s, act) {
         'div',
         { class: 'tiles' },
         ...subdirs.map((d) =>
-          el('button', { type: 'button', class: 'tile', title: `${d.path}\n${countFiles(d)} files`, onclick: () => act.browse(d.path) }, iconEl(folderIconSvg(48)), el('span', { class: 'tile-name' }, d.name), folderNote(d.name) ? el('span', { class: 'tile-note' }, folderNote(d.name)) : null),
+          el('button', { type: 'button', class: 'tile', title: `${d.path}\n${countFiles(d)} files`, onclick: () => act.browse(d.path), oncontextmenu: menuOn(act, { dir: d }) }, iconEl(folderIconSvg(48)), el('span', { class: 'tile-name' }, d.name), folderNote(d.name) ? el('span', { class: 'tile-note' }, folderNote(d.name)) : null),
         ),
         ...others.map((r) =>
           el(
             'button',
-            { type: 'button', class: `tile${r.dirty ? ' dirty' : ''}`, title: `${r.path}\n${fileType(r.path).name}, ${formatSize(r.file.size)}`, onclick: () => act.openRec(r) },
+            { type: 'button', class: `tile${r.dirty ? ' dirty' : ''}`, title: `${r.path}\n${fileType(r.path).name}, ${formatSize(r.file.size)}`, onclick: () => act.openRec(r), oncontextmenu: menuOn(act, { rec: r }) },
             iconEl(fileIconSvg(r.path, 48)),
             el('span', { class: 'tile-name' }, baseOf(r.path)),
           ),
@@ -260,10 +272,10 @@ export function renderFolder(s, act) {
 }
 
 function detailsTable(subdirs, files, act) {
-  const row = (icon, name, type, size, onclick, dirty) =>
+  const row = (icon, name, type, size, onclick, dirty, target) =>
     el(
       'tr',
-      {},
+      { oncontextmenu: menuOn(act, target) },
       el('td', { class: 'name' }, el('button', { type: 'button', class: `row-open${dirty ? ' dirty' : ''}`, onclick }, iconEl(icon), el('span', {}, name))),
       el('td', {}, type),
       el('td', { class: 'num' }, size),
@@ -278,10 +290,10 @@ function detailsTable(subdirs, files, act) {
       el(
         'tbody',
         {},
-        ...subdirs.map((d) => row(folderIconSvg(20), d.name, folderNote(d.name) || 'Folder', `${countFiles(d)} files`, () => act.browse(d.path))),
+        ...subdirs.map((d) => row(folderIconSvg(20), d.name, folderNote(d.name) || 'Folder', `${countFiles(d)} files`, () => act.browse(d.path), false, { dir: d })),
         ...files.map((r) => {
           const id = stageIdFor(r.path);
-          return row(fileIconSvg(r.path, 20), baseOf(r.path), id ? `Stage map (${stageTableId(id)})` : fileType(r.path).name, formatSize(r.file.size), () => (id ? act.openStage(r) : act.openRec(r)), r.dirty);
+          return row(fileIconSvg(r.path, 20), baseOf(r.path), id ? `Stage map (${stageTableId(id)})` : fileType(r.path).name, formatSize(r.file.size), () => (id ? act.openStage(r) : act.openRec(r)), r.dirty, { rec: r, stage: !!id });
         }),
       ),
     ),

@@ -769,5 +769,11 @@ span.twisty { cursor: default; }
 .cf-options { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; }
 .cf-options label { display: inline-flex; align-items: center; gap: 6px; }
 .cf-options .btn { margin-left: auto; }
+.bc-top { display: grid; grid-template-columns: 1fr auto; gap: 8px 10px; align-items: center; margin-bottom: 8px; font-size: 13px; }
+.bc-path { overflow-wrap: anywhere; }
+.bc-options { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.bc-options label { display: inline-flex; align-items: center; gap: 6px; }
+.bc-hint { margin: 0 0 8px; line-height: 1.4; }
+.bc-grid td.bc-details { white-space: normal; overflow-wrap: anywhere; }
 .cf-grid td { overflow-wrap: anywhere; }
 .cf-grid td:nth-child(n+3) { white-space: nowrap; }
