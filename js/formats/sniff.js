@@ -3,6 +3,7 @@ import { ascii4, extOf, looksLikeText } from '../util.js';
 import { isBres } from './bres.js';
 import { isDds } from './dds.js';
 import { looksLikeLngHeader, parseLng } from './lng.js';
+import { isAnimationPayload } from './rra.js';
 
 const TEXT_EXT = new Set(['.txt', '.xml', '.csv', '.cfg', '.ini', '.nut', '.lua', '.html', '.htm', '.js', '.css', '.yml', '.yaml', '.md', '.log', '.shader', '.fx', '.hlsl']);
 const IMAGE_MAGIC = [
@@ -21,6 +22,7 @@ export const KIND_LABELS = {
   image: 'Image',
   nutc: 'Compiled script',
   tanda: 'UI scene',
+  rra: 'Animation',
   hex: 'Binary',
 };
 
@@ -39,6 +41,7 @@ export function sniff(u8, name = '') {
   for (const [magic, mime] of IMAGE_MAGIC) if (magic.every((b, i) => u8[i] === b)) return { kind: 'image', mime };
   if (u8.length >= 2 && u8[0] === 0xfa && u8[1] === 0xfa) return { kind: 'nutc' }; // Squirrel bytecode
   if (ext === '.tanda') return { kind: 'tanda' }; // UI scene: HappyTool opens it by name and warns when it isn't TLAD
+  if (ext === '.rra' || ext === '.cmf' || isAnimationPayload(u8)) return { kind: 'rra' }; // by name loose, by content in a bundle
   if (ext === '.lng' || (looksLikeLngHeader(u8) && !looksLikeText(u8))) {
     try {
       parseLng(u8);

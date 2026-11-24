@@ -13,6 +13,7 @@ import { renderNut } from './views/nut-view.js';
 import { renderMedia } from './views/media-view.js';
 import { renderHex } from './views/hex-view.js';
 import { renderTanda } from './views/tanda-view.js';
+import { renderRra } from './views/rra-view.js';
 import { dataRootOf, preferredLng, isSearchable } from './formats/lng-refs.js';
 import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictures } from './browser.js';
 import { loadHandle, saveHandle, forgetHandle, readDirectory } from './data-folder.js';
@@ -559,6 +560,8 @@ function pickView(node, ctx) {
       return renderMedia(node, ctx, ctx.showHex);
     case 'tanda':
       return renderTanda(node, ctx);
+    case 'rra':
+      return renderRra(node, ctx);
     case 'nutc':
       return renderHex(node, ctx, 'Compiled Squirrel script (bytecode). Shown as bytes.');
     default:
