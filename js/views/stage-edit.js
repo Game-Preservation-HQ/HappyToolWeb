@@ -379,6 +379,57 @@ export function store(stage, objects, sky = null, features = null, gimmicks = nu
   }
 }
 
+// ---------- edits set aside (StageViewerForm.Stock.cs SetAsideFiles, SetAsideWhen, SetCurrentEditsAside, BringBackEdits) ----------
+
+const SET_ASIDE = '.set-aside-';
+const two = (n) => String(n).padStart(2, '0');
+const asideStamp = (d) => `${d.getFullYear()}${two(d.getMonth() + 1)}${two(d.getDate())}-${two(d.getHours())}${two(d.getMinutes())}${two(d.getSeconds())}`;
+
+/** This stage's set-aside edits (their keys), newest first, ordered as the desktop orders its "<stem>.set-aside-<stamp>.json" files. */
+export function setAsideKeys(stage) {
+  const prefix = STORE + stage.toLowerCase() + SET_ASIDE;
+  const keys = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k?.startsWith(prefix)) keys.push(k);
+    }
+  } catch {
+    return [];
+  }
+  const up = (k) => `${k}.json`.toUpperCase();
+  return keys.sort((a, b) => (up(a) < up(b) ? 1 : up(a) > up(b) ? -1 : 0));
+}
+
+/** "2026-10-06 14:03" from a set-aside key. */
+export function setAsideWhen(key) {
+  const at = key.lastIndexOf(SET_ASIDE);
+  const stamp = at >= 0 ? key.slice(at + SET_ASIDE.length) : key;
+  const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$/.exec(stamp);
+  return m ? `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}` : stamp;
+}
+
+/** Moves the kept edits to a dated set-aside key; returns that key, or '' when nothing is kept. Throws when it can't. */
+export function setEditsAside(stage) {
+  const key = STORE + stage.toLowerCase();
+  const raw = localStorage.getItem(key);
+  if (raw == null) return '';
+  const stem = key + SET_ASIDE + asideStamp(new Date());
+  let aside = stem;
+  for (let n = 2; localStorage.getItem(aside) != null; n++) aside = `${stem}-${n}`;
+  localStorage.setItem(aside, raw);
+  localStorage.removeItem(key);
+  return aside;
+}
+
+/** Puts set-aside edits back as the kept ones (after the current ones were set aside). Throws when they are gone. */
+export function bringBackEdits(stage, aside) {
+  const raw = localStorage.getItem(aside);
+  if (raw == null) throw new Error('Those edits are no longer there.');
+  localStorage.setItem(STORE + stage.toLowerCase(), raw);
+  localStorage.removeItem(aside);
+}
+
 // ---------- gizmo maths ----------
 
 export const AXES = [

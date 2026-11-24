@@ -901,3 +901,153 @@ export async function restoreStock(root, plan, { onStep } = {}) {
   step(100, message);
   return done(true, message, r.pre);
 }
+
+// ------------------------------------------------------------------ the map as it ships (StageInstaller.FindStockBundle, StageViewerForm.StockBundle)
+
+/**
+ * Stage id's bundle as the game shipped it, as far as HappyTool's backups know (FindStockBundle): the copy the oldest
+ * install or settings set holding stage\<id>.bres saved before changing it, as {set, entry, file, sha256}. Null when no
+ * backup holds the bundle, the stock game has none (HappyTool added the stage) or the copy is gone.
+ */
+export async function findStockBundle(root, id, all = null) {
+  all ??= await listBackupSets(root);
+  const sets = all.filter((s) => s.loadError == null && (s.operation === 'install' || s.operation === 'settings'))
+    .sort((a, b) => byCreated(a, b) || cmpIgnoreCase(a.name, b.name));
+  for (const set of sets) {
+    const e = set.entries.find((x) => isBundleOf(x, id));
+    if (!e) continue;
+    if (!e.existed) return null;
+    const file = await backupCopy(set, e);
+    return file && e.sha256 ? { set, entry: e, file, sha256: e.sha256.toLowerCase() } : null;
+  }
+  return null;
+}
+
+/**
+ * The stage as it ships, for "start over" (StageViewerForm.StockBundle): {bytes, sha256, set} from the stock copy in
+ * HappyTool's backups, else the game's own file when no backup holds it (HappyTool never changed it), else null.
+ */
+export async function stockBundle(root, id, all = null) {
+  if (!isValidStageId(id)) return null;
+  all ??= await listBackupSets(root);
+  const stock = await findStockBundle(root, id, all);
+  if (stock) return { bytes: await readBytes(stock.file), sha256: stock.sha256, set: stock.set };
+  const game = await fileAt(root.data, `stage\\${id}.bres`);
+  const own = `stage\\${id}.bres`;
+  if (!game || (await stageBackupSets(root, id, all)).some((s) => (s.entries ?? []).some((e) => sameName(e.path ?? '', own)))) return null;
+  const bytes = await readBytes(game);
+  return { bytes, sha256: await sha256(bytes), set: null };
+}
+
+// ------------------------------------------------------------------ back to an original the user chose (StageInstaller.cs 1340-1435)
+
+async function dirAt(dir, rel) {
+  for (const d of parts(rel)) {
+    dir = await child(dir, d, 'directory');
+    if (!dir) return null;
+  }
+  return dir;
+}
+
+/** Every file under a folder as [relative path, handle], deepest folders included. */
+async function filesUnder(dir, rel, deep) {
+  const out = [];
+  for await (const h of dir.values()) {
+    if (h.kind === 'file') out.push([`${rel}\\${h.name}`, h]);
+    else if (deep) out.push(...(await filesUnder(h, `${rel}\\${h.name}`, true)));
+  }
+  return out;
+}
+
+/**
+ * How to put stage id back from an original the user chose (PlanRestoreFromCopy): source.file (a .bres) goes back as
+ * stage\<id>.bres; source.folder (another copy's game folder or its Data folder) brings that copy's stage\<id>.bres and
+ * the stage's other own files it has (isStageOwnedFile: tables, decoration tables, mini bundle, stage script). Files the
+ * copy doesn't have are left as they are. {plan: {stageId, source, sourceName, sourceData, files: [{path, file, differs}],
+ * toChange}} or {error}.
+ */
+export async function planRestoreFromCopy(root, id, source) {
+  if (!isValidStageId(id)) return { error: `'${id}' isn't a stage id.` };
+  const bundleRel = `stage\\${id}.bres`;
+  let bundle, sourceData = null, sourceName;
+  if (source?.folder) {
+    const picked = source.folder;
+    const data = await child(picked, 'Data', 'directory');
+    const inData = data ? await fileAt(data, bundleRel) : null;
+    sourceData = inData ? data : picked;
+    bundle = inData ?? (await fileAt(picked, bundleRel));
+    if (!bundle) return { error: `"${picked.name}" has no Data\\${bundleRel}. Choose another copy's game folder or its Data folder.` };
+    sourceName = inData ? `${picked.name}\\Data\\${bundleRel}` : `${picked.name}\\${bundleRel}`;
+  } else {
+    bundle = source?.file;
+    sourceName = bundle?.name ?? '';
+    try {
+      if (!bundle) throw new Error();
+      await bundle.getFile();
+    } catch {
+      return { error: `File not found: ${sourceName}` };
+    }
+  }
+  const own = await fileAt(root.data, bundleRel);
+  if (own && (await own.isSameEntry(bundle)))
+    return { error: `That is the game's own ${id}.bres, the one to be replaced. Choose the original from another copy of the game, `
+      + 'a download or a file you saved.' };
+  const plan = { stageId: id, source, sourceName, sourceData: !!sourceData, files: [] };
+  const add = async (rel, file) => {
+    checkDataPath(rel);
+    const now = await fileAt(root.data, rel);
+    const differs = !now || (await sha256(await readBytes(now))) !== (await sha256(await readBytes(file)));
+    plan.files.push({ path: rel, file, differs });
+  };
+  await add(bundleRel, bundle);
+  if (sourceData)
+    for (const sub of ['stage\\mini', 'json\\stage', 'json\\stagedeco', `ssn\\${id}`]) {
+      const folder = await dirAt(sourceData, sub);
+      if (!folder) continue;
+      const found = (await filesUnder(folder, sub, sub === 'json\\stagedeco')).sort((a, b) => cmpIgnoreCase(a[0], b[0]));
+      for (const [rel, fh] of found) if (!sameName(rel, bundleRel) && isStageOwnedFile(rel, id)) await add(rel, fh);
+    }
+  plan.toChange = plan.files.filter((f) => f.differs).length;
+  return { plan };
+}
+
+/**
+ * Puts a stage's files back from the original the user chose (RestoreFromCopy): the plan is made again and must match,
+ * every file that differs is read, and the current state is saved as a pre-restore set first, so this can be undone from
+ * Backups. Resolves to {ok, message, log, preRestore}.
+ */
+export async function restoreFromCopy(root, plan, { onStep } = {}) {
+  const log = [];
+  const step = (pct, text) => {
+    log.push(text);
+    onStep?.(pct, text);
+  };
+  const done = (ok, message, preRestore = null) => ({ ok, message, log, preRestore });
+  if (!plan || plan.files.length === 0) return done(false, 'Nothing was chosen to put back.');
+  const id = plan.stageId;
+  const todo = plan.files.filter((f) => f.differs);
+  if (!todo.length) {
+    const message = `'${id}' is already the same as the chosen original.`;
+    step(100, message);
+    return done(true, message);
+  }
+  // No running-game check: a browser can't see processes (the confirmation asks to close Happy Wars).
+  const again = await planRestoreFromCopy(root, id, plan.source);
+  if (!again.plan || again.plan.files.length !== plan.files.length
+      || !again.plan.files.every((f, i) => f.path === plan.files[i].path && f.differs === plan.files[i].differs))
+    return done(false, again.error ?? "The game's files or the chosen original changed after this was planned, so nothing was changed. "
+      + 'Try again to see what it would do now.');
+
+  step(5, 'Reading the chosen original…');
+  const entries = [];
+  const byPath = new Map();
+  for (const f of todo) {
+    entries.push({ path: f.path, existed: true });
+    byPath.set(f.path.toLowerCase(), await readBytes(f.file));
+  }
+  const r = await putBack(root, id, plan.sourceName, `State before putting '${id}' back from ${plan.sourceName}`, entries, byPath, step);
+  if (!r.ok) return done(false, r.message, r.pre);
+  const message = `Put ${todo.length} file(s) of '${id}' back from ${plan.sourceName} (undo: restore '${r.pre.name}' from Backups under Restore stock…).`;
+  step(100, message);
+  return done(true, message, r.pre);
+}

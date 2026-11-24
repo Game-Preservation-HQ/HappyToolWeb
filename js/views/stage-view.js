@@ -7,7 +7,7 @@
 import { el, button, toast, downloadBlob, pickFiles, confirmBox, debounce, openDialog } from '../ui.js';
 import { BRUSH_TOOLS, RAISE, MIN_BRUSH, MAX_BRUSH, MIN_STRENGTH, MAX_STRENGTH, BRUSH_COLOURS, stockBounds, groundPieces, coverGround, groundHeights, sculptObject, liftFor, brushGroundY, brushStep, encodeSculpt, decodeSculpt, sculptWarp, warpNav } from './stage-terraform.js';
 import { decodeLayers, encodeLayers, writableLayers } from '../formats/wrappers.js';
-import { writeBres } from '../formats/bres.js';
+import { writeBres, parseBres } from '../formats/bres.js';
 import {
   collectExportEdits,
   bakeEdits,
@@ -20,7 +20,8 @@ import {
 import { downloadBytes } from '../util.js';
 import {
   openGameFolder, readRegistration, createPlan, install, BACKUP_FOLDER, listBackupSets, stageBackupSets, compareWithCurrent, restoreBackupSet,
-  isValidStageId, describeStage, planStockRestore, stockState, restoreStock as putStageBackToStock,
+  isValidStageId, describeStage, planStockRestore, stockState, restoreStock as putStageBackToStock, stockBundle, planRestoreFromCopy,
+  restoreFromCopy, sha256,
 } from '../formats/stage-install.js';
 import { stageGlb, stageObjZip } from '../formats/model-export.js';
 import { setViewCommands, openPalette } from '../palette.js';
@@ -32,7 +33,7 @@ import {
   IDENTITY, AXES, UNIFORM, History, collectObjects, writeObject, withState, sameState, isEmpty, wrapDegrees, niceStep,
   shortObjectName, editsFile, readEditsFile, loadStored, store, stageKey, ringPoint, distanceToSegment,
   closestParamOnAxis, screenAngle, screenTurnSign, turnAbout, isIdentityTransform, rotation, turnState, turnStateBy,
-  scaleState, rotationDelta,
+  scaleState, rotationDelta, setAsideKeys, setAsideWhen, setEditsAside, bringBackEdits,
 } from './stage-edit.js';
 import {
   GRID_SHOW, loadGrid, saveGrid, sizeText, gridSummary, stepSize, snapAxisMove, snapCarryMove, gridDrawer, drawAxisIndicator,
@@ -652,11 +653,13 @@ function readGimmickEdits(edit, list) {
 
 /** The map view of a stage bundle node. ctx.back returns to the entry list. */
 export function renderStage(node, ctx) {
-  const model = node.model;
+  // node.mapBase: the bundle the editor builds on instead of the file (the stock map after "Start over from the stock map").
+  const model = node.mapBase?.model ?? node.model;
   let job = jobs.get(model);
   const status = el('span', { class: 'muted stage-status' }, 'Reading the stage…');
   if (!job) {
-    job = { report: null, camera: null };
+    job = { report: null, camera: node.carryCamera ?? null }; // carryCamera: the view a reopen keeps
+    node.carryCamera = null;
     const id = stageKey(model.name);
     const ids = [...new Set([id, id.replace(/_harness$/i, ''), ctx.filePath ? stageKey(ctx.filePath) : null].filter(Boolean))];
     job.ids = ids;
@@ -836,7 +839,9 @@ export function renderStage(node, ctx) {
     let carry = null; // the object the controller carries: {o, start, surface, lift, dist, offset, twisted, sig}
     let releasePad = null;
     let last = performance.now();
-    const saveSoon = debounce(() => store(edit.stage, edit.objects, edit.sky, fogFeatures(edit), gimmickEdits(edit), edit.sculptFile), 250);
+    // keepEdits: edit.closed once the edits were set aside and the map reopens, so this view no longer writes them back.
+    const keepEdits = () => edit.closed || store(edit.stage, edit.objects, edit.sky, fogFeatures(edit), gimmickEdits(edit), edit.sculptFile);
+    const saveSoon = debounce(keepEdits, 250);
 
     function framed(b, from) {
       return { yaw: from.yaw, pitch: from.pitch, target: centre(b), dist: (radius(b) / Math.sin(FOV / 2)) * 1.05 };
@@ -1616,7 +1621,7 @@ export function renderStage(node, ctx) {
       releasePad?.();
       menu?.dispose();
       if (carry) cancelCarry(); // a carried object goes back to where it was picked up
-      store(edit.stage, edit.objects, edit.sky, fogFeatures(edit), gimmickEdits(edit), edit.sculptFile);
+      keepEdits();
       if (edit.navMatch && !edit.navMatch.done) {
         // Unfinished (the worker running, or the nav still being read): the next view starts it again.
         edit.navMatch.worker?.terminate();
@@ -2539,6 +2544,7 @@ export function renderStage(node, ctx) {
         status.textContent = was;
       }
       const names = new Set(all.map((x) => x.name.toLowerCase()));
+      const asides = setAsideKeys(id).slice(0, 5);
       const chosen = await openDialog((dlg, done) => {
         dlg.classList.add('dialog-wide');
         const action = (title, description, value, enabled = true) =>
@@ -2553,11 +2559,25 @@ export function renderStage(node, ctx) {
         dlg.append(
           el('h2', { class: 'dialog-title' }, 'Restore stock'),
           el('p', { class: 'muted' }, `${describeStage(id)} in "${root.game.name}"   ·   ${line}`),
+          el('div', { class: 'backup-rows' },
+            action('Restore stock — here and in the game…', "Puts it all back the way the stage ships: your edits are set aside (not "
+              + "deleted), the game's own files for this stage go back to stock from HappyTool's backups (the current ones are backed up "
+              + 'first), and the map reopens.', 'everywhere', isValidStageId(id))),
+          el('h3', { class: 'backup-section' }, 'This map in the editor'),
+          el('div', { class: 'backup-rows' },
+            action('Start over from the stock map', 'Sets all your edits aside — moved, hidden and added objects, gimmicks, terraforming, '
+              + "sky, decorations — and reopens the map as the stage ships. The game's files stay as they are. Nothing is deleted: bring "
+              + 'the edits back from this page.', 'startover'),
+            asides.map((key) => action(`Bring back edits set aside ${setAsideWhen(key)}`,
+              'Reopens the map with those edits. Your current edits are set aside first, so you can swap back.', { aside: key }))),
           el('h3', { class: 'backup-section' }, "The game's files"),
           el('div', { class: 'backup-rows' },
             action("Put only the game's files back to stock…", "Puts the game's own files for this stage — its .bres and its tables — "
               + 'back the way they were before HappyTool first changed them, from the backups below. Your edits stay in the editor. '
               + 'The current files are backed up first.', 'stock', isValidStageId(id)),
+            action('Put this stage back from an original file…', "Choose the stage's original .bres — from another copy of the game, a "
+              + "download or a file you saved — and it goes back into the game (with the stage's tables when you choose another copy's "
+              + 'game folder instead of the file). The current files are backed up first.', 'original', isValidStageId(id)),
             action('Verify all game files with Steam…', 'Steam checks every Happy Wars file and downloads the original of anything '
               + 'changed. This undoes every mod and installed map.', 'verify')),
           el('h3', { class: 'backup-section' }, sets.length ? `Backups (${sets.length})` : 'Backups'),
@@ -2569,7 +2589,11 @@ export function renderStage(node, ctx) {
         );
       });
       if (chosen?.set) await restoreBackup(root, chosen.set, names);
+      else if (chosen?.aside) await bringBackSetAside(chosen.aside);
+      else if (chosen === 'everywhere') await restoreStockEverywhere(root);
+      else if (chosen === 'startover') await startOverFromStock(root);
       else if (chosen === 'stock') await restoreStockInGame(root);
+      else if (chosen === 'original') await restoreFromChosenOriginal(root);
       else if (chosen === 'verify') await verifyWithSteam();
     }
     /** VerifyWithSteam: Steam puts back the original of every changed file (all mods and installed maps). */
@@ -2583,15 +2607,19 @@ export function renderStage(node, ctx) {
       ));
       if (r === 'steam') steamStarted();
     }
-    /** When the backups can't say what stock is (OfferOriginalOrSteam; choosing an original file comes with its own slice). */
-    async function offerSteam(why) {
+    /** When the backups can't say what stock is (OfferOriginalOrSteam): choose an original file, or let Steam verify every file. */
+    async function offerOriginalOrSteam(root, why) {
       const r = await openDialog((dlg, done) => dlg.append(
         el('h2', { class: 'dialog-title' }, 'Restore stock'),
         el('p', { class: 'dialog-text' }, why),
-        el('p', { class: 'dialog-text' }, 'Steam can verify every game file instead (that undoes all mods and installed maps).'),
-        el('div', { class: 'dialog-actions' }, button('Cancel', () => done(null), { autofocus: true }), steamLink(done)),
+        el('p', { class: 'dialog-text' }, 'Choose the original map file (from another copy of the game, a download or a file you saved) and put '
+          + 'it back, or let Steam verify every game file (that undoes all mods and installed maps).'),
+        el('div', { class: 'dialog-actions' }, button('Cancel', () => done(null)),
+          button('Choose the original file…', () => done('original'), { class: 'btn btn-primary', autofocus: true }),
+          steamLink(done, 'Verify with Steam')),
       ));
       if (r === 'steam') steamStarted();
+      else if (r === 'original') await restoreFromChosenOriginal(root);
     }
     /** StageListNote: the shared stage list isn't reset by a stock restore. */
     const stageListNote = (plan, name) =>
@@ -2621,13 +2649,13 @@ export function renderStage(node, ctx) {
       }
       if (plan.unreadableSets.length) {
         const n = plan.unreadableSets.length;
-        return offerSteam(`HappyTool can't read ${n === 1 ? `the backup set '${plan.unreadableSets[0]}'`
+        return offerOriginalOrSteam(root, `HappyTool can't read ${n === 1 ? `the backup set '${plan.unreadableSets[0]}'`
           : `${n} backup sets (${plan.unreadableSets.map((s) => `'${s}'`).join(', ')})`}, which may hold ${name}'s original files, so it `
           + `can't tell how the game shipped them. Repair or remove ${n === 1 ? 'it' : 'them'} in ${root.game.name}\\${BACKUP_FOLDER} and `
           + 'try again, or put the original back another way.');
       }
       if (plan.noBackups)
-        return offerSteam(`HappyTool hasn't changed ${name} in the game (it has no backup of its files), so as far as HappyTool knows it `
+        return offerOriginalOrSteam(root, `HappyTool hasn't changed ${name} in the game (it has no backup of its files), so as far as HappyTool knows it `
           + 'is stock. If it was changed some other way, put the original back another way.');
       // Nothing to change comes first: a stage HappyTool added and that is gone again needs no "restore its first install".
       if (plan.toChange === 0)
@@ -2649,7 +2677,7 @@ export function renderStage(node, ctx) {
           ...(same > 0 ? [el('p', { class: 'muted' }, `(${same} more file(s) are already stock)`)] : []),
           ...(plan.stageListSets.length ? [el('p', { class: 'dialog-text' }, stageListNote(plan, name))] : []),
           el('p', { class: 'dialog-text' }, 'Your edits stay in the editor (Install into game… to play them again). The current files are '
-            + 'backed up first, so this can be undone from Backups under Restore stock…. Close Happy Wars before you go on.'),
+            + 'backed up first, so this can be undone from Backups on the Restore stock… page. Close Happy Wars before you go on.'),
           el('div', { class: 'dialog-actions' },
             button('Cancel', () => done(false)), button('Put back to stock', () => done(true), { class: 'btn btn-primary', autofocus: true })),
         );
@@ -2670,6 +2698,308 @@ export function renderStage(node, ctx) {
       // The desktop reopens the map from the game's file; here the map came from a file of its own, so it stays as it is.
       if (r.ok) toast(`${name}'s game files are back to stock (${plan.toChange} file(s)) — your edits are still here. Undo: Restore stock… → Backups`, 'ok', 15000);
       else toast(`Could not put ${name} back to stock: ${r.message}`, 'error', 15000);
+    }
+    // ----- the map in the editor (StageViewerForm.Stock.cs StartOverFromStock, BringBackEdits, ReopenStage, RestoreStockEverywhere) -----
+    /** Anything to set aside: the edits this browser keeps for the map (written now, unsaved ones included). */
+    function hasEditsToSetAside() {
+      keepEdits();
+      return loadStored(edit.stage) != null;
+    }
+    /**
+     * SetCurrentEditsAside: the edits written now and moved to a dated set-aside key; that key, '' when there was nothing to
+     * set aside, or null after saying it failed (failure says what that means).
+     */
+    async function setCurrentEditsAside(failure = 'so nothing was changed') {
+      if (carry) cancelCarry();
+      try {
+        keepEdits();
+        return setEditsAside(edit.stage);
+      } catch (e) {
+        await info(`Could not set your edits aside, ${failure}:`, e.message);
+        return null;
+      }
+    }
+    /**
+     * ReopenStage: the view built again with the edits kept now and the same camera; base is the bundle to build on
+     * ({model, layers, sha}), null for the file the map was opened from, or undefined for the one it is built on now.
+     */
+    function reopenMap(message, base) {
+      edit.closed = true;
+      jobs.delete(model);
+      if (base !== undefined) {
+        jobs.delete(node.model);
+        if (node.mapBase) jobs.delete(node.mapBase.model);
+        node.mapBase = base;
+      }
+      try {
+        node.carryCamera = structuredClone(cam);
+      } catch {
+        node.carryCamera = null;
+      }
+      ctx.rerender();
+      toast(message, 'ok', 12000);
+    }
+    /**
+     * The stage as it ships (StockBundle) as {sha, base}: base is what reopenMap builds on (null when it is the opened file
+     * itself); null when the backups can't say what stock is or the copy can't be read as a stage.
+     */
+    async function stockBase(root, id) {
+      const stock = isValidStageId(id) ? await stockBundle(root, id) : null;
+      if (!stock) return null;
+      if (stock.sha256 === (await sha256(node.raw))) return { sha: stock.sha256, base: null };
+      try {
+        const d = await decodeLayers(stock.bytes);
+        const m = parseBres(d.payload);
+        if (!looksLikeStage(m)) throw new Error('it has no stage model');
+        return { sha: stock.sha256, base: { model: m, layers: d.layers, sha: stock.sha256 } };
+      } catch (e) {
+        console.warn(`Map editor: the stock ${id}.bres${stock.set ? ` in '${stock.set.name}'` : ''} could not be read: ${e.message}`);
+        return null;
+      }
+    }
+    /** The hash of the bundle the editor builds on now. */
+    const currentBaseSha = async () => node.mapBase?.sha ?? sha256(node.raw);
+    /** StartOverFromStock: every edit set aside and the map reopened as the stage ships (the stock bundle, not the file opened). */
+    async function startOverFromStock(root) {
+      let stock;
+      try {
+        stock = await stockBase(root, edit.stage);
+      } catch (e) {
+        return toast(`Could not read HappyTool's backups: ${e.message}`, 'error', 10000);
+      }
+      const onStock = stock == null || stock.sha === (await currentBaseSha());
+      if (!hasEditsToSetAside() && onStock) return toast('No edits — this is already the stock map', 'info', 6000);
+      const ok = await openDialog((dlg, done) => dlg.append(
+        el('h2', { class: 'dialog-title' }, 'Restore stock'),
+        el('p', { class: 'dialog-text' }, 'Start over from the stock map?'),
+        el('p', { class: 'dialog-text' }, `All your edits to ${edit.stage} — moved, hidden and added objects, gimmicks, terraforming, sky and `
+          + "decorations — are set aside (not deleted) and the map reopens as the stage ships. The game's files stay as they are."),
+        el('p', { class: 'dialog-text' }, 'To get the edits back: Restore stock… → Bring back edits.'),
+        el('div', { class: 'dialog-actions' },
+          button('Cancel', () => done(false)), button('Start over', () => done(true), { class: 'btn btn-primary', autofocus: true })),
+      )).then((v) => v === true);
+      if (!ok) return;
+      const aside = await setCurrentEditsAside();
+      if (aside == null) return;
+      reopenMap(aside ? `Stock map — your edits were set aside (${setAsideWhen(aside)})` : 'Stock map', stock ? stock.base : undefined);
+    }
+    /** BringBackEdits: the current edits set aside, those put back, and the map reopened on the file it was opened from. */
+    async function bringBackSetAside(key) {
+      if (!setAsideKeys(edit.stage).includes(key)) return toast('Those edits are no longer there', 'warn', 6000);
+      const when = setAsideWhen(key);
+      const ok = await openDialog((dlg, done) => dlg.append(
+        el('h2', { class: 'dialog-title' }, 'Restore stock'),
+        el('p', { class: 'dialog-text' }, `Bring back the edits set aside ${when}?`),
+        el('p', { class: 'dialog-text' }, 'Your current edits are set aside first, so you can swap back from this page.'),
+        el('div', { class: 'dialog-actions' },
+          button('Cancel', () => done(false)), button('Bring back', () => done(true), { class: 'btn btn-primary', autofocus: true })),
+      )).then((v) => v === true);
+      if (!ok) return;
+      const current = await setCurrentEditsAside();
+      if (current == null) return;
+      try {
+        bringBackEdits(edit.stage, key);
+      } catch (e) {
+        return info('Could not bring the edits back:', e.message, current ? `Your current edits are set aside ${setAsideWhen(current)}.` : null);
+      }
+      // The desktop reopens on the map the edits file names (BaseSha256); this browser keeps no base, so the file opened.
+      reopenMap(`Brought back the edits set aside ${when}`, null);
+    }
+    /** StockFileLines: each file a stock restore changes, and how many are already stock. */
+    const stockFileItems = (plan) => {
+      const same = plan.files.length - plan.toChange;
+      return [
+        el('ul', { class: 'restore-files' }, plan.files.filter((f) => !f.alreadyStock).map((f) =>
+          el('li', {}, `${f.entry.existed ? 'restore' : 'remove'} Data\\${f.path}`))),
+        ...(same > 0 ? [el('p', { class: 'muted' }, `(${same} more file(s) are already stock)`)] : []),
+      ];
+    };
+    /**
+     * RestoreStockEverywhere: the edits set aside, this stage's own game files back to stock from HappyTool's backups (the
+     * current ones backed up first) and the map reopened as the stage ships. The game's files go first; when that fails
+     * nothing else changes.
+     */
+    async function restoreStockEverywhere(root) {
+      const id = edit.stage;
+      const name = describeStage(id);
+      const was = status.textContent;
+      status.textContent = "Reading HappyTool's backups and the game's files…";
+      let plan, stock;
+      try {
+        plan = await planStockRestore(root, id);
+        stock = await stockBase(root, id);
+      } catch (e) {
+        return toast(`Could not read the backups: ${e.message}`, 'error', 10000);
+      } finally {
+        status.textContent = was;
+      }
+      let gameToDo = false, gameLine;
+      if (plan.unreadableSets.length)
+        gameLine = "The game's files can't be put back here: HappyTool can't read the backup set(s) "
+          + `${plan.unreadableSets.map((s) => `'${s}'`).join(', ')}, which may hold ${name}'s original files. Repair or remove them in `
+          + `${root.game.name}\\${BACKUP_FOLDER}, or use "Put this stage back from an original file…" on the Restore stock… page.`;
+      else if (plan.noBackups) gameLine = "The game's files stay as they are: HappyTool never changed them.";
+      else if (plan.toChange === 0) gameLine = `The game's files are already stock (${plan.files.length} file(s) checked).`;
+      else if (plan.addedByHappyTool)
+        gameLine = `The game's files stay: '${id}' was added by HappyTool, so the stock game doesn't have it. To take it out of the game, `
+          + 'restore its first install from Backups on the Restore stock… page.';
+      else {
+        gameToDo = true;
+        gameLine = "In the game, from HappyTool's backups of the original files:";
+      }
+      const edits = hasEditsToSetAside();
+      if (!gameToDo && !edits && (stock == null || stock.sha === (await currentBaseSha())))
+        return info(`${name} is already stock here and in the game.`, gameLine);
+      const ok = await openDialog((dlg, done) => {
+        dlg.classList.add('dialog-wide');
+        dlg.append(
+          el('h2', { class: 'dialog-title' }, 'Restore stock'),
+          el('p', { class: 'dialog-text' }, `Put ${name} back to stock — here and in the game?`),
+          el('p', { class: 'dialog-text' }, `In the editor: ${edits
+            ? 'your edits are set aside (not deleted — bring them back from this page) and the map reopens as the stage ships.'
+            : 'the map reopens as the stage ships.'}`),
+          el('p', { class: 'dialog-text' }, gameLine),
+          ...(gameToDo ? stockFileItems(plan) : []),
+          ...(gameToDo && plan.stageListSets.length ? [el('p', { class: 'dialog-text' }, stageListNote(plan, name))] : []),
+          ...(gameToDo ? [el('p', { class: 'dialog-text' }, 'The current files are backed up first, so this can be undone from Backups under '
+            + 'Restore stock…. Close Happy Wars before you go on.')] : []),
+          el('div', { class: 'dialog-actions' },
+            button('Cancel', () => done(false)), button('Put back to stock', () => done(true), { class: 'btn btn-primary', autofocus: true })),
+        );
+      }).then((v) => v === true);
+      if (!ok) return;
+      if (gameToDo) {
+        bakeBtn.disabled = installBtn.disabled = stockBtn.disabled = true;
+        let r;
+        try {
+          r = await putStageBackToStock(root, plan, { onStep: (pct, text) => (status.textContent = `${text} (${pct}%)`) });
+        } catch (e) {
+          r = { ok: false, message: e.message, log: [] };
+        } finally {
+          status.textContent = was;
+          stockBtn.disabled = !canInstall;
+          renderDownload();
+        }
+        console.info(`Restore stock:\n${r.log.join('\n')}`);
+        if (!r.ok) return info(`Could not put ${name} back to stock:`, r.message);
+      }
+      const aside = edits ? await setCurrentEditsAside(gameToDo ? "but the game's files are back to stock" : 'so nothing was changed') : '';
+      if (aside == null) return;
+      if (gameToDo) {
+        // The game's file is the stock one now.
+        try {
+          stock = (await stockBase(root, id)) ?? stock;
+        } catch (e) {
+          console.warn(`Map editor: could not read the stock map again: ${e.message}`);
+        }
+      }
+      const message = `${name} is stock here${gameToDo ? ` and in the game (${plan.toChange} file(s) put back)` : ''}`
+        + `${aside ? ' — your edits were set aside' : ''}${gameToDo ? '. Undo: Restore stock… → Backups' : ''}`;
+      reopenMap(message, stock ? stock.base : null);
+    }
+
+    // ----- back from an original the user chose (StageViewerForm.Stock.cs RestoreFromChosenOriginal) -----
+    /**
+     * The original to put back, asked for while the click still counts as the user's: {file} (a .bres) or {folder}
+     * (another copy's game folder or its Data folder, which brings the stage's tables too); null when cancelled.
+     */
+    async function pickOriginal(id, name) {
+      const how = await openDialog((dlg, done) => dlg.append(
+        el('h2', { class: 'dialog-title' }, `Choose the original ${id}.bres (${name})`),
+        el('p', { class: 'dialog-text' }, 'Choose the file — from another copy of the game, a download or a file you saved — to put back only '
+          + `the map, or another copy's game folder (or its Data folder) to bring its ${id}.bres and the stage's tables.`),
+        el('div', { class: 'dialog-actions' }, button('Cancel', () => done(null)),
+          button("Another copy's folder…", () => done('folder')),
+          button('Choose the file…', () => done('file'), { class: 'btn btn-primary', autofocus: true })),
+      ));
+      try {
+        if (how === 'file') {
+          const [file] = await window.showOpenFilePicker({ id: 'happytool-original',
+            types: [{ description: 'Stage bundle (*.bres)', accept: { 'application/octet-stream': ['.bres'] } }] });
+          return file ? { file } : null;
+        }
+        if (how === 'folder') return { folder: await window.showDirectoryPicker({ id: 'happytool-original-copy', mode: 'read' }) };
+      } catch (e) {
+        if (e.name !== 'AbortError') toast(`The browser would not open that (${e.message}).`, 'error', 10000);
+      }
+      return null;
+    }
+    /** Whether a bundle file reads as a stage: null when it does, else what to say (LooksLikeStageBundle). */
+    async function notAStage(fh, label) {
+      try {
+        const bytes = new Uint8Array(await (await fh.getFile()).arrayBuffer());
+        return looksLikeStage(parseBres((await decodeLayers(bytes)).payload)) ? null : `${label} isn't a stage bundle (it has no stage model).`;
+      } catch (e) {
+        return `${label} can't be read as a stage bundle: ${e.message}`;
+      }
+    }
+    /**
+     * RestoreFromChosenOriginal: the chosen bundle must read as a stage; with another copy's folder its tables come back too.
+     * Shows what changes first; the current files are backed up, so it can be undone from Backups.
+     */
+    async function restoreFromChosenOriginal(root) {
+      const id = edit.stage;
+      const name = describeStage(id);
+      if (!window.showOpenFilePicker) return toast('Choosing a file to put back needs Chrome or Edge.', 'warn', 8000);
+      const source = await pickOriginal(id, name);
+      if (!source) return;
+      const was = status.textContent;
+      status.textContent = "Reading the chosen original and the game's files…";
+      let plan = null, error = null;
+      try {
+        error = source.file ? await notAStage(source.file, source.file.name) : null;
+        if (!error) {
+          const r = await planRestoreFromCopy(root, id, source);
+          plan = r.plan ?? null;
+          error = r.error ?? null;
+          // A folder's bundle is known once the plan found it.
+          if (plan && source.folder && (error = await notAStage(plan.files[0].file, plan.sourceName))) plan = null;
+        }
+      } catch (e) {
+        error = e.message;
+      } finally {
+        status.textContent = was;
+      }
+      if (!plan) return info(error);
+      if (plan.toChange === 0)
+        return info(`${name} in the game is already the same as ${plan.sourceName} (${plan.files.length} file(s) checked).`);
+      const same = plan.files.length - plan.toChange;
+      const fileName = plan.files[0].file.name;
+      const ok = await openDialog((dlg, done) => {
+        dlg.classList.add('dialog-wide');
+        dlg.append(
+          el('h2', { class: 'dialog-title' }, 'Restore stock'),
+          el('p', { class: 'dialog-text' }, `Put ${name} back from ${plan.sourceName}?`),
+          ...(fileName.toLowerCase() !== `${id}.bres`.toLowerCase()
+            ? [el('p', { class: 'dialog-text' }, `Note: the file isn't named ${id}.bres. It goes in as ${name}'s map all the same.`)] : []),
+          el('ul', { class: 'restore-files' }, plan.files.filter((f) => f.differs).map((f) => el('li', {}, `restore Data\\${f.path}`))),
+          ...(same > 0 ? [el('p', { class: 'muted' }, `(${same} more file(s) are already the same)`)] : []),
+          el('p', { class: 'dialog-text' }, plan.sourceData
+            ? "The stage's other files the chosen copy doesn't have are left as they are."
+            : "Only the map comes back: the stage's tables stay as they are (choose another copy's game folder instead of the file to "
+              + 'bring its tables too).'),
+          el('p', { class: 'dialog-text' }, 'Your edits stay in the editor. The current files are backed up first, so this can be undone from '
+            + 'Backups on the Restore stock… page. Close Happy Wars before you go on.'),
+          el('div', { class: 'dialog-actions' },
+            button('Cancel', () => done(false)), button('Put back', () => done(true), { class: 'btn btn-primary', autofocus: true })),
+        );
+      }).then((v) => v === true);
+      if (!ok) return;
+      bakeBtn.disabled = installBtn.disabled = stockBtn.disabled = true;
+      let r;
+      try {
+        r = await restoreFromCopy(root, plan, { onStep: (pct, text) => (status.textContent = `${text} (${pct}%)`) });
+      } catch (e) {
+        r = { ok: false, message: e.message, log: [] };
+      } finally {
+        status.textContent = was;
+        stockBtn.disabled = !canInstall;
+        renderDownload();
+      }
+      console.info(`Restore from an original:\n${r.log.join('\n')}`);
+      // The desktop reopens the map from the game's file; here the map came from a file of its own, so it stays as it is.
+      if (r.ok) toast(`${name} is back from ${fileName} (${plan.toChange} file(s)) — your edits are still here. Undo: Restore stock… → Backups`, 'ok', 15000);
+      else info(`Could not put ${name} back:`, r.message);
     }
     /** RestoreBackupSet: what each file goes back to and what it is now, then the restore (a pre-restore set first). */
     async function restoreBackup(root, set, names) {
@@ -2694,7 +3024,7 @@ export function renderStage(node, ctx) {
           ...(changed ? [el('p', { class: 'dialog-text' },
             'Some files were changed by something else since (a later install or restore, a game update or a manual edit). Restoring still works.')] : []),
           el('p', { class: 'dialog-text' },
-            'Your edits stay in the editor. The current files are backed up first, so this can be undone from Backups under Restore stock…. Close Happy Wars before you go on.'),
+            'Your edits stay in the editor. The current files are backed up first, so this can be undone from Backups on the Restore stock… page. Close Happy Wars before you go on.'),
           el('div', { class: 'dialog-actions' },
             button('Cancel', () => done(false)), button('Restore', () => done(true), { class: 'btn btn-primary', autofocus: true })),
         );
@@ -2839,7 +3169,7 @@ export function renderStage(node, ctx) {
         }
         status.textContent = 'Writing the bundle…';
         await pause();
-        const bytes = await encodeLayers(writeBres(archive), writableLayers(node.layers || []));
+        const bytes = await encodeLayers(writeBres(archive), writableLayers((node.mapBase ?? node).layers || []));
         if (target) {
           const r = await install(target.root, target.plan, bytes, {
             source: `${edit.stage}.bres`,
