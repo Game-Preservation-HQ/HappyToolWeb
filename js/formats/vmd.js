@@ -3,18 +3,13 @@
 // menu position (int32 each) and a 16-byte NUL-padded ASCII menu text id. Little-endian on PC, big-endian on Xbox 360;
 // the header decides which. The id is category * 1000 + usage; menu positions of 100+ show as T<n>, 200+ as C<n>.
 
+import { netIntTryParse as csIntTryParse } from './net-text.js';
+
+export { csIntTryParse };
 const HEADER = 12;
 const GROUP = 28;
 const TEXT_BYTES = 16;
 export const MAX_MENU_TEXT_ID_CHARS = 15;
-
-/** C# int.TryParse (NumberStyles.Integer, invariant digits): surrounding white space, one leading sign, int32 range. */
-export function csIntTryParse(s) {
-  const m = /^[\t\n\v\f\r ]*([+-]?)(\d+)[\t\n\v\f\r ]*\0*$/.exec(s ?? '');
-  if (!m) return null;
-  const v = Number((m[1] === '-' ? '-' : '') + m[2].replace(/^0+(?=\d)/, ''));
-  return v >= -2147483648 && v <= 2147483647 ? v : null;
-}
 
 export const groupId = (g) => (Math.imul(g.category, 1000) + g.usage) | 0;
 

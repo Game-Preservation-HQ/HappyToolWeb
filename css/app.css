@@ -707,3 +707,6 @@ span.twisty { cursor: default; }
 .vmd-cell.num { text-align: right; font-variant-numeric: tabular-nums; }
 .vmd-cell:hover { border-color: var(--border); }
 .vmd-cell:focus { border-color: var(--accent, var(--border)); background: var(--surface); outline: none; }
+.rml-grid td.rml-node { font-family: var(--mono); font-size: 12.5px; }
+.rml-grid td.rml-node .twisty { height: 18px; vertical-align: middle; }
+.rml-grid td.rml-value { padding: 1px 4px; min-width: 16em; }
