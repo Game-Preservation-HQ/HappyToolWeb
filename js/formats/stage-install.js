@@ -11,7 +11,7 @@
 // A browser folder handle can't reach its parent, and the backups go next to Data, so the folder to pick is the game
 // folder (the one holding Data). The game can't be seen running from a browser, so the plan always says to close it.
 
-import { decodeLayers } from './wrappers.js';
+import { decodeLayers, encodeLayers } from './wrappers.js';
 import { parseBres } from './bres.js';
 import { stripJsonComments } from './json.js';
 
@@ -314,6 +314,57 @@ export async function createPlan(data, snap, stageId) {
   return plan;
 }
 
+const WRITE_COPY = ' (byte-for-byte copy)';
+const sameBytes = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+
+/**
+ * The parts of CreatePlan that need the bundle's lint (stage-lint.js), added once the bundle is built: the plan itself
+ * is made first, while the folder pick still counts as the user's click. Re-wrapping is on, as the desktop's default;
+ * renaming another stage's files for this slot (Retarget) isn't in the web yet, so a bundle made for another stage gets
+ * the desktop's renaming-off warning.
+ */
+export function applyLint(plan, lint, { rewrap = true } = {}) {
+  plan.lint = lint;
+  plan.willRewrap = !!(rewrap && lint?.readable && !lint.isSteamWrapped);
+  const id = plan.slot?.id ?? plan.id;
+  const authoredFor = lint?.detectedStageId;
+  const otherStage = isValidStageId(authoredFor) && authoredFor.toLowerCase() !== id.toLowerCase();
+  const found = [];
+  if (otherStage)
+    found.push({ severity: 'warning', code: 'NOT_RETARGETED', message: `The bundle's files are named for '${authoredFor}', not '${id}'`,
+      detail: `The game loads ${id}.rrm, ${id}_Chit.ccp … when it loads this slot; with renaming off they keep their ${authoredFor} names and may not be found.` });
+  if (otherStage && plan.slot?.hasStageTables)
+    found.push({ severity: 'info', code: 'SLOT_TABLES_MISMATCH', message: `Installing '${authoredFor}' into the '${id}' slot`,
+      detail: `The slot keeps json\\stage\\${id}_stage_*.json (areas, gimmicks, effects authored for ${friendlyName(id) ?? id}), so objectives are placed at ${id}'s coordinates.` });
+  // The desktop adds these just before its game-running check, which the web's close-the-game note stands for.
+  const at = plan.findings.findIndex((f) => f.code === 'CLOSE_GAME');
+  plan.findings.splice(at < 0 ? plan.findings.length : at, 0, ...found);
+  if (plan.willRewrap) {
+    const i = plan.steps.findIndex((x) => x.endsWith(WRITE_COPY));
+    if (i >= 0) plan.steps[i] = plan.steps[i].slice(0, -WRITE_COPY.length) + ' (re-wrapped as ZRES + BFBR)';
+  }
+  return plan;
+}
+
+const RANK = { info: 0, warning: 1, error: 2 };
+
+/**
+ * Bundle and plan findings as the user should see them, most severe first ({source: 'Bundle'|'Target', severity, code,
+ * message, detail}). A wrapping warning the install is about to fix is shown as a note, so it doesn't ask for a
+ * confirmation. Within a severity the checks keep their own order.
+ */
+export function combinedFindings(lint, plan) {
+  const list = [];
+  for (const f of lint?.findings ?? []) {
+    if (f.code === 'NOT_STEAM_WRAPPED' && plan?.willRewrap)
+      list.push({ source: 'Bundle', severity: 'info', code: 'REWRAP', message: 'Not BFBR + ZRES wrapped — will be re-wrapped on install',
+        detail: 'The installed copy is ZRES-compressed then BFBR-encrypted like the shipped Steam stages; your file is not modified.' });
+    else list.push({ source: 'Bundle', ...f });
+  }
+  for (const f of plan?.findings ?? []) list.push({ source: 'Target', ...f });
+  return list.map((x, i) => [x, i]).sort((a, b) => RANK[b[0].severity] - RANK[a[0].severity] || a[1] - b[1]).map((t) => t[0]);
+}
+
 // ----- backups -----
 
 const pad = (n, w = 2) => String(n).padStart(w, '0');
@@ -421,7 +472,7 @@ async function rollBack(root, set, applied) {
  * backup set first, then each write read back, rolled back from the set on any failure. source names the bundle in the
  * manifest. Resolves to {ok, message, log, set}; onStep(pct, text) reports progress.
  */
-export async function install(root, plan, bytes, { source, onStep } = {}) {
+export async function install(root, plan, bytes, { source, onStep, lint } = {}) {
   const log = [];
   const step = (pct, text) => {
     log.push(text);
@@ -429,12 +480,24 @@ export async function install(root, plan, bytes, { source, onStep } = {}) {
   };
   const done = (ok, message, set = null) => ({ ok, message, log, set });
   if (!plan || plan.hasErrors || !plan.slot) return done(false, 'The install plan has errors; nothing was changed.');
+  if (!lint || !lint.readable || lint.hasErrors) return done(false, 'The bundle failed the pre-install check; nothing was changed.');
+  if (lint.sha256 && (await sha256(bytes)) !== lint.sha256.toLowerCase())
+    return done(false, 'The bundle changed after it was checked. Check it again, then install; nothing was changed.');
   const id = plan.slot.id;
   // The bytes going to disk must still open as a BRES container.
+  let payload;
   try {
-    parseBres((await decodeLayers(bytes)).payload);
+    payload = (await decodeLayers(bytes)).payload;
+    parseBres(payload);
   } catch (e) {
     return done(false, `The bundle doesn't open as a BRES container (${e.message}); nothing was changed.`);
+  }
+  if (plan.willRewrap) {
+    step(10, 'Re-wrapping bundle as ZRES + BFBR…');
+    bytes = await encodeLayers(payload, ['BFBR', 'ZRES']);
+    const check = await decodeLayers(bytes);
+    if (check.layers.join() !== 'BFBR,ZRES' || !sameBytes(check.payload, payload))
+      return done(false, 'Re-wrapped bundle did not decode back to the original payload; nothing was changed.');
   }
   // Registration read again (not the plan's snapshot) so a change since the plan isn't missed.
   step(20, 'Preparing registration changes…');

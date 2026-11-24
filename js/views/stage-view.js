@@ -21,8 +21,9 @@ import { downloadBytes } from '../util.js';
 import {
   openGameFolder, readRegistration, createPlan, install, BACKUP_FOLDER, listBackupSets, stageBackupSets, compareWithCurrent, restoreBackupSet,
   isValidStageId, describeStage, planStockRestore, stockState, restoreStock as putStageBackToStock, stockBundle, planRestoreFromCopy,
-  restoreFromCopy, sha256,
+  restoreFromCopy, sha256, applyLint, combinedFindings,
 } from '../formats/stage-install.js';
+import { lintBundle } from '../formats/stage-lint.js';
 import { stageGlb, stageObjZip } from '../formats/model-export.js';
 import { setViewCommands, openPalette } from '../palette.js';
 import { takePad, PAD } from '../gamepad.js';
@@ -2432,6 +2433,41 @@ export function renderStage(node, ctx) {
         );
       }).then((v) => v === true);
     }
+    /**
+     * The built bundle's check (stage-lint.js) with the plan's findings, most severe first (StageInstaller.CombinedFindings),
+     * as StageInstallDialog shows them before installing. blocked: it can't be installed. Resolves to 'install',
+     * 'download' or null.
+     */
+    function lintDialog(list, plan, blocked) {
+      const label = { error: 'Problem', warning: 'Warning', info: 'Note' };
+      const warnings = list.filter((f) => f.severity === 'warning').length;
+      const title = blocked
+        ? `${edit.stage}.bres can't be installed`
+        : warnings
+          ? `${warnings} warning(s): install ${edit.stage}.bres anyway?`
+          : `Install ${edit.stage}.bres?`;
+      return openDialog((dlg, done) => {
+        dlg.classList.add('dialog-wide');
+        dlg.append(
+          el('h2', { class: 'dialog-title' }, title),
+          el('p', { class: 'muted' }, blocked
+            ? 'The built bundle failed the pre-install check, so nothing in the game folder was changed. You can still download it.'
+            : 'The built bundle was checked before anything is written.'),
+          el('ul', { class: 'install-findings' }, list.map((f) =>
+            el('li', { class: `install-${f.severity}` },
+              el('strong', {}, `${label[f.severity]} (${f.source === 'Bundle' ? 'bundle' : 'target'}): ${f.message}`), el('div', { class: 'muted' }, f.detail)))),
+          ...(blocked ? [] : [el('ol', { class: 'install-steps' }, plan.steps.map((x) => el('li', {}, x)))]),
+          el('div', { class: 'dialog-actions' },
+            blocked
+              ? [button('Download the bundle', () => done('download')), button('Close', () => done(null), { class: 'btn btn-primary', autofocus: true })]
+              : [
+                  button('Cancel', () => done(null), { autofocus: true }),
+                  button('Download instead', () => done('download')),
+                  button(warnings ? 'Install anyway' : 'Install', () => done('install'), { class: 'btn btn-primary' }),
+                ]),
+        );
+      }).then((v) => (v === 'install' || v === 'download' ? v : null));
+    }
     /** The game folder as {game, data}, asked for while the click still counts as the user's; null (after a message) when not. */
     async function pickGameFolder() {
       let picked;
@@ -3171,13 +3207,32 @@ export function renderStage(node, ctx) {
         await pause();
         const bytes = await encodeLayers(writeBres(archive), writableLayers((node.mapBase ?? node).layers || []));
         if (target) {
-          const r = await install(target.root, target.plan, bytes, {
-            source: `${edit.stage}.bres`,
-            onStep: (pct, text) => (status.textContent = `${text} (${pct}%)`),
-          });
-          console.info(`Install into game:\n${r.log.join('\n')}`);
-          if (r.ok) toast(`${r.message} Backup set: ${BACKUP_FOLDER}\\${r.set.name}. ${lines.join(' ')}`, 'ok', 15000);
-          else toast(r.message, 'error', 15000);
+          // StageLint on the bytes about to be written, then its findings with the plan's (the plan was made, and
+          // confirmed, before the bundle existed, so this is the only point the bundle itself can be checked).
+          status.textContent = 'Checking the bundle…';
+          await pause();
+          const lint = await lintBundle(bytes, `${edit.stage}.bres`);
+          applyLint(target.plan, lint);
+          const list = combinedFindings(lint, target.plan);
+          console.info(`Pre-install check of ${edit.stage}.bres:\n${list.map((f) => `${f.severity} ${f.code} (${f.source}) ${f.message}`).join('\n')}`);
+          const blocked = !lint.readable || lint.hasErrors || target.plan.hasErrors;
+          // Asked again only when the check has something to say: a problem, a warning, or the re-wrap changing a step.
+          const choice = blocked || target.plan.willRewrap || list.some((f) => f.severity === 'warning')
+            ? await lintDialog(list, target.plan, blocked)
+            : 'install';
+          if (choice === 'download') {
+            downloadBytes(bytes, `${edit.stage}.bres`);
+            toast(`${edit.stage}.bres downloaded; nothing was installed. ${lines.join(' ')}`, 'ok', 10000);
+          } else if (choice === 'install') {
+            const r = await install(target.root, target.plan, bytes, {
+              source: `${edit.stage}.bres`,
+              lint,
+              onStep: (pct, text) => (status.textContent = `${text} (${pct}%)`),
+            });
+            console.info(`Install into game:\n${r.log.join('\n')}`);
+            if (r.ok) toast(`${r.message} Backup set: ${BACKUP_FOLDER}\\${r.set.name}. ${lines.join(' ')}`, 'ok', 15000);
+            else toast(r.message, 'error', 15000);
+          }
         } else {
           downloadBytes(bytes, `${edit.stage}.bres`);
           toast(`${edit.stage}.bres downloaded. ${lines.join(' ')}`, 'ok', 10000);
