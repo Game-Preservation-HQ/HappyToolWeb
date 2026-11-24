@@ -699,3 +699,27 @@ span.twisty { cursor: default; }
 .nut-tb-list summary { cursor: pointer; padding: 2px 0; font-weight: 600; }
 .nut-tb-item { display: flex; gap: 6px; align-items: center; padding: 1px 4px 1px 12px; cursor: grab; font-family: var(--mono); font-size: 12px; white-space: nowrap; border-radius: 3px; }
 .nut-tb-item:hover, .nut-tb-item:focus { background: var(--sel); outline: none; }
+/* Quick Open (Ctrl+P), the desktop Workshop's palette (js/views/quick-open.js) */
+.quick-open { --qo-row: 30px; width: min(780px, calc(100vw - 32px)); padding: 8px; margin-top: 8vh; }
+.quick-open .qo-search { width: 100%; box-sizing: border-box; font-size: 15px; }
+.qo-list { list-style: none; margin: 6px 0 0; padding: 0; overflow-y: auto; }
+.qo-row { display: flex; align-items: center; gap: 8px; height: var(--qo-row); padding: 0 8px; border-radius: var(--radius); cursor: pointer; white-space: nowrap; }
+.qo-row:hover { background: var(--surface-2); }
+.qo-row.active { background: var(--sel); }
+.qo-row b { color: var(--accent); font-weight: 700; }
+.qo-row.missing, .qo-row.missing b { color: var(--muted); }
+.qo-row.missing .qo-icon { opacity: 0.45; filter: grayscale(1); }
+.qo-icon { flex: none; display: inline-flex; width: 16px; height: 16px; }
+.qo-name { flex: none; max-width: 60%; overflow: hidden; text-overflow: ellipsis; }
+/* The folder keeps its end (nearest the file) and loses its start: "…/stage/mini". */
+.qo-folder { flex: 1 1 0; min-width: 0; margin-left: 4px; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; color: var(--muted); font-size: 13px; }
+.qo-tag { flex: none; font-size: 11px; color: var(--muted); }
+.qo-pin { flex: none; display: inline-flex; width: 16px; height: 16px; align-items: center; justify-content: center; color: var(--muted); visibility: hidden; cursor: pointer; }
+.qo-pin svg { fill: none; }
+.qo-row:hover .qo-pin, .qo-row.active .qo-pin { visibility: visible; }
+.qo-pin.on { visibility: visible; color: var(--accent); }
+.qo-pin.on svg { fill: currentColor; }
+.qo-footer { display: flex; gap: 12px; justify-content: space-between; margin: 6px 4px 0; }
+.qo-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qo-hints { flex: none; white-space: nowrap; }
+@media (max-width: 640px) { .qo-hints { display: none; } .quick-open { margin-top: 16px; } }
