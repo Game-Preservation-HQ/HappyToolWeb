@@ -18,6 +18,7 @@ import { loadHandle, saveHandle, forgetHandle, readDirectory } from './data-fold
 import { openPalette, setAppCommands } from './palette.js';
 import { menuBar } from './menubar.js';
 import { openQuickOpen } from './views/quick-open.js';
+import { showFindInFiles } from './views/find-in-files.js';
 import { startGamepad } from './gamepad.js';
 
 const $ = (id) => document.getElementById(id);
@@ -929,7 +930,26 @@ function quickOpen() {
   });
 }
 
-const toolItems = [{ label: 'Quick Open…', keys: 'Ctrl+P', hint: 'Find a file in the Data folder by name (fuzzy)', run: quickOpen }];
+/** The open files as the search tools read them. */
+const toolFiles = () => files.map((r) => ({ path: r.path, size: r.file.size, read: async () => new Uint8Array(await r.file.arrayBuffer()) }));
+
+function findInFiles() {
+  showFindInFiles({
+    files: toolFiles,
+    root: toolsRoot,
+    open: (path) => {
+      const rec = findFile(tree, path);
+      if (!rec) return toast(`${path} is not among the open files. Open its Data folder to edit it.`, 'warn'), false;
+      openFile(rec);
+      return true;
+    },
+  });
+}
+
+const toolItems = [
+  { label: 'Quick Open…', keys: 'Ctrl+P', hint: 'Find a file in the Data folder by name (fuzzy)', run: quickOpen },
+  { label: 'Find in files…', hint: 'Search the text of every file under a folder', run: findInFiles },
+];
 $('btn-find').before(menuBar([{ label: 'Tools', items: toolItems }], 'Tools'));
 
 // Quick Open: Ctrl+P anywhere, as in the desktop Workshop (inside Quick Open it moves down the list).

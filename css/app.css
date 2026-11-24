@@ -723,3 +723,15 @@ span.twisty { cursor: default; }
 .qo-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .qo-hints { flex: none; white-space: nowrap; }
 @media (max-width: 640px) { .qo-hints { display: none; } .quick-open { margin-top: 16px; } }
+/* Find in files (views/find-in-files.js) */
+.fif-top { display: grid; grid-template-columns: auto 1fr auto 200px; gap: 8px 10px; align-items: center; margin-bottom: 10px; font-size: 13px; }
+.fif-buttons { grid-column: 1 / -1; display: flex; gap: 8px; }
+.fif-custom { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.fif-root { grid-column: 2 / -1; }
+.fif-label { white-space: nowrap; }
+.fif-wrap { height: min(400px, 50vh); flex: none; }
+.fif-grid td { overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .fif-top { grid-template-columns: auto 1fr; }
+  .fif-root { grid-column: 2; }
+}
