@@ -681,7 +681,7 @@ export async function restoreBackupSet(root, set, { onStep } = {}) {
     }
     if (!isRestorableDataFile(e.path)) return done(false, `Backup manifest names an unexpected file: ${e.path}.`);
     if (!e.existed) continue;
-    const copy = e.backup && !parts(e.backup).includes('..') ? await fileAt(set.dir, e.backup) : null;
+    const copy = await backupCopy(set, e);
     if (!copy) return done(false, `Backup copy missing for ${e.path}.`);
     const bytes = await readBytes(copy);
     if (e.sha256 && (await sha256(bytes)) !== e.sha256.toLowerCase())
@@ -689,21 +689,36 @@ export async function restoreBackupSet(root, set, { onStep } = {}) {
     byPath.set(e.path.toLowerCase(), bytes);
   }
 
-  // PutBack: the current state first, as its own set, so the restore can itself be undone.
+  // The desktop writes the set folder's full path as the source; a browser only knows the names below the game folder.
+  const r = await putBack(root, set.stageId ?? 'stage', `${root.game.name}\\${BACKUP_FOLDER}\\${set.name}`,
+    `State before restoring '${set.name}'`, set.entries, byPath, step);
+  if (!r.ok) return done(false, r.message, r.pre);
+  set.lastRestoredUtc = new Date();
+  set.lastRestoredText = null;
+  await writeManifest(root, set).catch(() => {});
+  const message = `Restored ${set.entries.length} file(s) from ${set.name}.`;
+  step(100, message);
+  return done(true, message, r.pre);
+}
+
+/**
+ * StageInstaller.PutBack: saves the current files as a "pre-restore" set (so this can itself be undone), then writes each
+ * entry's bytes from byPath (lowercased path → bytes) or removes the file, reading every write back; a failure puts the
+ * previous state back from that set. Resolves to {ok, message, pre}.
+ */
+async function putBack(root, stageId, source, note, entries, byPath, step) {
   step(20, 'Saving the current state as a pre-restore backup…');
   let pre;
   try {
-    // The desktop writes the set folder's full path; a browser only knows the names below the game folder.
-    pre = await createBackupSet(root, 'pre-restore', set.stageId ?? 'stage', `${root.game.name}\\${BACKUP_FOLDER}\\${set.name}`,
-      `State before restoring '${set.name}'`, set.entries.map((e) => e.path), step);
+    pre = await createBackupSet(root, 'pre-restore', stageId, source, note, entries.map((e) => e.path), step);
   } catch (err) {
-    return done(false, `Could not back up the current state, so nothing was restored: ${err.message}`);
+    return { ok: false, message: `Could not back up the current state, so nothing was restored: ${err.message}`, pre: null };
   }
   const applied = [];
   try {
     let n = 0;
-    for (const e of set.entries) {
-      step(40 + Math.trunc((50 * n++) / set.entries.length), `${e.existed ? 'Restoring' : 'Removing'} Data\\${e.path}…`);
+    for (const e of entries) {
+      step(40 + Math.trunc((50 * n++) / entries.length), `${e.existed ? 'Restoring' : 'Removing'} Data\\${e.path}…`);
       applied.push({ rel: e.path });
       if (e.existed) {
         const bytes = byPath.get(e.path.toLowerCase());
@@ -726,13 +741,163 @@ export async function restoreBackupSet(root, set, { onStep } = {}) {
     pre.status = problem == null ? 'rolled-back' : 'failed';
     await writeManifest(root, pre).catch(() => {});
     const why = /[.!?]$/.test(err.message) ? err.message : `${err.message}.`;
-    return done(false, `Restore failed: ${why}` +
-      (problem == null ? ' The previous state was put back.' : ` Could not undo: ${problem} — restore '${pre.name}' manually.`), pre);
+    return { ok: false, pre, message: `Restore failed: ${why}` +
+      (problem == null ? ' The previous state was put back.' : ` Could not undo: ${problem} — restore '${pre.name}' manually.`) };
   }
-  set.lastRestoredUtc = new Date();
-  set.lastRestoredText = null;
-  await writeManifest(root, set).catch(() => {});
-  const message = `Restored ${set.entries.length} file(s) from ${set.name}.`;
+  return { ok: true, message: null, pre };
+}
+
+// ------------------------------------------------------------------ back to stock (StageInstaller.cs 1196-1339, 1461, 1510)
+
+const isStageListFile = (rel) => sameName(backslashed(rel), FILE_LIST) || sameName(backslashed(rel), TABLE);
+const isBundleOf = (e, id) => sameName(backslashed(e.path), `stage\\${id}.bres`);
+/** Where a set keeps its copy of an entry (BackupCopyPath), or null when it is missing or would lie outside the set. */
+const backupCopy = async (set, e) => (e.backup && !parts(e.backup).includes('..') ? await fileAt(set.dir, e.backup) : null);
+const byCreated = (a, b) => (a.createdKey === b.createdKey ? 0 : a.createdKey < b.createdKey ? -1 : 1);
+const quoted = (names) => names.map((s) => `'${s}'`).join(', ');
+
+/**
+ * What putting a stage's own files back to stock would do (PlanStockRestore): each file from the oldest install or
+ * settings set holding it (pre-restore sets hold what a restore replaced, so they never count as stock), with whether it
+ * is already stock. {stageId, files: [{path, set, entry, alreadyStock}], unreadableSets, stageListSets, addedByHappyTool,
+ * toChange, noBackups}; all = listBackupSets(root) when the caller has it.
+ */
+export async function planStockRestore(root, id, all = null) {
+  all ??= await listBackupSets(root);
+  const plan = { stageId: id, files: [], unreadableSets: [], stageListSets: [], addedByHappyTool: false };
+  for (const set of all.filter((s) => s.loadError != null).sort(byCreated))
+    if (mayHoldStageFiles(set, id)) plan.unreadableSets.push(set.name);
+  const sets = all.filter((s) => s.loadError == null && (s.operation === 'install' || s.operation === 'settings'))
+    .sort((a, b) => byCreated(a, b) || cmpIgnoreCase(a.name, b.name));
+  const oldest = new Map();
+  for (const set of sets) {
+    let holds = false;
+    for (const e of set.entries) {
+      if (!isStageOwnedFile(e.path, id)) continue;
+      holds = true;
+      if (!oldest.has(e.path.toLowerCase())) oldest.set(e.path.toLowerCase(), { path: e.path, set, entry: e, alreadyStock: false });
+    }
+    if (holds && set.operation === 'install' && set.entries.some((e) => isStageListFile(e.path))) plan.stageListSets.push(set.name);
+  }
+  for (const f of [...oldest.values()].sort((a, b) => cmpIgnoreCase(a.path, b.path))) {
+    checkDataPath(f.path);
+    const fh = await fileAt(root.data, f.path);
+    const now = fh ? await sha256(await readBytes(fh)) : null;
+    const stock = f.entry.existed ? await stockHash(f) : null;
+    f.alreadyStock = f.entry.existed ? stock != null && now === stock : now == null;
+    plan.files.push(f);
+    if (!f.entry.existed && isBundleOf(f.entry, id)) plan.addedByHappyTool = true;
+  }
+  plan.toChange = plan.files.filter((f) => !f.alreadyStock).length;
+  plan.noBackups = plan.files.length === 0;
+  return plan;
+}
+
+/** The stock file's hash: the manifest's, or the backup copy's when an old manifest didn't record one. */
+async function stockHash(f) {
+  if (f.entry.sha256) return f.entry.sha256.toLowerCase();
+  const copy = await backupCopy(f.set, f.entry);
+  return copy ? sha256(await readBytes(copy)) : null;
+}
+
+/** Two plans for the same stage would do the same: same files, from the same sets, in the same state. */
+function sameStockPlan(a, b) {
+  const same = (x, y) => x.length === y.length && x.every((s, i) => sameName(s, y[i]));
+  if (a.addedByHappyTool !== b.addedByHappyTool || a.files.length !== b.files.length || !same(a.unreadableSets, b.unreadableSets)
+      || !same(a.stageListSets, b.stageListSets)) return false;
+  return a.files.every((x, i) => {
+    const y = b.files[i];
+    return sameName(x.path, y.path) && x.alreadyStock === y.alreadyStock && x.entry.existed === y.entry.existed && sameName(x.set.name, y.set.name);
+  });
+}
+
+/** The newest readable install set that wrote stage id's bundle with this hash (FindInstallThatWrote), or null. */
+export async function findInstallThatWrote(root, id, sha, all = null) {
+  if (!sha) return null;
+  return (all ?? (await listBackupSets(root))).find((s) => s.loadError == null && s.operation === 'install'
+    && s.entries.some((e) => isBundleOf(e, id) && e.writtenSha256?.toLowerCase() === sha.toLowerCase())) ?? null;
+}
+
+/**
+ * What the game has for a stage now, for the Restore stock page's status line (StageViewerForm.GameStateLine):
+ * {plan, state: 'unknown' | 'no-bundle' | 'as-found' | 'added' | 'stock' | 'changed', map: 'stock' | 'installed' | 'changed',
+ * install (the set that wrote the bundle, for 'installed'), tables (changed files besides the bundle)}.
+ */
+export async function stockState(root, id, all = null) {
+  all ??= await listBackupSets(root);
+  const plan = await planStockRestore(root, id, all);
+  const r = { plan, state: 'changed', map: null, install: null, tables: 0 };
+  const bundle = await fileAt(root.data, `stage\\${id}.bres`);
+  if (plan.unreadableSets.length) r.state = 'unknown';
+  else if (!bundle) r.state = 'no-bundle';
+  else if (plan.noBackups) r.state = 'as-found';
+  else if (plan.addedByHappyTool) r.state = 'added';
+  else if (plan.toChange === 0) r.state = 'stock';
+  else {
+    const own = plan.files.find((f) => sameName(f.path, `stage\\${id}.bres`));
+    if (own == null || own.alreadyStock) r.map = 'stock';
+    else {
+      r.install = await findInstallThatWrote(root, id, await sha256(await readBytes(bundle)), all);
+      r.map = r.install ? 'installed' : 'changed';
+    }
+    r.tables = plan.files.filter((f) => !f.alreadyStock && f !== own).length;
+  }
+  return r;
+}
+
+/**
+ * Puts a stage's own files back to stock (StageInstaller.RestoreStock): each from the oldest backup holding it, removed
+ * when the stock game has no such file. Every copy is verified first and the current files become a pre-restore set
+ * (source "stock"), so this can be undone from Backups. Refuses unreadable sets that may hold the stage's files, a stage
+ * HappyTool added, and a plan that no longer matches the files. Resolves to {ok, message, log, preRestore}.
+ */
+export async function restoreStock(root, plan, { onStep } = {}) {
+  const log = [];
+  const step = (pct, text) => {
+    log.push(text);
+    onStep?.(pct, text);
+  };
+  const done = (ok, message, preRestore = null) => ({ ok, message, log, preRestore });
+  if (plan?.unreadableSets.length)
+    return done(false, `HappyTool can't read backup set(s) ${quoted(plan.unreadableSets)}, which may hold this stage's original files, so it `
+      + `can't tell what stock is. Repair or remove them, or use Steam's "Verify integrity of game files".`);
+  if (!plan || plan.noBackups)
+    return done(false, "HappyTool has no backup of this stage's original files, so it can't put them back. "
+      + `Steam's "Verify integrity of game files" restores every original file.`);
+  const id = plan.stageId;
+  const todo = plan.files.filter((f) => !f.alreadyStock);
+  if (!todo.length) {
+    const message = plan.addedByHappyTool
+      ? `'${id}' was added by HappyTool and its files are already gone from the game.`
+      : `'${id}' is already as the game shipped it.`;
+    step(100, message);
+    return done(true, message);
+  }
+  // The desktop names the installer's "Restore backups" tab; here the backups are listed under Restore stock….
+  if (plan.addedByHappyTool)
+    return done(false, `'${id}' was added by HappyTool, so the stock game doesn't have it. To remove it, restore its first install `
+      + 'from Backups under Restore stock… (that also takes it out of the stage list).');
+  // No running-game check: a browser can't see processes (the confirmation asks to close Happy Wars).
+  if (!sameStockPlan(plan, await planStockRestore(root, id)))
+    return done(false, `The files of '${id}' or HappyTool's backups changed after this was planned (another install?), so nothing was `
+      + 'changed. Try again to see what it would do now.');
+
+  step(5, 'Verifying the backed-up original files…');
+  const entries = [];
+  const byPath = new Map();
+  for (const f of todo) {
+    entries.push(f.entry);
+    if (!f.entry.existed) continue;
+    const copy = await backupCopy(f.set, f.entry);
+    if (!copy) return done(false, `The original of ${f.path} is missing from backup set '${f.set.name}'; nothing was changed.`);
+    const bytes = await readBytes(copy);
+    if (f.entry.sha256 && (await sha256(bytes)) !== f.entry.sha256.toLowerCase())
+      return done(false, `The original of ${f.path} in backup set '${f.set.name}' is corrupt (SHA-256 mismatch); nothing was changed.`);
+    byPath.set(f.path.toLowerCase(), bytes);
+  }
+  const r = await putBack(root, id, 'stock', `State before putting '${id}' back to stock`, entries, byPath, step);
+  if (!r.ok) return done(false, r.message, r.pre);
+  const message = `Put ${todo.length} file(s) of '${id}' back to stock (undo: restore '${r.pre.name}' from Backups under Restore stock…).`;
   step(100, message);
-  return done(true, message, pre);
+  return done(true, message, r.pre);
 }

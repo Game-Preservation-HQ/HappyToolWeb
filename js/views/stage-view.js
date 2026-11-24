@@ -20,6 +20,7 @@ import {
 import { downloadBytes } from '../util.js';
 import {
   openGameFolder, readRegistration, createPlan, install, BACKUP_FOLDER, listBackupSets, stageBackupSets, compareWithCurrent, restoreBackupSet,
+  isValidStageId, describeStage, planStockRestore, stockState, restoreStock as putStageBackToStock,
 } from '../formats/stage-install.js';
 import { stageGlb, stageObjZip } from '../formats/model-export.js';
 import { setViewCommands, openPalette } from '../palette.js';
@@ -2497,29 +2498,68 @@ export function renderStage(node, ctx) {
       set.loadError != null
         ? `Its manifest can't be read (${set.loadError}), so it can't be restored. ${root.game.name}\\${BACKUP_FOLDER}\\${set.name}`
         : `Puts back ${set.entries.map((e) => leafName(e.path)).join(', ')} as they were then. ${set.note ? `${set.note}. ` : ''}The current files are backed up first.`;
-    /** The Restore stock page: this stage's backup sets, newest first; one picked is restored after a confirmation. */
+    /** What the game has for this stage now (StageViewerForm.GameStateLine), from stockState. */
+    function gameStateLine(s) {
+      switch (s.state) {
+        case 'unknown': return "in the game: unknown (a backup can't be read)";
+        case 'no-bundle': return `in the game: no ${edit.stage}.bres`;
+        case 'as-found': return 'in the game: as HappyTool found it';
+        case 'added': return 'in the game: a stage HappyTool added';
+        case 'stock': return 'in the game: stock';
+      }
+      const map = s.map === 'stock' ? 'the stock map' : s.map === 'installed' ? `the map installed ${backupWhen(s.install)}` : 'a changed map';
+      return `in the game: ${map}${s.tables > 0 ? ` + ${s.tables} changed table(s)` : ''}`;
+    }
+    const STEAM_VALIDATE = 'steam://validate/246280'; // HappyWarsDepotCatalog.AppId
+    /** A link that hands Steam's verify to the OS; the dialog closes after the click, or the removed link wouldn't navigate. */
+    const steamLink = (done, label = 'Verify with Steam') =>
+      el('a', { class: 'btn btn-primary', href: STEAM_VALIDATE, onclick: () => setTimeout(() => done('steam')) }, label);
+    const steamStarted = () =>
+      toast('Steam is verifying Happy Wars — watch its Downloads page. If Steam did not open: right-click Happy Wars → Properties → '
+        + 'Installed Files → Verify integrity of game files.', 'info', 15000);
+    /** The Restore stock page: the game's files for this stage, then its backup sets, newest first. */
     async function restoreStock() {
       const root = await pickGameFolder();
       if (!root) return;
-      let all, sets;
+      const id = edit.stage;
+      let all, sets, line;
+      const was = status.textContent;
+      status.textContent = "Reading HappyTool's backups and the game's files…";
       try {
         all = await listBackupSets(root);
-        sets = await stageBackupSets(root, edit.stage, all);
+        sets = await stageBackupSets(root, id, all);
+        try {
+          line = isValidStageId(id) ? gameStateLine(await stockState(root, id, all)) : "not one of the game's stages";
+        } catch (e) {
+          line = `in the game: can't tell (${e.message})`;
+        }
       } catch (e) {
         return toast(`Could not read ${BACKUP_FOLDER}: ${e.message}`, 'error', 10000);
+      } finally {
+        status.textContent = was;
       }
       const names = new Set(all.map((x) => x.name.toLowerCase()));
       const chosen = await openDialog((dlg, done) => {
         dlg.classList.add('dialog-wide');
+        const action = (title, description, value, enabled = true) =>
+          el('button', { type: 'button', class: 'backup-row', disabled: !enabled, onclick: () => done(value) },
+            el('span', { class: 'backup-row-head' }, el('strong', {}, title)), el('span', { class: 'muted' }, description));
         const rows = sets.slice(0, BACKUP_ROWS).map((set) =>
-          el('button', { type: 'button', class: 'backup-row', disabled: set.loadError != null, onclick: () => done(set) },
+          el('button', { type: 'button', class: 'backup-row', disabled: set.loadError != null, onclick: () => done({ set }) },
             el('span', { class: 'backup-row-head' },
               el('strong', {}, `${backupWhen(set)} — ${backupLabel(set, names)}`),
               set.lastRestoredUtc && el('span', { class: 'muted' }, restoredWhen(set.lastRestoredUtc))),
             el('span', { class: 'muted' }, backupDescription(root, set))));
         dlg.append(
           el('h2', { class: 'dialog-title' }, 'Restore stock'),
-          el('p', { class: 'muted' }, `${edit.stage} in "${root.game.name}"`),
+          el('p', { class: 'muted' }, `${describeStage(id)} in "${root.game.name}"   ·   ${line}`),
+          el('h3', { class: 'backup-section' }, "The game's files"),
+          el('div', { class: 'backup-rows' },
+            action("Put only the game's files back to stock…", "Puts the game's own files for this stage — its .bres and its tables — "
+              + 'back the way they were before HappyTool first changed them, from the backups below. Your edits stay in the editor. '
+              + 'The current files are backed up first.', 'stock', isValidStageId(id)),
+            action('Verify all game files with Steam…', 'Steam checks every Happy Wars file and downloads the original of anything '
+              + 'changed. This undoes every mod and installed map.', 'verify')),
           el('h3', { class: 'backup-section' }, sets.length ? `Backups (${sets.length})` : 'Backups'),
           sets.length
             ? el('div', { class: 'backup-rows' }, rows)
@@ -2528,7 +2568,108 @@ export function renderStage(node, ctx) {
           el('div', { class: 'dialog-actions' }, button('Close', () => done(null), { class: 'btn btn-primary', autofocus: true })),
         );
       });
-      if (chosen) await restoreBackup(root, chosen, names);
+      if (chosen?.set) await restoreBackup(root, chosen.set, names);
+      else if (chosen === 'stock') await restoreStockInGame(root);
+      else if (chosen === 'verify') await verifyWithSteam();
+    }
+    /** VerifyWithSteam: Steam puts back the original of every changed file (all mods and installed maps). */
+    async function verifyWithSteam() {
+      const r = await openDialog((dlg, done) => dlg.append(
+        el('h2', { class: 'dialog-title' }, 'Restore stock'),
+        el('p', { class: 'dialog-text' }, "Ask Steam to verify Happy Wars' files?"),
+        el('p', { class: 'dialog-text' }, "Steam downloads the original of every changed file. That undoes ALL mods and installed maps, not just "
+          + "this one. HappyTool's backups are kept."),
+        el('div', { class: 'dialog-actions' }, button('Cancel', () => done(null), { autofocus: true }), steamLink(done)),
+      ));
+      if (r === 'steam') steamStarted();
+    }
+    /** When the backups can't say what stock is (OfferOriginalOrSteam; choosing an original file comes with its own slice). */
+    async function offerSteam(why) {
+      const r = await openDialog((dlg, done) => dlg.append(
+        el('h2', { class: 'dialog-title' }, 'Restore stock'),
+        el('p', { class: 'dialog-text' }, why),
+        el('p', { class: 'dialog-text' }, 'Steam can verify every game file instead (that undoes all mods and installed maps).'),
+        el('div', { class: 'dialog-actions' }, button('Cancel', () => done(null), { autofocus: true }), steamLink(done)),
+      ));
+      if (r === 'steam') steamStarted();
+    }
+    /** StageListNote: the shared stage list isn't reset by a stock restore. */
+    const stageListNote = (plan, name) =>
+      plan.stageListSets.length === 0 ? null
+        : `Not reset: the stage list (stageFileList.nut, gemini_stage_table.json). HappyTool changed it when it installed ${name} `
+          + `(${plan.stageListSets.map((s) => `'${s}'`).join(', ')}), and every stage shares it, so ${name} may still have a Skirmish menu `
+          + `slot the stock game doesn't. Restoring ${plan.stageListSets.length === 1 ? 'that install' : 'the first of them'} from Backups `
+          + 'under Restore stock… puts the stage list back too, but also undoes every stage-list change made after it.';
+    const info = (...texts) => openDialog((dlg, done) => dlg.append(
+      el('h2', { class: 'dialog-title' }, 'Restore stock'),
+      ...texts.filter(Boolean).map((t) => el('p', { class: 'dialog-text' }, t)),
+      el('div', { class: 'dialog-actions' }, button('OK', () => done(null), { class: 'btn btn-primary', autofocus: true })),
+    ));
+    /** RestoreStockInGame: puts this stage's own game files back to stock from the oldest backups, after a confirmation. */
+    async function restoreStockInGame(root) {
+      const id = edit.stage;
+      const name = describeStage(id);
+      const was = status.textContent;
+      status.textContent = "Reading HappyTool's backups and the game's files…";
+      let plan;
+      try {
+        plan = await planStockRestore(root, id);
+      } catch (e) {
+        return toast(`Could not read the backups: ${e.message}`, 'error', 10000);
+      } finally {
+        status.textContent = was;
+      }
+      if (plan.unreadableSets.length) {
+        const n = plan.unreadableSets.length;
+        return offerSteam(`HappyTool can't read ${n === 1 ? `the backup set '${plan.unreadableSets[0]}'`
+          : `${n} backup sets (${plan.unreadableSets.map((s) => `'${s}'`).join(', ')})`}, which may hold ${name}'s original files, so it `
+          + `can't tell how the game shipped them. Repair or remove ${n === 1 ? 'it' : 'them'} in ${root.game.name}\\${BACKUP_FOLDER} and `
+          + 'try again, or put the original back another way.');
+      }
+      if (plan.noBackups)
+        return offerSteam(`HappyTool hasn't changed ${name} in the game (it has no backup of its files), so as far as HappyTool knows it `
+          + 'is stock. If it was changed some other way, put the original back another way.');
+      // Nothing to change comes first: a stage HappyTool added and that is gone again needs no "restore its first install".
+      if (plan.toChange === 0)
+        return info(plan.addedByHappyTool
+          ? `'${id}' was added by HappyTool and its files are already gone from the game, so there's nothing to put back.`
+          : `${name} is already as the game shipped it (${plan.files.length} file(s) checked).`, stageListNote(plan, name));
+      if (plan.addedByHappyTool)
+        return info(`'${id}' was added by HappyTool, so the stock game doesn't have it. To remove it, restore its first install from `
+          + 'Backups under Restore stock… (that also takes it out of the stage list).');
+      const same = plan.files.length - plan.toChange;
+      const ok = await openDialog((dlg, done) => {
+        dlg.classList.add('dialog-wide');
+        dlg.append(
+          el('h2', { class: 'dialog-title' }, 'Restore stock'),
+          el('p', { class: 'dialog-text' }, `Put ${name} back the way the game shipped it?`),
+          el('p', { class: 'dialog-text' }, "From HappyTool's backups of the original files:"),
+          el('ul', { class: 'restore-files' }, plan.files.filter((f) => !f.alreadyStock).map((f) =>
+            el('li', {}, `${f.entry.existed ? 'restore' : 'remove'} Data\\${f.path}`))),
+          ...(same > 0 ? [el('p', { class: 'muted' }, `(${same} more file(s) are already stock)`)] : []),
+          ...(plan.stageListSets.length ? [el('p', { class: 'dialog-text' }, stageListNote(plan, name))] : []),
+          el('p', { class: 'dialog-text' }, 'Your edits stay in the editor (Install into game… to play them again). The current files are '
+            + 'backed up first, so this can be undone from Backups under Restore stock…. Close Happy Wars before you go on.'),
+          el('div', { class: 'dialog-actions' },
+            button('Cancel', () => done(false)), button('Put back to stock', () => done(true), { class: 'btn btn-primary', autofocus: true })),
+        );
+      }).then((v) => v === true);
+      if (!ok) return;
+      bakeBtn.disabled = installBtn.disabled = stockBtn.disabled = true;
+      let r;
+      try {
+        r = await putStageBackToStock(root, plan, { onStep: (pct, text) => (status.textContent = `${text} (${pct}%)`) });
+      } catch (e) {
+        r = { ok: false, message: e.message, log: [] };
+      } finally {
+        status.textContent = was;
+        stockBtn.disabled = !canInstall;
+        renderDownload();
+      }
+      console.info(`Restore stock:\n${r.log.join('\n')}`);
+      // The desktop reopens the map from the game's file; here the map came from a file of its own, so it stays as it is.
+      if (r.ok) toast(`${name}'s game files are back to stock (${plan.toChange} file(s)) — your edits are still here. Undo: Restore stock… → Backups`, 'ok', 15000);
+      else toast(`Could not put ${name} back to stock: ${r.message}`, 'error', 15000);
     }
     /** RestoreBackupSet: what each file goes back to and what it is now, then the restore (a pre-restore set first). */
     async function restoreBackup(root, set, names) {

@@ -99,6 +99,7 @@ code, pre, .hex { font-family: var(--mono); }
   cursor: pointer;
   white-space: nowrap;
 }
+a.btn { display: inline-block; text-decoration: none; }
 .btn:hover:not(:disabled) { background: var(--surface-2); }
 .btn:disabled { opacity: 0.45; cursor: default; }
 .btn:focus-visible, .input:focus-visible, .file-item:focus-visible, .grid:focus-visible, .lng-grid:focus-visible, .hex:focus-visible {
