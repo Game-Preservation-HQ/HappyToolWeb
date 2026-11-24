@@ -99,6 +99,7 @@ code, pre, .hex { font-family: var(--mono); }
   cursor: pointer;
   white-space: nowrap;
 }
+a.btn { display: inline-block; text-decoration: none; }
 .btn:hover:not(:disabled) { background: var(--surface-2); }
 .btn:disabled { opacity: 0.45; cursor: default; }
 .btn:focus-visible, .input:focus-visible, .file-item:focus-visible, .grid:focus-visible, .lng-grid:focus-visible, .hex:focus-visible {
@@ -395,6 +396,22 @@ kbd {
 .dialog-text { margin: 0 0 14px; }
 .dialog .input { width: 100%; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.dialog-wide { width: min(600px, calc(100vw - 32px)); }
+.install-findings { list-style: none; margin: 0 0 12px; padding: 0; display: grid; gap: 8px; }
+.install-findings li { padding: 6px 10px; border-radius: var(--radius); border-left: 4px solid var(--border); }
+.install-findings .install-error { border-left-color: var(--danger); background: var(--error-bg); }
+.install-findings .install-warning { border-left-color: #d9a400; background: var(--warn-bg); }
+.install-findings .install-error strong { color: var(--error-text); }
+.install-findings .install-warning strong { color: var(--warn-text); }
+.install-steps { margin: 0; padding-left: 20px; display: grid; gap: 4px; }
+.backup-section { margin: 12px 0 6px; font-size: 1em; }
+.backup-rows { display: grid; gap: 6px; max-height: 50vh; overflow: auto; }
+.backup-row { display: grid; gap: 2px; width: 100%; text-align: left; padding: 6px 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: inherit; font: inherit; cursor: pointer; }
+.backup-row:hover:not(:disabled) { border-color: var(--accent); }
+.backup-row:disabled { cursor: default; opacity: .7; }
+.backup-row-head { display: flex; justify-content: space-between; gap: 12px; }
+.backup-empty { padding: 6px 10px; }
+.restore-files { margin: 0 0 14px; padding-left: 20px; display: grid; gap: 4px; overflow-wrap: anywhere; }
 .stage-pad-help { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; max-width: 640px; }
 .stage-pad-help dt { font-weight: 600; }
 .stage-pad-help dd { margin: 0; }
@@ -699,6 +716,61 @@ span.twisty { cursor: default; }
 .nut-tb-list summary { cursor: pointer; padding: 2px 0; font-weight: 600; }
 .nut-tb-item { display: flex; gap: 6px; align-items: center; padding: 1px 4px 1px 12px; cursor: grab; font-family: var(--mono); font-size: 12px; white-space: nowrap; border-radius: 3px; }
 .nut-tb-item:hover, .nut-tb-item:focus { background: var(--sel); outline: none; }
+
+/* ---------- small binary editors (.vmd, .rml, .vir, .fnt) ---------- */
+.vmd-view .check, .rml-view .check { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; white-space: nowrap; }
+.vmd-grid td:has(> input) { padding: 1px 4px; }
+.vmd-cell { width: 100%; min-width: 5em; font: inherit; color: var(--text); background: transparent; border: 1px solid transparent; border-radius: 3px; padding: 2px 5px; }
+.vmd-cell.num { text-align: right; font-variant-numeric: tabular-nums; }
+.vmd-cell:hover { border-color: var(--border); }
+.vmd-cell:focus { border-color: var(--accent, var(--border)); background: var(--surface); outline: none; }
+.rml-grid td.rml-node { font-family: var(--mono); font-size: 12.5px; }
+.rml-grid td.rml-node .twisty { height: 18px; vertical-align: middle; }
+.rml-grid td.rml-value { padding: 1px 4px; min-width: 16em; }
+
+/* Quick Open (Ctrl+P), the desktop Workshop's palette (js/views/quick-open.js) */
+.quick-open { --qo-row: 30px; width: min(780px, calc(100vw - 32px)); padding: 8px; margin-top: 8vh; }
+.quick-open .qo-search { width: 100%; box-sizing: border-box; font-size: 15px; }
+.qo-list { list-style: none; margin: 6px 0 0; padding: 0; overflow-y: auto; }
+.qo-row { display: flex; align-items: center; gap: 8px; height: var(--qo-row); padding: 0 8px; border-radius: var(--radius); cursor: pointer; white-space: nowrap; }
+.qo-row:hover { background: var(--surface-2); }
+.qo-row.active { background: var(--sel); }
+.qo-row b { color: var(--accent); font-weight: 700; }
+.qo-row.missing, .qo-row.missing b { color: var(--muted); }
+.qo-row.missing .qo-icon { opacity: 0.45; filter: grayscale(1); }
+.qo-icon { flex: none; display: inline-flex; width: 16px; height: 16px; }
+.qo-name { flex: none; max-width: 60%; overflow: hidden; text-overflow: ellipsis; }
+/* The folder keeps its end (nearest the file) and loses its start: "…/stage/mini". */
+.qo-folder { flex: 1 1 0; min-width: 0; margin-left: 4px; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; color: var(--muted); font-size: 13px; }
+.qo-tag { flex: none; font-size: 11px; color: var(--muted); }
+.qo-pin { flex: none; display: inline-flex; width: 16px; height: 16px; align-items: center; justify-content: center; color: var(--muted); visibility: hidden; cursor: pointer; }
+.qo-pin svg { fill: none; }
+.qo-row:hover .qo-pin, .qo-row.active .qo-pin { visibility: visible; }
+.qo-pin.on { visibility: visible; color: var(--accent); }
+.qo-pin.on svg { fill: currentColor; }
+.qo-footer { display: flex; gap: 12px; justify-content: space-between; margin: 6px 4px 0; }
+.qo-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qo-hints { flex: none; white-space: nowrap; }
+@media (max-width: 640px) { .qo-hints { display: none; } .quick-open { margin-top: 16px; } }
+/* Find in files (views/find-in-files.js) */
+.fif-top { display: grid; grid-template-columns: auto 1fr auto 200px; gap: 8px 10px; align-items: center; margin-bottom: 10px; font-size: 13px; }
+.fif-buttons { grid-column: 1 / -1; display: flex; gap: 8px; }
+.fif-custom { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.fif-root { grid-column: 2 / -1; }
+.fif-label { white-space: nowrap; }
+.fif-wrap { height: min(400px, 50vh); flex: none; }
+.fif-grid td { overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .fif-top { grid-template-columns: auto 1fr; }
+  .fif-root { grid-column: 2; }
+}
+/* Compare two folders */
+.cf-top { display: grid; grid-template-columns: auto 1fr auto; gap: 8px 10px; align-items: center; margin-bottom: 10px; font-size: 13px; }
+.cf-options { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; }
+.cf-options label { display: inline-flex; align-items: center; gap: 6px; }
+.cf-options .btn { margin-left: auto; }
+.cf-grid td { overflow-wrap: anywhere; }
+.cf-grid td:nth-child(n+3) { white-space: nowrap; }
 
 /* ---------- .tanda UI scene and .rra animation viewers ---------- */
 .tabs-bar { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; }

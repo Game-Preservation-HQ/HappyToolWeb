@@ -3,6 +3,10 @@ import { el, button, toast, pickFiles, openDialog, ask, confirmBox } from './ui.
 import { decodeLayers, encodeLayers, writableLayers } from './formats/wrappers.js';
 import { parseBres, writeBres } from './formats/bres.js';
 import { parseLng, writeLng, validateLng } from './formats/lng.js';
+import { parseVmd, writeVmd } from './formats/vmd.js';
+import { parseRml, serializeRml } from './formats/rml.js';
+import { isTrf, VIR_WARNING } from './formats/vir.js';
+import { looksLikeFtdf, FNT_WARNING } from './formats/fnt.js';
 import { sniff, KIND_LABELS, describeMagic } from './formats/sniff.js';
 import { decodeText, encodeText, bytesEqual, formatSize, baseName, downloadBytes } from './util.js';
 import { renderBres } from './views/bres-view.js';
@@ -12,12 +16,20 @@ import { renderText } from './views/text-view.js';
 import { renderNut } from './views/nut-view.js';
 import { renderMedia } from './views/media-view.js';
 import { renderHex } from './views/hex-view.js';
+import { renderVmd } from './views/vmd-view.js';
+import { renderRml } from './views/rml-view.js';
+import { renderVir } from './views/vir-view.js';
+import { renderFnt } from './views/fnt-view.js';
 import { renderTanda } from './views/tanda-view.js';
 import { renderRra } from './views/rra-view.js';
 import { dataRootOf, preferredLng, isSearchable } from './formats/lng-refs.js';
 import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictures } from './browser.js';
 import { loadHandle, saveHandle, forgetHandle, readDirectory } from './data-folder.js';
 import { openPalette, setAppCommands } from './palette.js';
+import { menuBar } from './menubar.js';
+import { openQuickOpen } from './views/quick-open.js';
+import { showFindInFiles } from './views/find-in-files.js';
+import { showCompareFolders } from './views/compare-folders.js';
 import { startGamepad } from './gamepad.js';
 
 const $ = (id) => document.getElementById(id);
@@ -174,6 +186,13 @@ function loadModel(node) {
   try {
     if (s.kind === 'bres') node.model = parseBres(node.payload);
     else if (s.kind === 'lng') node.model = parseLng(node.payload);
+    else if (s.kind === 'vmd') node.model = parseVmd(node.payload, !!node.parent);
+    else if (s.kind === 'rml') node.model = parseRml(node.payload);
+    else if (s.kind === 'vir' && !isTrf(node.payload)) node.warning = VIR_WARNING;
+    else if (s.kind === 'fnt' && !looksLikeFtdf(node.payload)) {
+      if (node.parent) node.kind = 'hex'; // the desktop's bundle editor opens only FTDF .fnt entries as fonts
+      else node.warning = FNT_WARNING;
+    }
     else if (s.kind === 'json' || s.kind === 'text') {
       node.model = decodeText(node.payload);
       if (!bytesEqual(encodeText(node.model.text, node.model.encoding), node.payload))
@@ -200,6 +219,10 @@ function serialize(node) {
     case 'json':
     case 'text':
       return encodeText(node.model.text, node.model.encoding);
+    case 'vmd':
+      return writeVmd(node.model);
+    case 'rml':
+      return serializeRml(node.model);
     default:
       return node.payload;
   }
@@ -564,6 +587,14 @@ function pickView(node, ctx) {
       return renderRra(node, ctx);
     case 'nutc':
       return renderHex(node, ctx, 'Compiled Squirrel script (bytecode). Shown as bytes.');
+    case 'vmd':
+      return renderVmd(node, ctx);
+    case 'rml':
+      return renderRml(node, ctx);
+    case 'vir':
+      return renderVir(node);
+    case 'fnt':
+      return renderFnt(node);
     default:
       return renderHex(node, ctx, node.payload.length ? `Binary data (starts with ${describeMagic(node.payload)}). Shown as bytes.` : null);
   }
@@ -910,6 +941,88 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
+// ---------- search and compare tools (the desktop's Quick Open, Find in files, Compare two folders) ----------
+
+/** The Data folder the tools work in: the open file's, else the first one opened, else the opened folder ('' for loose files, null for none). */
+function toolsRoot() {
+  if (!files.length) return null;
+  const data = dataRootOf(current?.path ?? '') || dataRootOf(files.find((r) => dataRootOf(r.path))?.path ?? '');
+  if (data) return data;
+  const top = files[0].path.split('/')[0];
+  return files.every((r) => r.path.startsWith(top + '/')) ? top : '';
+}
+
+/** Shows a file in the browser with the focus on its tile (Quick Open's Ctrl+Enter, the desktop's reveal). */
+function revealFile(path) {
+  browseTo(dirOf(path));
+  const name = path.slice(path.lastIndexOf('/') + 1);
+  const hit = [...dom.view.querySelectorAll('.tile, .row-open')].find((b) => b.title.split('\n')[0] === path || (!b.title && b.textContent === name));
+  hit?.focus();
+  hit?.scrollIntoView({ block: 'nearest' });
+}
+
+function quickOpen() {
+  openQuickOpen({
+    files: () => files.map((r) => r.path),
+    root: toolsRoot,
+    // The desktop pins files only; a folder pinned to Places stays out of the list.
+    pinned: () => prefs.pins.filter((p) => !tree.dirs.has(p)),
+    recent: () => prefs.recent,
+    togglePin: (p) => (togglePin(p), prefs.pins.includes(p)),
+    unpin: (p) => prefs.pins.includes(p) && togglePin(p),
+    removeRecent: (p) => {
+      prefs.recent = prefs.recent.filter((x) => x !== p);
+      writePref('happytool-web-recent', prefs.recent);
+      renderFileList();
+    },
+    open: (p) => sidebarActions.open(p),
+    reveal: revealFile,
+  });
+}
+
+/** The open files as the search tools read them. */
+const toolFiles = () => files.map((r) => ({ path: r.path, size: r.file.size, lastModified: r.file.lastModified, read: async () => new Uint8Array(await r.file.arrayBuffer()) }));
+
+/** Opens a file a tool lists; false (with a note) when it is not among the open files. */
+function openToolFile(path) {
+  const rec = findFile(tree, path);
+  if (!rec) return toast(`${path} is not among the open files. Open its Data folder to edit it.`, 'warn'), false;
+  openFile(rec);
+  return true;
+}
+
+function findInFiles() {
+  showFindInFiles({
+    files: toolFiles,
+    root: toolsRoot,
+    open: openToolFile,
+  });
+}
+
+function compareFolders() {
+  showCompareFolders({ files: toolFiles, root: toolsRoot, open: openToolFile });
+}
+
+const toolItems = [
+  { label: 'Quick Open…', keys: 'Ctrl+P', hint: 'Find a file in the Data folder by name (fuzzy)', run: quickOpen },
+  { label: 'Find in files…', hint: 'Search the text of every file under a folder', run: findInFiles },
+  { label: 'Compare two folders…', hint: 'List the files two folders do not share or that differ', run: compareFolders },
+];
+$('btn-find').before(menuBar([{ label: 'Tools', items: toolItems }], 'Tools'));
+
+// Quick Open: Ctrl+P anywhere, as in the desktop Workshop (inside Quick Open it moves down the list).
+window.addEventListener(
+  'keydown',
+  (e) => {
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'p' && !document.querySelector('dialog.quick-open[open]')) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!document.querySelector('dialog[open]')) quickOpen();
+    }
+  },
+  true,
+);
+
 // Find a feature: Ctrl+K anywhere (caught before the map viewer's own keys, where K toggles Solid).
 window.addEventListener(
   'keydown',
@@ -926,6 +1039,7 @@ $('btn-find').addEventListener('click', openPalette);
 // Controller: moves around the page like the desktop's (stick/D-pad, A, B, X/Y); Menu opens Find a feature.
 startGamepad({ onMenu: openPalette });
 setAppCommands(() => [
+  ...toolItems.map((t) => ({ label: t.label, keys: t.keys, hint: t.hint, section: 'Tools', run: t.run })),
   ...(stepBackLabel() && !(mapShown() && stack().length < 2)
     ? [{ label: stepBackLabel(), keys: current ? 'Esc · Alt+←' : 'Esc · Backspace · Alt+←', section: 'Location', run: stepBack }]
     : []),
