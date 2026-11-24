@@ -735,3 +735,10 @@ span.twisty { cursor: default; }
   .fif-top { grid-template-columns: auto 1fr; }
   .fif-root { grid-column: 2; }
 }
+/* Compare two folders */
+.cf-top { display: grid; grid-template-columns: auto 1fr auto; gap: 8px 10px; align-items: center; margin-bottom: 10px; font-size: 13px; }
+.cf-options { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; }
+.cf-options label { display: inline-flex; align-items: center; gap: 6px; }
+.cf-options .btn { margin-left: auto; }
+.cf-grid td { overflow-wrap: anywhere; }
+.cf-grid td:nth-child(n+3) { white-space: nowrap; }

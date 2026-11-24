@@ -19,6 +19,7 @@ import { openPalette, setAppCommands } from './palette.js';
 import { menuBar } from './menubar.js';
 import { openQuickOpen } from './views/quick-open.js';
 import { showFindInFiles } from './views/find-in-files.js';
+import { showCompareFolders } from './views/compare-folders.js';
 import { startGamepad } from './gamepad.js';
 
 const $ = (id) => document.getElementById(id);
@@ -931,24 +932,32 @@ function quickOpen() {
 }
 
 /** The open files as the search tools read them. */
-const toolFiles = () => files.map((r) => ({ path: r.path, size: r.file.size, read: async () => new Uint8Array(await r.file.arrayBuffer()) }));
+const toolFiles = () => files.map((r) => ({ path: r.path, size: r.file.size, lastModified: r.file.lastModified, read: async () => new Uint8Array(await r.file.arrayBuffer()) }));
+
+/** Opens a file a tool lists; false (with a note) when it is not among the open files. */
+function openToolFile(path) {
+  const rec = findFile(tree, path);
+  if (!rec) return toast(`${path} is not among the open files. Open its Data folder to edit it.`, 'warn'), false;
+  openFile(rec);
+  return true;
+}
 
 function findInFiles() {
   showFindInFiles({
     files: toolFiles,
     root: toolsRoot,
-    open: (path) => {
-      const rec = findFile(tree, path);
-      if (!rec) return toast(`${path} is not among the open files. Open its Data folder to edit it.`, 'warn'), false;
-      openFile(rec);
-      return true;
-    },
+    open: openToolFile,
   });
+}
+
+function compareFolders() {
+  showCompareFolders({ files: toolFiles, root: toolsRoot, open: openToolFile });
 }
 
 const toolItems = [
   { label: 'Quick Open…', keys: 'Ctrl+P', hint: 'Find a file in the Data folder by name (fuzzy)', run: quickOpen },
   { label: 'Find in files…', hint: 'Search the text of every file under a folder', run: findInFiles },
+  { label: 'Compare two folders…', hint: 'List the files two folders do not share or that differ', run: compareFolders },
 ];
 $('btn-find').before(menuBar([{ label: 'Tools', items: toolItems }], 'Tools'));
 
