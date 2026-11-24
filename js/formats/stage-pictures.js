@@ -7,6 +7,9 @@ import { decodeLayers } from './wrappers.js';
 import { parseBres } from './bres.js';
 import { decodeDds } from './dds.js';
 import { parseGameJson } from './json.js';
+import { decompressMovie, u8At, u16, rectLength, skipMatrix, skipColorTransform, readCString, readPascalString, readTags } from './sgfx.js';
+
+export { decompressMovie };
 
 export const PICTURE_BUNDLE = 'scaleform/UI_main.bres';
 export const STAGE_TABLE = 'json/stage/gemini_stage_table.json';
@@ -52,113 +55,6 @@ export function stageKinds(tableText) {
 }
 
 // ---------- the movie ----------
-
-async function inflate(u8, format) {
-  const stream = new Blob([u8]).stream().pipeThrough(new DecompressionStream(format));
-  return new Uint8Array(await new Response(stream).arrayBuffer());
-}
-
-/** The movie's uncompressed bytes (CFX/CWS: zlib after the 8-byte header; GFX/FWS: as stored), or null. */
-export async function decompressMovie(sgfx) {
-  if (!sgfx || sgfx.length < 10) return null;
-  const sig = String.fromCharCode(sgfx[0], sgfx[1], sgfx[2]);
-  if (sig === 'GFX' || sig === 'FWS') return sgfx;
-  if (sig !== 'CFX' && sig !== 'CWS') return null;
-  let body;
-  try {
-    body = await inflate(sgfx.subarray(8), 'deflate');
-  } catch {
-    // As HappyTool: the raw deflate data after the 2-byte zlib header, checksum ignored.
-    body = await inflate(sgfx.subarray(10, sgfx.length - 4), 'deflate-raw');
-  }
-  const out = new Uint8Array(8 + body.length);
-  out.set(sgfx.subarray(0, 8));
-  out.set(body, 8);
-  return out;
-}
-
-function u8At(b, p) {
-  if (p < 0 || p >= b.length) throw new RangeError('past the end');
-  return b[p];
-}
-const u16 = (b, p) => u8At(b, p) | (u8At(b, p + 1) << 8);
-const i32 = (b, p) => u16(b, p) | (u16(b, p + 2) << 16);
-
-class BitReader {
-  constructor(b, pos) {
-    this.b = b;
-    this.pos = pos;
-    this.bit = 0;
-  }
-  read(bits) {
-    let v = 0;
-    for (let i = 0; i < bits; i++) {
-      v = (v << 1) | ((u8At(this.b, this.pos) >> (7 - this.bit)) & 1);
-      if (++this.bit === 8) {
-        this.bit = 0;
-        this.pos++;
-      }
-    }
-    return v;
-  }
-  get end() {
-    return this.pos + (this.bit ? 1 : 0);
-  }
-}
-
-const rectLength = (b, pos) => ((5 + (u8At(b, pos) >> 3) * 4 + 7) / 8) | 0;
-
-function skipMatrix(b, pos) {
-  const r = new BitReader(b, pos);
-  if (r.read(1)) { const n = r.read(5); r.read(n); r.read(n); } // scale
-  if (r.read(1)) { const n = r.read(5); r.read(n); r.read(n); } // rotate / skew
-  { const n = r.read(5); r.read(n); r.read(n); } // translate
-  return r.end;
-}
-
-function skipColorTransform(b, pos) {
-  const r = new BitReader(b, pos);
-  const hasAdd = r.read(1), hasMul = r.read(1), n = r.read(4);
-  const fields = (hasAdd ? 4 : 0) + (hasMul ? 4 : 0);
-  for (let i = 0; i < fields; i++) r.read(n);
-  return r.end;
-}
-
-function readCString(b, at) {
-  let p = at.p;
-  while (u8At(b, p) !== 0) p++;
-  const s = new TextDecoder().decode(b.subarray(at.p, p));
-  at.p = p + 1;
-  return s;
-}
-
-function readPascalString(b, at) {
-  const n = u8At(b, at.p++);
-  if (at.p + n > b.length) throw new RangeError('past the end');
-  const s = String.fromCharCode(...b.subarray(at.p, at.p + n));
-  at.p += n;
-  return s;
-}
-
-function readTags(b, pos, end) {
-  const tags = [];
-  while (pos + 2 <= end) {
-    const codeAndLength = u16(b, pos);
-    const code = codeAndLength >> 6;
-    let length = codeAndLength & 0x3f;
-    let header = 2;
-    if (length === 0x3f) {
-      if (pos + 6 > end) break;
-      length = i32(b, pos + 2);
-      header = 6;
-    }
-    if (length < 0 || pos + header + length > end) break;
-    tags.push({ code, data: b.subarray(pos + header, pos + header + length) });
-    pos += header + length;
-    if (code === 0) break;
-  }
-  return tags;
-}
 
 /** PlaceObject2 / PlaceObject3: the character placed (-1 when it only moves one) and the instance name, or null. */
 function readPlaceObject(t) {

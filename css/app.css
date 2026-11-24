@@ -231,6 +231,10 @@ a.btn { display: inline-block; text-decoration: none; }
 
 /* ---------- bundle table ---------- */
 .grid-wrap { flex: 1; min-height: 0; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.sgfx-body { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
+.sgfx-body h3 { margin: 6px 0 0; font-size: 13px; }
+.sgfx-body .sgfx-table { flex: none; max-height: 40vh; }
+.sgfx-info { overflow-wrap: anywhere; }
 .grid { width: 100%; border-collapse: collapse; font-size: 13px; }
 .grid th {
   position: sticky;

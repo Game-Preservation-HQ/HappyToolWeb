@@ -4,7 +4,8 @@ import { sniff, KIND_LABELS } from '../formats/sniff.js';
 import { SHELLS } from '../formats/wrappers.js';
 import { makeZip } from '../formats/zip.js';
 import { looksLikeStage } from './stage-view.js';
-import { ascii4, formatSize, baseName } from '../util.js';
+import { ascii4, formatSize, baseName, downloadBytes } from '../util.js';
+import { canExportSwf, sgfxToSwf, swfNameForEntry } from '../formats/sgfx.js';
 
 const kindCache = new WeakMap();
 function entryType(e) {
@@ -184,6 +185,10 @@ export function renderBres(node, ctx) {
   const btn = {
     open: button('Open', () => ctx.openChild(one()), { title: 'Open the selected entry (Enter or double-click)' }),
     extract: button('Extract', () => extract(selection()), { title: 'Download the selected entries (several go in a .zip)' }),
+    swf: button('Export SWF…', () => {
+      const e = arc.entries[one()];
+      downloadBytes(sgfxToSwf(e.data), swfNameForEntry(e.name));
+    }, { title: 'Download the selected .sgfx / .gfx movie as a .swf (CFX → CWS, GFX → FWS) for JPEXS FFDec' }),
     replace: button('Replace…', replace, { title: 'Replace the selected entry with a file from disk' }),
     rename: button('Rename…', rename),
     del: button('Delete', del, { class: 'btn btn-danger-quiet' }),
@@ -192,6 +197,7 @@ export function renderBres(node, ctx) {
     const single = one();
     btn.open.disabled = single < 0 || arc.entries[single]?.pointer;
     btn.extract.disabled = selected.size === 0;
+    btn.swf.disabled = single < 0 || !canExportSwf(arc.entries[single]);
     btn.replace.disabled = single < 0;
     btn.rename.disabled = single < 0;
     btn.del.disabled = selected.size === 0;
@@ -213,6 +219,7 @@ export function renderBres(node, ctx) {
       looksLikeStage(arc) ? button('View map', () => ((node.showMap = true), ctx.rerender()), { title: 'Draw this stage in 3D' }) : null,
       btn.open,
       btn.extract,
+      btn.swf,
       btn.replace,
       button('Add files…', add, { title: 'Add files from disk as new entries' }),
       btn.rename,

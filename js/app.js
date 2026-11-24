@@ -22,6 +22,7 @@ import { renderVir } from './views/vir-view.js';
 import { renderFnt } from './views/fnt-view.js';
 import { renderTanda } from './views/tanda-view.js';
 import { renderRra } from './views/rra-view.js';
+import { renderSgfx } from './views/sgfx-view.js';
 import { dataRootOf, preferredLng, isSearchable } from './formats/lng-refs.js';
 import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictures } from './browser.js';
 import { loadHandle, saveHandle, forgetHandle, readDirectory } from './data-folder.js';
@@ -476,6 +477,10 @@ function renderView() {
     changed: markDirty,
     rerender: () => (renderInfo(), renderView()),
     openChild,
+    /** Opens another entry of the bundle this entry sits in (the movie view's external images). */
+    openSibling: async (index) => {
+      if (stack().length > 1 && (await popTo(stack().length - 2))) await openChild(index);
+    },
     /** The File menu of an editor view (the script editor's): open, save, save as, close. */
     file: {
       open: openFilesPicker,
@@ -614,6 +619,8 @@ function pickView(node, ctx) {
       return renderVir(node);
     case 'fnt':
       return renderFnt(node);
+    case 'sgfx':
+      return renderSgfx(node, ctx);
     default:
       return renderHex(node, ctx, node.payload.length ? `Binary data (starts with ${describeMagic(node.payload)}). Shown as bytes.` : null);
   }

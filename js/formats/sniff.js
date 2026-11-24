@@ -5,6 +5,7 @@ import { isDds } from './dds.js';
 import { looksLikeLngHeader, parseLng } from './lng.js';
 import { looksLikeRml } from './rml.js';
 import { isAnimationPayload } from './rra.js';
+import { isScaleformMovie } from './sgfx.js';
 
 const TEXT_EXT = new Set(['.txt', '.xml', '.csv', '.cfg', '.ini', '.nut', '.lua', '.html', '.htm', '.js', '.css', '.yml', '.yaml', '.md', '.log', '.shader', '.fx', '.hlsl']);
 const IMAGE_MAGIC = [
@@ -28,6 +29,7 @@ export const KIND_LABELS = {
   fnt: 'Bitmap font',
   tanda: 'UI scene',
   rra: 'Animation',
+  sgfx: 'Scaleform movie',
   hex: 'Binary',
 };
 
@@ -45,6 +47,7 @@ export function sniff(u8, name = '') {
   if (isDds(u8)) return { kind: 'dds' };
   for (const [magic, mime] of IMAGE_MAGIC) if (magic.every((b, i) => u8[i] === b)) return { kind: 'image', mime };
   if (u8.length >= 2 && u8[0] === 0xfa && u8[1] === 0xfa) return { kind: 'nutc' }; // Squirrel bytecode
+  if (isScaleformMovie(u8)) return { kind: 'sgfx' }; // .sgfx / .gfx (CFX / GFX) and .swf (CWS / FWS), by content
   if (ext === '.vmd') return { kind: 'vmd' }; // the desktop opens .vmd by name; a bad header shows its error
   if (looksLikeRml(u8) || ext === '.rml') return { kind: 'rml' }; // bundles open any 0MF entry (.rmd too) as a material
   if (ext === '.vir') return { kind: 'vir' }; // the desktop opens .vir by name and warns when it isn't TRF
