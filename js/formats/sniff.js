@@ -24,6 +24,7 @@ export const KIND_LABELS = {
   vmd: 'Voice macro',
   rml: 'Material definition',
   vir: 'Resource descriptor',
+  fnt: 'Bitmap font',
   hex: 'Binary',
 };
 
@@ -44,6 +45,7 @@ export function sniff(u8, name = '') {
   if (ext === '.vmd') return { kind: 'vmd' }; // the desktop opens .vmd by name; a bad header shows its error
   if (looksLikeRml(u8) || ext === '.rml') return { kind: 'rml' }; // bundles open any 0MF entry (.rmd too) as a material
   if (ext === '.vir') return { kind: 'vir' }; // the desktop opens .vir by name and warns when it isn't TRF
+  if (ext === '.fnt') return { kind: 'fnt' }; // by name too (app.js keeps a bundle entry without FTDF as bytes)
   if (ext === '.lng' || (looksLikeLngHeader(u8) && !looksLikeText(u8))) {
     try {
       parseLng(u8);

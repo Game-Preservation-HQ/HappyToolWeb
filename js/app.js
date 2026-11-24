@@ -6,6 +6,7 @@ import { parseLng, writeLng, validateLng } from './formats/lng.js';
 import { parseVmd, writeVmd } from './formats/vmd.js';
 import { parseRml, serializeRml } from './formats/rml.js';
 import { isTrf, VIR_WARNING } from './formats/vir.js';
+import { looksLikeFtdf, FNT_WARNING } from './formats/fnt.js';
 import { sniff, KIND_LABELS, describeMagic } from './formats/sniff.js';
 import { decodeText, encodeText, bytesEqual, formatSize, baseName, downloadBytes } from './util.js';
 import { renderBres } from './views/bres-view.js';
@@ -18,6 +19,7 @@ import { renderHex } from './views/hex-view.js';
 import { renderVmd } from './views/vmd-view.js';
 import { renderRml } from './views/rml-view.js';
 import { renderVir } from './views/vir-view.js';
+import { renderFnt } from './views/fnt-view.js';
 import { dataRootOf, preferredLng, isSearchable } from './formats/lng-refs.js';
 import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictures } from './browser.js';
 import { loadHandle, saveHandle, forgetHandle, readDirectory } from './data-folder.js';
@@ -181,6 +183,10 @@ function loadModel(node) {
     else if (s.kind === 'vmd') node.model = parseVmd(node.payload, !!node.parent);
     else if (s.kind === 'rml') node.model = parseRml(node.payload);
     else if (s.kind === 'vir' && !isTrf(node.payload)) node.warning = VIR_WARNING;
+    else if (s.kind === 'fnt' && !looksLikeFtdf(node.payload)) {
+      if (node.parent) node.kind = 'hex'; // the desktop's bundle editor opens only FTDF .fnt entries as fonts
+      else node.warning = FNT_WARNING;
+    }
     else if (s.kind === 'json' || s.kind === 'text') {
       node.model = decodeText(node.payload);
       if (!bytesEqual(encodeText(node.model.text, node.model.encoding), node.payload))
@@ -561,6 +567,8 @@ function pickView(node, ctx) {
       return renderRml(node, ctx);
     case 'vir':
       return renderVir(node);
+    case 'fnt':
+      return renderFnt(node);
     default:
       return renderHex(node, ctx, node.payload.length ? `Binary data (starts with ${describeMagic(node.payload)}). Shown as bytes.` : null);
   }
