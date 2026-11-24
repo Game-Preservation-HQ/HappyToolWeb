@@ -1,8 +1,10 @@
 // Model fingerprints of embedded .rrm / .rmd meshes, ported from HappyTool/RrmConvert/RrmModelParser.cs
 // (TryParseBundledModel, TryComputeModelFingerprint, TryComputeVertexCloudFingerprint,
-// TryComputeTriangleSoupFingerprint). Float arithmetic is float32 as on the desktop, values are rounded with
-// Math.Round(x, 3, AwayFromZero) and sorted with the desktop's unstable introsort, so -0 / +0 ties land in the
-// same order and the SHA-256 of the written stream comes out the same.
+// TryComputeTriangleSoupFingerprint). Values are rounded with Math.Round(x, 3, AwayFromZero) and sorted with the
+// desktop's unstable introsort, so -0 / +0 ties land in the same order and the SHA-256 of the written stream comes
+// out the same. The desktop is an x86 Debug build, run on the x87 FPU at double precision: a float expression is
+// only narrowed to float32 (Math.fround here) where it is stored in a float local, returned or passed as a float
+// argument, so (pos - c) / scale, the centroid sums and dx*dx + dy*dy + dz*dz are each worked out in double first.
 
 import { parseRrm } from '../formats/rrm.js';
 import { parseRmdMesh } from '../formats/rmd.js';
@@ -68,9 +70,9 @@ function visualShapeHash(mesh) {
   const { cx, cy, cz, scale } = bounds(pos);
   const nrm = new Float32Array(vc * 3);
   for (let i = 0; i < vc; i++) {
-    nrm[i * 3] = netRound3(f(f(pos[i * 3] - cx) / scale));
-    nrm[i * 3 + 1] = netRound3(f(f(pos[i * 3 + 1] - cy) / scale));
-    nrm[i * 3 + 2] = netRound3(f(f(pos[i * 3 + 2] - cz) / scale));
+    nrm[i * 3] = netRound3(f((pos[i * 3] - cx) / scale));
+    nrm[i * 3 + 1] = netRound3(f((pos[i * 3 + 1] - cy) / scale));
+    nrm[i * 3 + 2] = netRound3(f((pos[i * 3 + 2] - cz) / scale));
   }
   const order = Array.from({ length: vc }, (_, i) => i);
   netSort(order, (a, b) => {
@@ -116,9 +118,9 @@ function vertexCloudHash(mesh) {
   const pts = new Array(vc);
   for (let i = 0; i < vc; i++) {
     pts[i] = [
-      netRound3(f(f(pos[i * 3] - cx) / scale)),
-      netRound3(f(f(pos[i * 3 + 1] - cy) / scale)),
-      netRound3(f(f(pos[i * 3 + 2] - cz) / scale)),
+      netRound3(f((pos[i * 3] - cx) / scale)),
+      netRound3(f((pos[i * 3 + 1] - cy) / scale)),
+      netRound3(f((pos[i * 3 + 2] - cz) / scale)),
     ];
   }
   netSort(pts, (a, b) => {
@@ -143,20 +145,20 @@ function triangleSoupHash(mesh) {
   const pos = mesh.positions, idx = mesh.indices;
   const vc = pos.length / 3;
   const { cx, cy, cz, scale } = bounds(pos);
-  const px = (v) => f(f(pos[v * 3] - cx) / scale);
-  const py = (v) => f(f(pos[v * 3 + 1] - cy) / scale);
-  const pz = (v) => f(f(pos[v * 3 + 2] - cz) / scale);
+  const px = (v) => f((pos[v * 3] - cx) / scale);
+  const py = (v) => f((pos[v * 3 + 1] - cy) / scale);
+  const pz = (v) => f((pos[v * 3 + 2] - cz) / scale);
   const dist = (a, b) => {
     const dx = f(px(a) - px(b)), dy = f(py(a) - py(b)), dz = f(pz(a) - pz(b));
-    return f(Math.sqrt(f(f(f(dx * dx) + f(dy * dy)) + f(dz * dz))));
+    return f(Math.sqrt(dx * dx + dy * dy + dz * dz));
   };
   const feats = [];
   for (let t = 0; t + 2 < idx.length; t += 3) {
     const i0 = idx[t], i1 = idx[t + 1], i2 = idx[t + 2];
     if (i0 >= vc || i1 >= vc || i2 >= vc) continue;
-    const c0 = netRound3(f(f(f(px(i0) + px(i1)) + px(i2)) / 3));
-    const c1 = netRound3(f(f(f(py(i0) + py(i1)) + py(i2)) / 3));
-    const c2 = netRound3(f(f(f(pz(i0) + pz(i1)) + pz(i2)) / 3));
+    const c0 = netRound3(f((px(i0) + px(i1) + px(i2)) / 3));
+    const c1 = netRound3(f((py(i0) + py(i1) + py(i2)) / 3));
+    const c2 = netRound3(f((pz(i0) + pz(i1) + pz(i2)) / 3));
     let a = netRound3(dist(i0, i1)), b = netRound3(dist(i1, i2)), c = netRound3(dist(i2, i0)), s;
     if (a > b) { s = a; a = b; b = s; }
     if (a > c) { s = a; a = c; c = s; }

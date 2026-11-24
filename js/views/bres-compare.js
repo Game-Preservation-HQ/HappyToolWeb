@@ -69,14 +69,12 @@ export function showBresCompare({ workshop = null } = {}) {
         const newA = await loadBundle(await pathWorkshop.read());
         allRows = compareBundles(oldA, newA, new ModelFingerprints());
         populate();
-        const m = allRows.filter(isMatchRow).length;
-        statusLine.textContent = `${allRows.length} rows, ${m} matched.`;
       } catch (e) {
         allRows = [];
         populate();
-        statusLine.textContent = '';
         toast(e.message, 'error');
       } finally {
+        statusLine.textContent = '';
         compareBtn.disabled = false;
       }
     }
