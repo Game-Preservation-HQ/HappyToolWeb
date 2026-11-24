@@ -822,24 +822,40 @@ function boneTree(st, onSelect) {
       const children = kids[i < 0 ? n : i];
       const open = st.expanded.has(i);
       const sel = i >= 0 && st.selected === i;
-      const item = el('div', { class: 'tree-item' + (sel ? ' sel' : ''), role: 'treeitem', tabindex: -1, 'aria-selected': String(sel), title: label(i) }, label(i));
+      const cur = i === (st.selected >= 0 ? st.selected : -1);
+      const item = el('div', { class: 'tree-item' + (sel ? ' sel' : ''), role: 'treeitem', tabindex: cur ? 0 : -1, 'aria-selected': String(sel), title: label(i), dataset: { i: String(i) } }, label(i));
       if (children.length) item.setAttribute('aria-expanded', String(open));
       const twisty = el('button', { type: 'button', class: 'twisty', tabindex: -1, 'aria-hidden': 'true' }, children.length ? (open ? '▾' : '▸') : '');
       twisty.addEventListener('click', () => {
         if (open) st.expanded.delete(i);
         else st.expanded.add(i);
         render();
+        host.querySelector('.tree-item[tabindex="0"]')?.focus({ preventScroll: true });
       });
-      item.addEventListener('click', () => {
-        onSelect(i);
-        render();
-      });
+      item.addEventListener('click', () => choose(i));
       const box = el('div', {}, el('div', { class: 'tree-row', style: `padding-left: ${depth * 14}px` }, twisty, item));
       if (open) for (const c of children) box.append(build(c, depth + 1));
       return box;
     };
     host.append(build(-1, 0));
   };
+  // Selecting keeps the focus on the chosen node, so the player's keys keep working; Up / Down walk the visible
+  // nodes the way the desktop's TreeView does (its form takes Space, Left, Right, Home and End first).
+  const choose = (i) => {
+    onSelect(i);
+    render();
+    host.querySelector(`.tree-item[data-i="${i}"]`)?.focus({ preventScroll: true });
+  };
+  host.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+    const items = [...host.querySelectorAll('.tree-item')];
+    const next = items[items.indexOf(document.activeElement) + (e.key === 'ArrowUp' ? -1 : 1)];
+    e.preventDefault();
+    if (next) {
+      choose(Number(next.dataset.i));
+      host.querySelector('.tree-item:focus')?.scrollIntoView({ block: 'nearest' });
+    }
+  });
   render();
   return host;
 }
@@ -873,7 +889,7 @@ export function renderRra(node, ctx) {
   header += st.extras;
   const memo = (st.report + (st.meshNotes.length ? '\n' + st.meshNotes.join('\n') : '')).trim();
 
-  const view = el('div', { class: 'view rra-view', tabindex: -1 }, el('div', { class: 'toolbar' }, el('span', { class: 'note', title: 'Animation (.rra / .cmf)' }, header)));
+  const view = el('div', { class: 'view rra-view', tabindex: -1 }, el('div', { class: 'toolbar' }, el('span', { class: 'note', title: 'Animation (.rra / .cmf)', style: 'white-space: pre-wrap' }, header)));
   if (!doc.isValid) view.append(el('div', { class: 'banner banner-warn', role: 'alert' }, 'This file does not look like a Happy Wars .rra / .cmf animation.'));
 
   const run = ++st.run;
