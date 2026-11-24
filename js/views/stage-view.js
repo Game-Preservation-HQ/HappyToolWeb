@@ -18,6 +18,7 @@ import {
   placementMatrix,
 } from '../formats/stage-bake.js';
 import { downloadBytes } from '../util.js';
+import { openGameFolder, readRegistration, createPlan, install, BACKUP_FOLDER } from '../formats/stage-install.js';
 import { stageGlb, stageObjZip } from '../formats/model-export.js';
 import { setViewCommands, openPalette } from '../palette.js';
 import { takePad, PAD } from '../gamepad.js';
@@ -2206,8 +2207,16 @@ export function renderStage(node, ctx) {
 
     // ----- download (objects, sky and fog written into a copy of the bundle, as the desktop export does) -----
     const downloadNote = el('p', { class: 'muted stage-count' });
-    const bakeBtn = button('Download bundle', bakeBundle, {
+    const bakeBtn = button('Download bundle', () => bakeBundle(), {
       title: 'Write the moved, hidden and Solid objects, the collision edits, the sky and the fog into a copy of the stage bundle, as the desktop export does',
+    });
+    // Install (the desktop's Install into game, over the stage the map came from): pick the game folder, see the plan,
+    // then the same bundle is written into Data\stage after a backup set the desktop's Backups list can restore.
+    const canInstall = !!window.showDirectoryPicker;
+    const installBtn = button('Install into game…', () => bakeBundle(true), {
+      title: canInstall
+        ? `Write the same bundle into the game's Data\\stage in place of the stage it came from. Pick the game folder (the one holding Data); every file that changes is backed up first into ${BACKUP_FOLDER} next to Data`
+        : 'Installing needs a browser that can write to a folder (Chrome or Edge). Download the bundle and copy it into Data\\stage instead',
     });
     function bakeParts() {
       const parts = [];
@@ -2296,7 +2305,8 @@ export function renderStage(node, ctx) {
         ? `Writes the ${listOf(parts)} into a copy of ${edit.stage}.bres.`
         : 'Move, hide or make objects Solid, terraform the ground, change the sky, fog or minimap, edit the collision, or set up the castle gimmicks, to write them into a copy of the bundle.';
       bakeBtn.disabled = !parts.length;
-      if (!downloadBox.contains(bakeBtn)) downloadBox.replaceChildren(downloadNote, el('div', { class: 'toolbar' }, bakeBtn));
+      installBtn.disabled = !parts.length || !canInstall;
+      if (!downloadBox.contains(bakeBtn)) downloadBox.replaceChildren(downloadNote, el('div', { class: 'toolbar' }, bakeBtn, installBtn));
     }
     /** Solid objects for export (CollectExportSolids): each one's collision shape, placed like the object. */
     function exportSolids() {
@@ -2391,11 +2401,58 @@ export function renderStage(node, ctx) {
         [...notes, ...rep.warnings].map((x) => ` ${x}`).join('');
       return { entries: kept, line };
     }
-    /** Downloads a copy of the bundle with the objects (and their collision), sky (ApplySkyToBundle) and fog (FogExport) written in. */
-    async function bakeBundle() {
+    /** The install plan's findings (and its steps, when it can go ahead) in a dialog; resolves to true for Install. */
+    function planDialog(plan, title, okLabel) {
+      const label = { error: 'Problem', warning: 'Warning', info: 'Note' };
+      return openDialog((dlg, done) => {
+        dlg.classList.add('dialog-wide');
+        dlg.append(
+          el('h2', { class: 'dialog-title' }, title),
+          el('ul', { class: 'install-findings' }, plan.findings.map((f) =>
+            el('li', { class: `install-${f.severity}` }, el('strong', {}, `${label[f.severity]}: ${f.message}`), el('div', { class: 'muted' }, f.detail)))),
+          okLabel && el('ol', { class: 'install-steps' }, plan.steps.map((x) => el('li', {}, x))),
+          el('div', { class: 'dialog-actions' }, okLabel
+            ? [button('Cancel', () => done(false)), button(okLabel, () => done(true), { class: 'btn btn-primary', autofocus: true })]
+            : button('Close', () => done(false), { class: 'btn btn-primary', autofocus: true })),
+        );
+      }).then((v) => v === true);
+    }
+    /** Asks for the game folder (while the click still counts as the user's) and shows the plan: {root, plan}, or null. */
+    async function pickInstall() {
+      if (!canInstall) {
+        toast('Installing needs a browser that can write to a folder (Chrome or Edge). Download the bundle and copy it into Data\\stage instead.', 'warn', 10000);
+        return null;
+      }
+      let picked;
+      try {
+        picked = await window.showDirectoryPicker({ id: 'happywars-game', mode: 'readwrite' });
+      } catch (e) {
+        if (e.name !== 'AbortError') toast(`The browser would not open that folder (${e.message}).`, 'error', 10000);
+        return null;
+      }
+      try {
+        const root = await openGameFolder(picked);
+        const plan = await createPlan(root.data, await readRegistration(root.data), edit.stage);
+        if (plan.hasErrors) {
+          await planDialog(plan, `${edit.stage}.bres can't be installed into "${root.game.name}"`, null);
+          return null;
+        }
+        return (await planDialog(plan, `Install ${edit.stage}.bres into "${root.game.name}"?`, 'Install')) ? { root, plan } : null;
+      } catch (e) {
+        toast(e.message, 'error', 10000);
+        return null;
+      }
+    }
+    /**
+     * Downloads a copy of the bundle with the objects (and their collision), sky (ApplySkyToBundle) and fog (FogExport)
+     * written in; with toGame, installs that copy into the game folder picked first (StageInstaller.Install) instead.
+     */
+    async function bakeBundle(toGame = false) {
       const parts = bakeParts();
       if (!parts.length) return toast('Nothing to write into the bundle yet.');
-      bakeBtn.disabled = true;
+      const target = toGame ? await pickInstall() : null;
+      if (toGame && !target) return;
+      bakeBtn.disabled = installBtn.disabled = true;
       const was = status.textContent;
       try {
         let archive = model;
@@ -2509,8 +2566,18 @@ export function renderStage(node, ctx) {
         status.textContent = 'Writing the bundle…';
         await pause();
         const bytes = await encodeLayers(writeBres(archive), writableLayers(node.layers || []));
-        downloadBytes(bytes, `${edit.stage}.bres`);
-        toast(`${edit.stage}.bres downloaded. ${lines.join(' ')}`, 'ok', 10000);
+        if (target) {
+          const r = await install(target.root, target.plan, bytes, {
+            source: `${edit.stage}.bres`,
+            onStep: (pct, text) => (status.textContent = `${text} (${pct}%)`),
+          });
+          console.info(`Install into game:\n${r.log.join('\n')}`);
+          if (r.ok) toast(`${r.message} Backup set: ${BACKUP_FOLDER}\\${r.set.name}. ${lines.join(' ')}`, 'ok', 15000);
+          else toast(r.message, 'error', 15000);
+        } else {
+          downloadBytes(bytes, `${edit.stage}.bres`);
+          toast(`${edit.stage}.bres downloaded. ${lines.join(' ')}`, 'ok', 10000);
+        }
       } catch (e) {
         toast(`The bundle could not be written: ${e.message}`, 'error', 10000);
       } finally {

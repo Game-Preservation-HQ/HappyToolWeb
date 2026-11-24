@@ -395,6 +395,14 @@ kbd {
 .dialog-text { margin: 0 0 14px; }
 .dialog .input { width: 100%; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.dialog-wide { width: min(600px, calc(100vw - 32px)); }
+.install-findings { list-style: none; margin: 0 0 12px; padding: 0; display: grid; gap: 8px; }
+.install-findings li { padding: 6px 10px; border-radius: var(--radius); border-left: 4px solid var(--border); }
+.install-findings .install-error { border-left-color: var(--danger); background: var(--error-bg); }
+.install-findings .install-warning { border-left-color: #d9a400; background: var(--warn-bg); }
+.install-findings .install-error strong { color: var(--error-text); }
+.install-findings .install-warning strong { color: var(--warn-text); }
+.install-steps { margin: 0; padding-left: 20px; display: grid; gap: 4px; }
 .stage-pad-help { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; max-width: 640px; }
 .stage-pad-help dt { font-weight: 600; }
 .stage-pad-help dd { margin: 0; }
