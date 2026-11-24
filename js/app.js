@@ -176,7 +176,7 @@ function loadModel(node) {
   try {
     if (s.kind === 'bres') node.model = parseBres(node.payload);
     else if (s.kind === 'lng') node.model = parseLng(node.payload);
-    else if (s.kind === 'vmd') node.model = parseVmd(node.payload);
+    else if (s.kind === 'vmd') node.model = parseVmd(node.payload, !!node.parent);
     else if (s.kind === 'rml') node.model = parseRml(node.payload);
     else if (s.kind === 'json' || s.kind === 'text') {
       node.model = decodeText(node.payload);

@@ -62,7 +62,8 @@ function readAsciiField(bytes) {
  * @typedef {{version: number, bigEndian: boolean, groups: VoiceGroup[]}} VmdFile
  * @returns {VmdFile}
  */
-export function parseVmd(d) {
+export function parseVmd(d, embedded = false) {
+  if (embedded && d.length === 0) throw new Error('No data.'); // VoiceMacroCatalog.TryLoadFromBytes (bundle entries)
   if (d.length < HEADER) throw new Error('File is too small to be a valid .vmd file.');
   const bigEndian = detectBigEndian(d);
   const version = readI32(d, 0, bigEndian);
