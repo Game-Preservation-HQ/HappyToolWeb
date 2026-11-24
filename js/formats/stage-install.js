@@ -210,6 +210,245 @@ export function addFileListEntry(text, name) {
   return out;
 }
 
+// ----- gemini_stage_table.json: text edits that keep the file's own layout (StageTableText) -----
+
+/** C#'s String.Trim().Length == 0 on Latin-1 text (Char.IsWhiteSpace also counts U+0085, which JS's trim doesn't). */
+const isBlank = (s) => /^[\t\n\v\f\r \u0085 ]*$/.test(s);
+const TRUNCATED = Symbol('truncated');
+
+/** The desktop's minimal span-recording JSON scanner (tolerates // and /* *\/ comments like the game's files). */
+function skipTrivia(t, i) {
+  while (i < t.length) {
+    const c = t[i];
+    if (c === ' ' || c === '\t' || c === '\r' || c === '\n') i++;
+    else if (c === '/' && t[i + 1] === '/') {
+      const eol = t.indexOf('\n', i);
+      i = eol < 0 ? t.length : eol + 1;
+    } else if (c === '/' && t[i + 1] === '*') {
+      const end = t.indexOf('*/', i + 2);
+      i = end < 0 ? t.length : end + 2;
+    } else break;
+  }
+  return i;
+}
+function scanString(t, i) {
+  if (i >= t.length) throw TRUNCATED; // C# indexes past the end here
+  if (t[i] !== '"') throw new Error(`Expected a string at offset ${i}.`);
+  let s = '';
+  i++;
+  while (i < t.length && t[i] !== '"') {
+    if (t[i] === '\\' && i + 1 < t.length) {
+      s += t[i + 1];
+      i += 2;
+      continue;
+    }
+    s += t[i++];
+  }
+  if (i >= t.length) throw new Error('Unterminated string.');
+  return { key: s, end: i + 1 };
+}
+function scanValue(t, i) {
+  i = skipTrivia(t, i);
+  if (i >= t.length) throw new Error('Unexpected end of JSON.');
+  const c = t[i];
+  if (c === '{') return scanObject(t, i, null);
+  if (c === '[') {
+    i = skipTrivia(t, i + 1);
+    if (i < t.length && t[i] === ']') return i + 1;
+    for (;;) {
+      i = skipTrivia(t, scanValue(t, i));
+      if (i >= t.length) throw new Error('Unterminated array.');
+      if (t[i] === ',') i++;
+      else if (t[i] === ']') return i + 1;
+      else throw new Error(`Expected ',' or ']' at offset ${i}.`);
+    }
+  }
+  if (c === '"') return scanString(t, i).end;
+  const start = i;
+  while (i < t.length && !',}] \t\r\n/'.includes(t[i])) i++;
+  if (i === start) throw new Error(`Unexpected character '${c}' at offset ${i}.`);
+  return i;
+}
+/** Scans the object at i (its first character is skipped, '{' or not, as the desktop does); collect gets the members. */
+function scanObject(t, i, collect) {
+  i = skipTrivia(t, i + 1);
+  if (i < t.length && t[i] === '}') return i + 1;
+  for (;;) {
+    i = skipTrivia(t, i);
+    const keyStart = i;
+    const { key, end } = scanString(t, i);
+    i = skipTrivia(t, end);
+    if (i >= t.length || t[i] !== ':') throw new Error(`Expected ':' after "${key}".`);
+    const valueStart = skipTrivia(t, i + 1);
+    i = scanValue(t, valueStart);
+    collect?.push({ key, keyStart, valueStart, valueEnd: i });
+    i = skipTrivia(t, i);
+    if (i >= t.length) throw new Error('Unterminated object.');
+    if (t[i] === ',') i++;
+    else if (t[i] === '}') return i + 1;
+    else throw new Error(`Expected ',' or '}' at offset ${i}.`);
+  }
+}
+
+/** The stage_ object's members with their spans (TryScanStages); throws with the desktop's message. */
+function scanStages(text) {
+  try {
+    const i = skipTrivia(text, 0);
+    if (i >= text.length || text[i] !== '{') throw new Error('Stage table does not start with an object.');
+    const top = [];
+    scanObject(text, i, top);
+    const root = top.find((m) => m.key === 'JsonStageInfomationTable');
+    if (!root) throw new Error('JsonStageInfomationTable not found.');
+    const rootMembers = [];
+    scanObject(text, root.valueStart, rootMembers);
+    const stages = rootMembers.find((m) => m.key === 'stage_');
+    if (!stages) throw new Error('stage_ not found.');
+    const members = [];
+    scanObject(text, stages.valueStart, members);
+    return members;
+  } catch (e) {
+    if (e === TRUNCATED) throw new Error('Stage table is truncated.');
+    throw e;
+  }
+}
+
+/** The key/value separator the file uses (" : " in the Excel exports). */
+function separatorOf(value, props) {
+  const p = props[0];
+  const keyEnd = value.indexOf('"', p.keyStart + 1) + 1;
+  const sep = value.slice(keyEnd, p.valueStart);
+  return sep.includes(':') ? sep : ' : ';
+}
+
+/** One entry object with id_ set (when tableId isn't null) and MenuNum set or inserted (TryEditEntryValue). */
+function editEntryValue(value, tableId, menuNum) {
+  const i = skipTrivia(value, 0);
+  if (i >= value.length || value[i] !== '{') throw new Error('Stage entry is not an object.');
+  const props = [];
+  scanObject(value, i, props);
+  if (!props.length) throw new Error('Stage entry has no fields.');
+  // Applied back to front so the earlier spans stay valid.
+  const edits = [];
+  if (tableId != null) {
+    const idProp = props.find((p) => p.key === 'id_');
+    if (idProp) edits.push([idProp.valueStart, idProp.valueEnd, `"${tableId}"`]);
+  }
+  const menu = props.find((p) => p.key === 'MenuNum');
+  if (menu) edits.push([menu.valueStart, menu.valueEnd, String(menuNum)]);
+  else {
+    // A whole line before MenuBgIndex (the official field order), else before the first field.
+    const anchor = props.find((p) => p.key === 'MenuBgIndex') ?? props[0];
+    const at = lineStart(value, anchor.keyStart);
+    const indent = value.slice(at, anchor.keyStart);
+    const sep = separatorOf(value, props);
+    if (isBlank(indent)) edits.push([at, at, `${indent}"MenuNum"${sep}${menuNum},${detectNewline(value, 0)}`]);
+    else edits.push([anchor.keyStart, anchor.keyStart, `"MenuNum"${sep}${menuNum}, `]);
+  }
+  let out = value;
+  for (const [from, to, s] of edits.sort((a, b) => b[0] - a[0])) out = out.slice(0, from) + s + out.slice(to);
+  return out;
+}
+
+const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+/** JToken.DeepEquals: objects by key whatever their order, arrays in order. */
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (Array.isArray(a)) return Array.isArray(b) && a.length === b.length && a.every((v, i) => deepEqual(v, b[i]));
+  if (!isObject(a) || !isObject(b)) return false;
+  const ka = Object.keys(a);
+  return ka.length === Object.keys(b).length && ka.every((k) => own(b, k) && deepEqual(a[k], b[k]));
+}
+/** (int?) and (string) on a Json.NET value, for the fields the edit wrote. */
+const asInt = (v) =>
+  typeof v === 'number' ? toInt(v) : typeof v === 'boolean' ? +v : typeof v === 'string' && /^\s*[+-]?\d+\s*$/.test(v) ? parseInt(v, 10) : null;
+const asString = (v) => (v == null ? null : typeof v === 'boolean' ? (v ? 'True' : 'False') : typeof v === 'object' ? null : String(v));
+
+function parseStages(text) {
+  let stages;
+  try {
+    stages = JSON.parse(stripJsonComments(text).text)?.JsonStageInfomationTable?.stage_;
+  } catch (e) {
+    throw new Error(`JSON parse failed: ${e.message}`);
+  }
+  if (!isObject(stages)) throw new Error('"JsonStageInfomationTable"."stage_" not found.');
+  return stages;
+}
+
+/** The edited table read back (Verify): every other entry unchanged, the entry there with its id_ and MenuNum. */
+function verifyTable(oldText, newText, id, tableId, menuNum) {
+  let before;
+  let after;
+  try {
+    before = parseStages(oldText);
+    after = parseStages(newText);
+  } catch (e) {
+    throw new Error(`Edited stage table does not parse: ${e.message}`);
+  }
+  for (const k of Object.keys(before)) {
+    if (sameName(k, id)) continue;
+    if (!own(after, k) || !deepEqual(before[k], after[k])) throw new Error(`Edit changed an unrelated entry (${k}).`);
+  }
+  if (Object.keys(after).length !== Object.keys(before).length + (own(before, id) ? 0 : 1))
+    throw new Error('Edited stage table has an unexpected number of entries.');
+  const entry = own(after, id) && isObject(after[id]) ? after[id] : null;
+  if (!entry || asInt(entry.MenuNum) !== menuNum || (tableId != null && asString(entry.id_) !== tableId))
+    throw new Error('Edited stage entry is missing its id_/MenuNum.');
+  if (own(before, id) && isObject(before[id])) {
+    // Only MenuNum may differ on an existing entry.
+    const { MenuNum: a, ...cmp } = entry;
+    const { MenuNum: b, ...oldCmp } = before[id];
+    if (!deepEqual(cmp, oldCmp)) throw new Error('Edit changed fields other than MenuNum.');
+  }
+}
+
+/**
+ * The table's text with a new stage entry cloned from templateId's (same fields and layout) under the key newId, with
+ * its id_ and MenuNum replaced (StageTableText.TryAddEntry). The template's NameTextID / HelpTextID stay, so the menu
+ * shows the template's name for the new stage. Throws with the desktop's message.
+ */
+export function addTableEntry(text, newId, tableId, menuNum, templateId) {
+  const members = scanStages(text);
+  if (members.some((m) => sameName(m.key, newId))) throw new Error(`Stage '${newId}' already has a table entry.`);
+  const template = members.find((m) => sameName(m.key, templateId ?? ''));
+  if (!template) throw new Error(`Template stage '${templateId ?? ''}' is not in the table.`);
+  if (!members.length) throw new Error('The stage table is empty.');
+  const newValue = editEntryValue(text.slice(template.valueStart, template.valueEnd), tableId, menuNum);
+  const keyAndColon = text.slice(template.keyStart, template.valueStart);
+  const newMember = `"${newId}"${keyAndColon.slice(keyAndColon.indexOf('"', 1) + 1)}${newValue}`;
+  const last = members[members.length - 1];
+  const at = lineStart(text, template.keyStart);
+  let indent = text.slice(at, template.keyStart);
+  if (!isBlank(indent)) indent = '';
+  const nl = detectNewline(text, template.valueStart);
+  const out = `${text.slice(0, last.valueEnd)},${nl}${indent}${newMember}${text.slice(last.valueEnd)}`;
+  verifyTable(text, out, newId, tableId, menuNum);
+  return out;
+}
+
+/** The table's text with stage id's entry given MenuNum menuNum (StageTableText.TryAddMenuNum, for entries without one). */
+export function addMenuNum(text, id, menuNum) {
+  const entry = scanStages(text).find((m) => sameName(m.key, id));
+  if (!entry) throw new Error(`Stage '${id}' has no table entry.`);
+  const newValue = editEntryValue(text.slice(entry.valueStart, entry.valueEnd), null, menuNum);
+  const out = text.slice(0, entry.valueStart) + newValue + text.slice(entry.valueEnd);
+  verifyTable(text, out, entry.key, null, menuNum);
+  return out;
+}
+
+/** The id_ a new table entry gets (StageNames.DefaultTableId): sforA → STAGE_SFOR_A, anything else upper-cased. */
+export function defaultTableId(id) {
+  if (!id) return '';
+  const m = /^([a-z]+)([A-Z])$/.exec(id);
+  return m ? `STAGE_${m[1].toUpperCase()}_${m[2]}` : `STAGE_${id.toUpperCase()}`;
+}
+
+/** The MenuNum after the highest one in use (StageRegistrationSnapshot.NextFreeMenuNum). */
+export function nextFreeMenuNum(snap) {
+  const used = snap.slots.filter((s) => s.menuNum != null).map((s) => s.menuNum);
+  return (used.length ? Math.max(...used) : 0) + 1;
+}
+
 /**
  * Renames, in place, the archive's files named for stage from so the game finds them in stage to's slot
  * (StageInstaller.RetargetNames): a name starting with from (any case) starts with to instead, and minimap_<from>.dds
@@ -355,16 +594,24 @@ export async function readRegistration(data) {
 }
 
 /**
- * The install plan for putting the bundle into stage id's slot in place of the bundle there (CreatePlan for
- * ReplaceExisting): {id, slot, bundleRel, miniRel, targetExists, miniExists, addToFileList, retargetFrom, willRewrap,
- * findings: [{severity, code, message, detail}], steps, hasErrors}. A slot stageFileList.nut doesn't list is added to it.
- * retarget (rename a bundle made for another stage for this slot) and rewrap (ZRES + BFBR when it isn't) are the
+ * The install plan for putting the bundle into stage id's slot (CreatePlan): {id, mode, slot, bundleRel, miniRel,
+ * targetExists, miniExists, addToFileList, addTableEntry, addMenuNum, newTableId, effectiveMenuNum, retargetFrom,
+ * willRewrap, findings: [{severity, code, message, detail}], steps, hasErrors}. mode 'replace' puts it in place of the
+ * bundle there, and with menuNum gives a table entry that has no MenuNum that one; 'addNew' adds a gemini_stage_table.json
+ * entry for a new id with menuNum and the settings of template's entry. A slot stageFileList.nut doesn't list is added
+ * to it. retarget (rename a bundle made for another stage for this slot) and rewrap (ZRES + BFBR when it isn't) are the
  * dialog's two options, both on as the desktop's. The bundle's own stage comes from its check (applyLint); until then
  * authoredFor stands in for it.
  */
-export async function createPlan(data, snap, stageId, { retarget = true, rewrap = true, authoredFor = null } = {}) {
+export async function createPlan(
+  data, snap, stageId, { mode = 'replace', menuNum = null, template = null, retarget = true, rewrap = true, authoredFor = null } = {},
+) {
   const id = String(stageId ?? '').trim();
-  const plan = { id, slot: null, retarget, rewrap, authoredFor, lint: null, base: [], final: false };
+  const addNew = mode === 'addNew';
+  const plan = {
+    id, mode: addNew ? 'addNew' : 'replace', menuNum, template, slot: null, retarget, rewrap, authoredFor, lint: null, base: [],
+    final: false, addToFileList: false, addTableEntry: false, addMenuNum: false, newTableId: null, effectiveMenuNum: null,
+  };
   const add = (severity, code, message, detail) => plan.base.push({ severity, code, message, detail });
   if (!isValidStageId(id)) {
     add('error', 'INVALID_ID', `Invalid stage id '${id}'`, 'Use letters, digits and underscores only (e.g. sforA).');
@@ -378,31 +625,65 @@ export async function createPlan(data, snap, stageId, { retarget = true, rewrap 
   plan.miniRel = `stage\\mini\\${sid}.bres`;
   plan.targetExists = !!slot?.bundleExists;
   plan.miniExists = !!(await fileAt(data, plan.miniRel));
-  if (!slot) {
-    add('error', 'SLOT_UNKNOWN', `'${id}' is not an installed or registered stage`,
-      'Pick one of the listed stages to replace, or add it as a new stage with the desktop HappyTool.');
+  if (addNew && slot?.inTable) {
+    add('error', 'ID_EXISTS', `'${slot.id}' already exists in gemini_stage_table.json`, 'Use "Replace an existing stage" to install over it.');
     plan.final = true;
     return settle(plan);
   }
-  plan.addToFileList = !slot.listedInFileList;
-  const menu = slot.menuNum;
-  if (menu == null)
+  if (!addNew && !slot) {
+    add('error', 'SLOT_UNKNOWN', `'${id}' is not an installed or registered stage`,
+      'Pick one of the listed stages to replace, or switch to "Add as a new stage".');
+    plan.final = true;
+    return settle(plan);
+  }
+  const inTable = !!slot?.inTable;
+  const current = slot?.menuNum ?? null;
+  // Replacing never adds a table entry; it only gives an existing entry a MenuNum when the user asks for one.
+  plan.addTableEntry = addNew;
+  plan.addMenuNum = !addNew && inTable && current == null && menuNum != null;
+  plan.addToFileList = !slot || !slot.listedInFileList;
+  const adding = plan.addTableEntry || plan.addMenuNum;
+  const menu = current ?? (adding ? menuNum : null);
+  plan.effectiveMenuNum = menu;
+  if (!addNew && menu == null)
     add('warning', 'NOT_IN_MENU', `'${id}' has no MenuNum — it won't appear in Skirmish`,
-      slot.inTable
+      inTable
         ? `The file is replaced, but the stage has no Skirmish slot. Replace a stage with MenuNum 1–${SKIRMISH_SLOTS} to play it.`
         : "The stage has no gemini_stage_table.json entry at all, so the menu can't list it.");
-  else if (menu === GATED_SLOT)
-    add('warning', 'SLOT_GATED', `MenuNum ${GATED_SLOT} is DLC-gated — the stage won't show in Skirmish`,
-      `Slot ${GATED_SLOT} is unlocked by an entitlement check in HappyWars.exe, not by data.`);
-  else if (!visibleSlot(menu))
-    add('warning', 'SLOT_BEYOND_CAP', `MenuNum ${menu} is outside the ${SKIRMISH_SLOTS} visible Skirmish slots`,
-      `The stage is registered but will not appear in the menu. Replace one of MenuNum 1–${SKIRMISH_SLOTS} to play it.`);
-  if (visibleSlot(menu))
+  if (addNew) {
+    plan.newTableId = defaultTableId(id);
+    // The desktop's snap.Find: the id as given (no trimming), any case.
+    const t = template == null ? null : snap.slots.find((s) => sameName(s.id, String(template))) ?? null;
+    if (!t?.inTable)
+      add('error', 'TEMPLATE_MISSING', 'Choose an existing stage to copy table settings from',
+        'A new gemini_stage_table.json entry is cloned from an existing one.');
+  }
+  if (adding && menuNum == null)
+    add('error', 'MENUNUM_REQUIRED', `Choose a MenuNum for '${id}'`, 'The Skirmish menu is ordered by MenuNum; the new entry needs one.');
+  // Menu slot checks (the cap lives in HappyWars.exe).
+  if (adding)
+    add('warning', 'NEW_MENU_SLOT', 'Adds a new Skirmish MenuNum instead of replacing a stage',
+      `HappyWars.exe caps the Skirmish menu at ${SKIRMISH_SLOTS} stages and MenuNum ${GATED_SLOT} is DLC/entitlement-gated, so extra entries do not appear in the menu. To test in-game, replace an existing stage (e.g. sbabA) instead.`);
+  if (menu != null) {
+    if (menu === GATED_SLOT)
+      add('warning', 'SLOT_GATED', `MenuNum ${GATED_SLOT} is DLC-gated — the stage won't show in Skirmish`,
+        `Slot ${GATED_SLOT} is unlocked by an entitlement check in HappyWars.exe, not by data.`);
+    else if (!visibleSlot(menu))
+      add('warning', 'SLOT_BEYOND_CAP', `MenuNum ${menu} is outside the ${SKIRMISH_SLOTS} visible Skirmish slots`,
+        `The stage is registered but will not appear in the menu. Replace one of MenuNum 1–${SKIRMISH_SLOTS} to play it.`);
+    if (adding) {
+      const clash = snap.slots.filter((s) => s.menuNum === menu && !sameName(s.id, id));
+      if (clash.length)
+        add('warning', 'MENUNUM_IN_USE', `MenuNum ${menu} is already used by ${clash.map((s) => s.id).join(', ')}`,
+          'Two stages sharing a MenuNum is untested; the menu may show only one of them.');
+    }
+  }
+  if (!adding && visibleSlot(menu))
     add('info', 'SLOT', `Skirmish slot ${menu}: ${describeStage(sid)}`,
       plan.targetExists
         ? `Replaces Data\\stage\\${sid}.bres; the current file is backed up first.`
         : `${sid}.bres is not installed yet — this fills the slot (restoring removes it again).`);
-  if (!slot.hasStageTables) {
+  if (!slot?.hasStageTables) {
     const missing = [];
     for (const s of STAGE_TABLE_SUFFIXES) if (!(await fileAt(data, `json\\stage\\${id}${s}`))) missing.push(id + s);
     if (missing.length)
@@ -420,7 +701,7 @@ function settle(plan) {
   plan.willRewrap = false;
   if (!plan.final) {
     const { id, lint } = plan;
-    const sid = plan.slot.id;
+    const sid = plan.slot?.id ?? id;
     plan.willRewrap = !!(plan.rewrap && lint?.readable && !lint.isSteamWrapped);
     const authoredFor = lint ? lint.detectedStageId : plan.authoredFor;
     const otherStage = isValidStageId(authoredFor) && authoredFor.toLowerCase() !== id.toLowerCase();
@@ -432,7 +713,7 @@ function settle(plan) {
     } else if (otherStage)
       add('warning', 'NOT_RETARGETED', `The bundle's files are named for '${authoredFor}', not '${id}'`,
         `The game loads ${id}.rrm, ${id}_Chit.ccp … when it loads this slot; with renaming off they keep their ${authoredFor} names and may not be found.`);
-    if (otherStage && plan.slot.hasStageTables)
+    if (otherStage && plan.slot?.hasStageTables)
       add('info', 'SLOT_TABLES_MISMATCH', `Installing '${authoredFor}' into the '${id}' slot`,
         `The slot keeps json\\stage\\${id}_stage_*.json (areas, gimmicks, effects authored for ${friendlyName(id) ?? id}), so objectives are placed at ${id}'s coordinates.`);
     // The desktop warns here when it sees the game running; a browser can't, so it always says to close it.
@@ -442,6 +723,9 @@ function settle(plan) {
     const target = `Data\\stage\\${sid}.bres`;
     if (plan.targetExists) steps.push(`Back up the current ${target}`);
     if (plan.addToFileList) steps.push(`Back up stage\\stageFileList.nut and add "${id}.bres" to it`);
+    if (plan.addTableEntry)
+      steps.push(`Back up gemini_stage_table.json and add '${id}' (id_ ${plan.newTableId}, MenuNum ${plan.menuNum ?? '?'}, settings from ${plan.template ?? ''})`);
+    else if (plan.addMenuNum) steps.push(`Back up gemini_stage_table.json and give '${id}' MenuNum ${plan.menuNum ?? '?'}`);
     if (plan.retargetFrom)
       steps.push(`Rename the bundle's ${plan.retargetFrom} files for ${id} (models, collision, effects, camera / light, minimap)`);
     steps.push(`${plan.targetExists ? 'Replace' : 'Write'} ${target}${
@@ -602,11 +886,11 @@ export async function install(root, plan, bytes, { source, onStep, lint } = {}) 
     onStep?.(pct, text);
   };
   const done = (ok, message, set = null) => ({ ok, message, log, set });
-  if (!plan || plan.hasErrors || !plan.slot) return done(false, 'The install plan has errors; nothing was changed.');
+  if (!plan || plan.hasErrors || plan.final) return done(false, 'The install plan has errors; nothing was changed.');
   if (!lint || !lint.readable || lint.hasErrors) return done(false, 'The bundle failed the pre-install check; nothing was changed.');
   if (lint.sha256 && (await sha256(bytes)) !== lint.sha256.toLowerCase())
     return done(false, 'The bundle changed after it was checked. Check it again, then install; nothing was changed.');
-  const id = plan.slot.id;
+  const id = plan.slot?.id ?? plan.id;
   // The bytes going to disk must still open as a BRES container.
   let payload;
   let layers;
@@ -661,11 +945,29 @@ export async function install(root, plan, bytes, { source, onStep, lint } = {}) 
       return done(false, `${e.message} Nothing was changed.`);
     }
   }
+  let table = null;
+  if (plan.addTableEntry || plan.addMenuNum) {
+    let text;
+    try {
+      const plain = latin1(snap.table.plain);
+      text = plan.addTableEntry
+        ? addTableEntry(plain, id, plan.newTableId, plan.menuNum, plan.template)
+        : addMenuNum(plain, id, plan.menuNum);
+    } catch (e) {
+      return done(false, `gemini_stage_table.json: ${e.message}`);
+    }
+    try {
+      table = await encodeLike(latin1Bytes(text), snap.table.layers);
+    } catch (e) {
+      return done(false, `${e.message} Nothing was changed.`);
+    }
+  }
 
   const writes = [{ role: 'bundle', rel: plan.bundleRel, bytes }];
   // Lower quality levels load stage\mini\<id>.bres instead when it exists; the full-size bundle works in its place.
   if (await fileAt(root.data, plan.miniRel)) writes.push({ role: 'low-quality bundle', rel: plan.miniRel, bytes });
   if (fileList) writes.push({ role: 'file list', rel: FILE_LIST, bytes: fileList });
+  if (table) writes.push({ role: 'stage table', rel: TABLE, bytes: table });
 
   step(35, 'Backing up files that will change…');
   let set;

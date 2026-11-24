@@ -21,7 +21,7 @@ import { downloadBytes } from '../util.js';
 import {
   openGameFolder, readRegistration, createPlan, install, BACKUP_FOLDER, listBackupSets, stageBackupSets, compareWithCurrent, restoreBackupSet,
   isValidStageId, describeStage, planStockRestore, stockState, restoreStock as putStageBackToStock, stockBundle, planRestoreFromCopy,
-  restoreFromCopy, sha256, applyLint, combinedFindings, friendlyName,
+  restoreFromCopy, sha256, applyLint, combinedFindings, friendlyName, nextFreeMenuNum,
 } from '../formats/stage-install.js';
 import { lintBundle } from '../formats/stage-lint.js';
 import { stageGlb, stageObjZip } from '../formats/model-export.js';
@@ -2433,11 +2433,12 @@ export function renderStage(node, ctx) {
             : !isMenuSlot(s) ? 'beyond the 11-slot menu cap' : '',
     ];
     /**
-     * Where to install, as StageInstallDialog's "Replace an existing stage" page asks it: the game's stages in Skirmish
-     * menu order (stages outside the menu greyed), its two options, and the plan for the stage picked, worked out again on
+     * Where to install, as StageInstallDialog asks it: the game's stages in Skirmish menu order (stages outside the menu
+     * greyed), its two options, Replace an existing stage or Add as a new stage id (with its MenuNum and the stage whose
+     * table settings it copies; a replaced stage without a MenuNum can be given one), and the plan, worked out again on
      * every change: its findings, and its steps when it can go ahead. The map's own stage is picked first when it is a
-     * Skirmish slot the game has (the desktop follows the bundle's stage the same way), otherwise sbabA. Resolves to the
-     * plan, or null.
+     * Skirmish slot the game has (the desktop follows the bundle's stage the same way), otherwise sbabA; it is also the
+     * new id offered when the game has no table entry for it. Resolves to the plan, or null.
      */
     function targetDialog(root, snap) {
       const label = { error: 'Problem', warning: 'Warning', info: 'Note' };
@@ -2445,37 +2446,92 @@ export function renderStage(node, ctx) {
       let picked = (own && isMenuSlot(own) && own.bundleExists ? own : snap.find('sbabA') ?? snap.slots[0])?.id;
       const rewrapBox = el('input', { type: 'checkbox', checked: true });
       const retargetBox = el('input', { type: 'checkbox', checked: true });
+      const replaceRadio = el('input', { type: 'radio', name: 'install-mode', value: 'replace', checked: true });
+      const addRadio = el('input', { type: 'radio', name: 'install-mode', value: 'addNew' });
+      const newIdBox = el('input', { type: 'text', class: 'input new-id', placeholder: 'e.g. sforA', spellcheck: 'false', autocomplete: 'off' });
+      const assignBox = el('input', { type: 'checkbox' });
+      let lastMenu = nextFreeMenuNum(snap);
+      const menuBox = el('input', { type: 'number', class: 'input menu-num', min: 1, max: 99, step: 1, value: String(lastMenu) });
+      // The desktop's combo lists the table entries that have a MenuNum and starts with none chosen.
+      const templateBox = el('select', { class: 'input' }, el('option', { value: '', hidden: true }, ''),
+        snap.slots.filter((s) => s.inTable && s.menuNum != null).map((s) => el('option', { value: s.id }, `${describeStage(s.id)} (MenuNum ${s.menuNum})`)));
+      const newIdLabel = el('label', {}, 'New stage id: ', newIdBox);
+      const assignLabel = el('label', {}, assignBox, ' Give it a Skirmish MenuNum');
+      const menuLabel = el('label', {}, 'MenuNum: ', menuBox);
+      const templateLabel = el('label', {}, 'Copy table settings from: ', templateBox);
+      const newPanel = el('div', { class: 'install-new', hidden: true }, newIdLabel, assignLabel, menuLabel, templateLabel);
+      const caption = el('p', { class: 'slot-caption', id: 'install-slot-caption' }, 'Target slot — pick the stage your bundle replaces (Skirmish menu order):');
+      const gridWrap = el('div', { class: 'grid-wrap slot-grid-wrap' });
       const planBox = el('div', { class: 'install-plan', 'aria-live': 'polite' });
       let plan = null;
       let seq = 0;
+      /** The spin box's value: a whole number from 1 to 99, the last good one while the box holds something else. */
+      const menuValue = () => {
+        const v = Math.round(Number(menuBox.value));
+        if (menuBox.value.trim() !== '' && Number.isFinite(v)) lastMenu = Math.min(99, Math.max(1, v));
+        return lastMenu;
+      };
+      const selectTemplate = (id) => {
+        const opts = [...templateBox.options].slice(1);
+        const o = opts.find((x) => x.value.toLowerCase() === id.toLowerCase()) ?? opts[0];
+        if (o) templateBox.value = o.value;
+      };
       return openDialog((dlg, done) => {
         const ok = button('Install', () => plan && !plan.hasErrors && done(plan), { class: 'btn btn-primary', disabled: true });
+        const showPlan = (findings, steps) =>
+          planBox.replaceChildren(
+            el('ul', { class: 'install-findings' }, findings.map((f) =>
+              el('li', { class: `install-${f.severity}` }, el('strong', {}, `${label[f.severity]}: ${f.message}`), f.detail ? el('div', { class: 'muted' }, f.detail) : null))),
+            ...(steps ? [el('ol', { class: 'install-steps' }, steps.map((x) => el('li', {}, x)))] : []),
+          );
+        let rows = [];
         const refresh = async () => {
           const n = ++seq;
           ok.disabled = true;
+          // StageInstallDialog.UpdatePlan: which of the new-id row's controls apply, then the request and its plan.
+          const addNew = addRadio.checked;
+          const slot = snap.find(picked);
+          const canAssign = !addNew && slot != null && slot.inTable && slot.menuNum == null;
+          newIdLabel.hidden = !addNew;
+          templateLabel.hidden = !addNew;
+          assignLabel.hidden = !canAssign;
+          menuLabel.hidden = !(addNew || canAssign);
+          menuBox.disabled = !(addNew || assignBox.checked);
+          newPanel.hidden = !(addNew || canAssign);
+          gridWrap.classList.toggle('slot-grid-off', addNew);
+          for (const r of rows) r.radio.disabled = addNew;
+          caption.textContent = addNew
+            ? 'Existing stages (for reference — a new id gets its own entry):'
+            : 'Target slot — pick the stage your bundle replaces (Skirmish menu order):';
+          const id = addNew ? newIdBox.value.trim() : slot?.id;
+          const menuNum = addNew || (canAssign && assignBox.checked) ? menuValue() : null;
+          if (!id) {
+            plan = null;
+            showPlan([{ severity: 'info', message: addNew ? 'Enter the new stage id' : 'Pick a target slot', detail: '' }], null);
+            return;
+          }
           let p;
           try {
-            p = await createPlan(root.data, snap, picked, { retarget: retargetBox.checked, rewrap: rewrapBox.checked, authoredFor: edit.stage });
+            p = await createPlan(root.data, snap, id, {
+              mode: addNew ? 'addNew' : 'replace', menuNum, template: templateBox.value || null,
+              retarget: retargetBox.checked, rewrap: rewrapBox.checked, authoredFor: edit.stage,
+            });
           } catch (e) {
             if (n === seq) planBox.replaceChildren(el('p', { class: 'muted' }, `The plan could not be made: ${e.message}`));
             return;
           }
           if (n !== seq) return;
           plan = p;
-          planBox.replaceChildren(
-            el('ul', { class: 'install-findings' }, p.findings.map((f) =>
-              el('li', { class: `install-${f.severity}` }, el('strong', {}, `${label[f.severity]}: ${f.message}`), el('div', { class: 'muted' }, f.detail)))),
-            ...(p.hasErrors ? [] : [el('ol', { class: 'install-steps' }, p.steps.map((x) => el('li', {}, x)))]),
-          );
+          showPlan(p.findings, p.hasErrors ? null : p.steps);
           ok.disabled = p.hasErrors;
         };
-        const rows = snap.slots.map((s) => {
+        rows = snap.slots.map((s) => {
           const cells = slotCells(s);
           const radio = el('input', { type: 'radio', name: 'install-slot', value: s.id, checked: s.id === picked, 'aria-label': `${s.id} ${cells[2]}`.trim() });
           const tr = el('tr', { class: isMenuSlot(s) ? null : 'slot-off' },
             el('td', { class: 'num' }, radio, ` ${cells[0]}`), ...cells.slice(1).map((c, i) => el('td', { class: i === 0 ? 'name' : null }, String(c))));
           const pick = () => {
-            if (picked === s.id) return;
+            if (picked === s.id || addRadio.checked) return;
             picked = s.id;
             radio.checked = true;
             for (const r of rows) r.tr.classList.toggle('sel', r.id === picked);
@@ -2488,17 +2544,44 @@ export function renderStage(node, ctx) {
         });
         rewrapBox.addEventListener('change', refresh);
         retargetBox.addEventListener('change', refresh);
+        // StageInstallDialog.ModeChanged: a new id starts at the next free MenuNum, the map's own stage when the table has
+        // no entry for it, and sbabA's settings (or the first entry's) unless a template is already chosen.
+        const modeChanged = () => {
+          if (addRadio.checked) {
+            lastMenu = nextFreeMenuNum(snap);
+            menuBox.value = String(lastMenu);
+            if (!newIdBox.value.trim() && isValidStageId(edit.stage) && snap.find(edit.stage)?.inTable !== true) newIdBox.value = edit.stage;
+            if (!templateBox.value) selectTemplate('sbabA');
+          }
+          refresh();
+        };
+        replaceRadio.addEventListener('change', modeChanged);
+        addRadio.addEventListener('change', modeChanged);
+        newIdBox.addEventListener('input', refresh);
+        assignBox.addEventListener('change', refresh);
+        menuBox.addEventListener('input', refresh);
+        menuBox.addEventListener('change', () => {
+          menuBox.value = String(menuValue());
+          refresh();
+        });
+        templateBox.addEventListener('change', refresh);
+        gridWrap.append(
+          el('table', { class: 'grid', 'aria-labelledby': 'install-slot-caption' },
+            el('thead', {}, el('tr', {}, ['Menu', 'Stage', 'Skirmish name', 'Installed file', 'In stageFileList.nut', 'Gameplay tables', 'Note'].map((h) => el('th', {}, h)))),
+            el('tbody', {}, rows.map((r) => r.tr))),
+        );
         const installed = snap.slots.filter((s) => s.bundleExists).length;
         const visible = snap.slots.filter(isMenuSlot).length;
         dlg.classList.add('dialog-slots');
         dlg.append(
           el('h2', { class: 'dialog-title' }, `Install ${edit.stage}.bres into "${root.game.name}"`),
           el('p', { class: 'muted' }, `Happy Wars Data folder — ${installed} stage bundle(s) installed, ${visible} Skirmish slot(s) with MenuNum 1–11. Backups: ${root.game.name}\\${BACKUP_FOLDER}`),
-          el('p', { class: 'slot-caption', id: 'install-slot-caption' }, 'Target slot — pick the stage your bundle replaces (Skirmish menu order):'),
-          el('div', { class: 'grid-wrap slot-grid-wrap' },
-            el('table', { class: 'grid', 'aria-labelledby': 'install-slot-caption' },
-              el('thead', {}, el('tr', {}, ['Menu', 'Stage', 'Skirmish name', 'Installed file', 'In stageFileList.nut', 'Gameplay tables', 'Note'].map((h) => el('th', {}, h)))),
-              el('tbody', {}, rows.map((r) => r.tr)))),
+          el('div', { class: 'install-mode', role: 'radiogroup', 'aria-label': 'Install mode' },
+            el('label', {}, replaceRadio, ' Replace an existing stage (recommended)'),
+            el('label', {}, addRadio, ' Add as a new stage id (advanced — the Skirmish menu is capped at 11)')),
+          caption,
+          gridWrap,
+          newPanel,
           el('div', { class: 'install-options' },
             el('label', {}, rewrapBox, " Re-wrap as BFBR + ZRES (like the shipped Steam stages) when the bundle isn't already"),
             el('label', {}, retargetBox, ' Rename the bundle\'s own files for the slot it replaces (a Forest port over Rainbow: sforA.rrm → sligA.rrm …)')),

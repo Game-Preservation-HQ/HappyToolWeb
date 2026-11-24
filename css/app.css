@@ -403,6 +403,12 @@ kbd {
 .slot-grid-wrap td input { margin: 0 4px 0 0; vertical-align: -2px; }
 .grid tbody tr.slot-off { color: var(--muted); }
 .install-options { display: grid; gap: 4px; margin: 0 0 12px; }
+.install-mode { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 10px 0 0; }
+.install-new { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; margin: 0 0 12px; }
+.install-new .input { width: auto; max-width: 100%; }
+.install-new .new-id { width: 120px; }
+.install-new .menu-num { width: 64px; }
+.slot-grid-wrap.slot-grid-off { opacity: 0.6; pointer-events: none; }
 .install-findings { list-style: none; margin: 0 0 12px; padding: 0; display: grid; gap: 8px; }
 .install-findings li { padding: 6px 10px; border-radius: var(--radius); border-left: 4px solid var(--border); }
 .install-findings .install-error { border-left-color: var(--danger); background: var(--error-bg); }
