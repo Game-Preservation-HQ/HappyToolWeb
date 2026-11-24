@@ -23,6 +23,7 @@ export const KIND_LABELS = {
   nutc: 'Compiled script',
   vmd: 'Voice macro',
   rml: 'Material definition',
+  vir: 'Resource descriptor',
   hex: 'Binary',
 };
 
@@ -42,6 +43,7 @@ export function sniff(u8, name = '') {
   if (u8.length >= 2 && u8[0] === 0xfa && u8[1] === 0xfa) return { kind: 'nutc' }; // Squirrel bytecode
   if (ext === '.vmd') return { kind: 'vmd' }; // the desktop opens .vmd by name; a bad header shows its error
   if (looksLikeRml(u8) || ext === '.rml') return { kind: 'rml' }; // bundles open any 0MF entry (.rmd too) as a material
+  if (ext === '.vir') return { kind: 'vir' }; // the desktop opens .vir by name and warns when it isn't TRF
   if (ext === '.lng' || (looksLikeLngHeader(u8) && !looksLikeText(u8))) {
     try {
       parseLng(u8);
