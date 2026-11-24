@@ -727,3 +727,47 @@ span.twisty { cursor: default; }
 .rml-grid td.rml-node { font-family: var(--mono); font-size: 12.5px; }
 .rml-grid td.rml-node .twisty { height: 18px; vertical-align: middle; }
 .rml-grid td.rml-value { padding: 1px 4px; min-width: 16em; }
+
+/* Quick Open (Ctrl+P), the desktop Workshop's palette (js/views/quick-open.js) */
+.quick-open { --qo-row: 30px; width: min(780px, calc(100vw - 32px)); padding: 8px; margin-top: 8vh; }
+.quick-open .qo-search { width: 100%; box-sizing: border-box; font-size: 15px; }
+.qo-list { list-style: none; margin: 6px 0 0; padding: 0; overflow-y: auto; }
+.qo-row { display: flex; align-items: center; gap: 8px; height: var(--qo-row); padding: 0 8px; border-radius: var(--radius); cursor: pointer; white-space: nowrap; }
+.qo-row:hover { background: var(--surface-2); }
+.qo-row.active { background: var(--sel); }
+.qo-row b { color: var(--accent); font-weight: 700; }
+.qo-row.missing, .qo-row.missing b { color: var(--muted); }
+.qo-row.missing .qo-icon { opacity: 0.45; filter: grayscale(1); }
+.qo-icon { flex: none; display: inline-flex; width: 16px; height: 16px; }
+.qo-name { flex: none; max-width: 60%; overflow: hidden; text-overflow: ellipsis; }
+/* The folder keeps its end (nearest the file) and loses its start: "…/stage/mini". */
+.qo-folder { flex: 1 1 0; min-width: 0; margin-left: 4px; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; color: var(--muted); font-size: 13px; }
+.qo-tag { flex: none; font-size: 11px; color: var(--muted); }
+.qo-pin { flex: none; display: inline-flex; width: 16px; height: 16px; align-items: center; justify-content: center; color: var(--muted); visibility: hidden; cursor: pointer; }
+.qo-pin svg { fill: none; }
+.qo-row:hover .qo-pin, .qo-row.active .qo-pin { visibility: visible; }
+.qo-pin.on { visibility: visible; color: var(--accent); }
+.qo-pin.on svg { fill: currentColor; }
+.qo-footer { display: flex; gap: 12px; justify-content: space-between; margin: 6px 4px 0; }
+.qo-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qo-hints { flex: none; white-space: nowrap; }
+@media (max-width: 640px) { .qo-hints { display: none; } .quick-open { margin-top: 16px; } }
+/* Find in files (views/find-in-files.js) */
+.fif-top { display: grid; grid-template-columns: auto 1fr auto 200px; gap: 8px 10px; align-items: center; margin-bottom: 10px; font-size: 13px; }
+.fif-buttons { grid-column: 1 / -1; display: flex; gap: 8px; }
+.fif-custom { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.fif-root { grid-column: 2 / -1; }
+.fif-label { white-space: nowrap; }
+.fif-wrap { height: min(400px, 50vh); flex: none; }
+.fif-grid td { overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .fif-top { grid-template-columns: auto 1fr; }
+  .fif-root { grid-column: 2; }
+}
+/* Compare two folders */
+.cf-top { display: grid; grid-template-columns: auto 1fr auto; gap: 8px 10px; align-items: center; margin-bottom: 10px; font-size: 13px; }
+.cf-options { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; }
+.cf-options label { display: inline-flex; align-items: center; gap: 6px; }
+.cf-options .btn { margin-left: auto; }
+.cf-grid td { overflow-wrap: anywhere; }
+.cf-grid td:nth-child(n+3) { white-space: nowrap; }
