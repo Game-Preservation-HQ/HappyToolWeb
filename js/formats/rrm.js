@@ -72,7 +72,7 @@ function readUvStream(u8, r, off, vc, be) {
   return out;
 }
 
-function trianglesFromList(entries, vc) {
+export function trianglesFromList(entries, vc) {
   const out = [];
   for (let i = 0; i + 2 < entries.length; i += 3) {
     const a = entries[i], b = entries[i + 1], c = entries[i + 2];
@@ -83,7 +83,7 @@ function trianglesFromList(entries, vc) {
   return out;
 }
 
-function trianglesFromStrip(entries, vc) {
+export function trianglesFromStrip(entries, vc) {
   const out = [];
   let parity = 0, p1 = -1, p2 = -1;
   for (const u of entries) {

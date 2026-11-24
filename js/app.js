@@ -20,6 +20,7 @@ import { menuBar } from './menubar.js';
 import { openQuickOpen } from './views/quick-open.js';
 import { showFindInFiles } from './views/find-in-files.js';
 import { showCompareFolders } from './views/compare-folders.js';
+import { showBresCompare } from './views/bres-compare.js';
 import { startGamepad } from './gamepad.js';
 
 const $ = (id) => document.getElementById(id);
@@ -954,10 +955,17 @@ function compareFolders() {
   showCompareFolders({ files: toolFiles, root: toolsRoot, open: openToolFile });
 }
 
+/** Compare two bundles on the .bres `path` among the open files (the browser's context menu), or on none (Tools). */
+function compareBundlesOf(path = null) {
+  const rec = path ? findFile(tree, path) : null;
+  showBresCompare({ workshop: rec ? { path: rec.path, read: async () => new Uint8Array(await rec.file.arrayBuffer()) } : null });
+}
+
 const toolItems = [
   { label: 'Quick Open…', keys: 'Ctrl+P', hint: 'Find a file in the Data folder by name (fuzzy)', run: quickOpen },
   { label: 'Find in files…', hint: 'Search the text of every file under a folder', run: findInFiles },
   { label: 'Compare two folders…', hint: 'List the files two folders do not share or that differ', run: compareFolders },
+  { label: 'Compare two bundles…', hint: 'Pair the .rrm / .rmd models of two .bres bundles (renamed, changed, gone, new)', run: () => compareBundlesOf() },
 ];
 $('btn-find').before(menuBar([{ label: 'Tools', items: toolItems }], 'Tools'));
 
