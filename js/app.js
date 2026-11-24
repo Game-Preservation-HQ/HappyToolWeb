@@ -24,6 +24,10 @@ import { dataRootOf, preferredLng, isSearchable } from './formats/lng-refs.js';
 import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictures } from './browser.js';
 import { loadHandle, saveHandle, forgetHandle, readDirectory } from './data-folder.js';
 import { openPalette, setAppCommands } from './palette.js';
+import { menuBar } from './menubar.js';
+import { openQuickOpen } from './views/quick-open.js';
+import { showFindInFiles } from './views/find-in-files.js';
+import { showCompareFolders } from './views/compare-folders.js';
 import { startGamepad } from './gamepad.js';
 
 const $ = (id) => document.getElementById(id);
@@ -915,6 +919,88 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
+// ---------- search and compare tools (the desktop's Quick Open, Find in files, Compare two folders) ----------
+
+/** The Data folder the tools work in: the open file's, else the first one opened, else the opened folder ('' for loose files, null for none). */
+function toolsRoot() {
+  if (!files.length) return null;
+  const data = dataRootOf(current?.path ?? '') || dataRootOf(files.find((r) => dataRootOf(r.path))?.path ?? '');
+  if (data) return data;
+  const top = files[0].path.split('/')[0];
+  return files.every((r) => r.path.startsWith(top + '/')) ? top : '';
+}
+
+/** Shows a file in the browser with the focus on its tile (Quick Open's Ctrl+Enter, the desktop's reveal). */
+function revealFile(path) {
+  browseTo(dirOf(path));
+  const name = path.slice(path.lastIndexOf('/') + 1);
+  const hit = [...dom.view.querySelectorAll('.tile, .row-open')].find((b) => b.title.split('\n')[0] === path || (!b.title && b.textContent === name));
+  hit?.focus();
+  hit?.scrollIntoView({ block: 'nearest' });
+}
+
+function quickOpen() {
+  openQuickOpen({
+    files: () => files.map((r) => r.path),
+    root: toolsRoot,
+    // The desktop pins files only; a folder pinned to Places stays out of the list.
+    pinned: () => prefs.pins.filter((p) => !tree.dirs.has(p)),
+    recent: () => prefs.recent,
+    togglePin: (p) => (togglePin(p), prefs.pins.includes(p)),
+    unpin: (p) => prefs.pins.includes(p) && togglePin(p),
+    removeRecent: (p) => {
+      prefs.recent = prefs.recent.filter((x) => x !== p);
+      writePref('happytool-web-recent', prefs.recent);
+      renderFileList();
+    },
+    open: (p) => sidebarActions.open(p),
+    reveal: revealFile,
+  });
+}
+
+/** The open files as the search tools read them. */
+const toolFiles = () => files.map((r) => ({ path: r.path, size: r.file.size, lastModified: r.file.lastModified, read: async () => new Uint8Array(await r.file.arrayBuffer()) }));
+
+/** Opens a file a tool lists; false (with a note) when it is not among the open files. */
+function openToolFile(path) {
+  const rec = findFile(tree, path);
+  if (!rec) return toast(`${path} is not among the open files. Open its Data folder to edit it.`, 'warn'), false;
+  openFile(rec);
+  return true;
+}
+
+function findInFiles() {
+  showFindInFiles({
+    files: toolFiles,
+    root: toolsRoot,
+    open: openToolFile,
+  });
+}
+
+function compareFolders() {
+  showCompareFolders({ files: toolFiles, root: toolsRoot, open: openToolFile });
+}
+
+const toolItems = [
+  { label: 'Quick Open…', keys: 'Ctrl+P', hint: 'Find a file in the Data folder by name (fuzzy)', run: quickOpen },
+  { label: 'Find in files…', hint: 'Search the text of every file under a folder', run: findInFiles },
+  { label: 'Compare two folders…', hint: 'List the files two folders do not share or that differ', run: compareFolders },
+];
+$('btn-find').before(menuBar([{ label: 'Tools', items: toolItems }], 'Tools'));
+
+// Quick Open: Ctrl+P anywhere, as in the desktop Workshop (inside Quick Open it moves down the list).
+window.addEventListener(
+  'keydown',
+  (e) => {
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'p' && !document.querySelector('dialog.quick-open[open]')) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!document.querySelector('dialog[open]')) quickOpen();
+    }
+  },
+  true,
+);
+
 // Find a feature: Ctrl+K anywhere (caught before the map viewer's own keys, where K toggles Solid).
 window.addEventListener(
   'keydown',
@@ -931,6 +1017,7 @@ $('btn-find').addEventListener('click', openPalette);
 // Controller: moves around the page like the desktop's (stick/D-pad, A, B, X/Y); Menu opens Find a feature.
 startGamepad({ onMenu: openPalette });
 setAppCommands(() => [
+  ...toolItems.map((t) => ({ label: t.label, keys: t.keys, hint: t.hint, section: 'Tools', run: t.run })),
   ...(stepBackLabel() && !(mapShown() && stack().length < 2)
     ? [{ label: stepBackLabel(), keys: current ? 'Esc · Alt+←' : 'Esc · Backspace · Alt+←', section: 'Location', run: stepBack }]
     : []),
