@@ -18,7 +18,9 @@ import {
   placementMatrix,
 } from '../formats/stage-bake.js';
 import { downloadBytes } from '../util.js';
-import { openGameFolder, readRegistration, createPlan, install, BACKUP_FOLDER } from '../formats/stage-install.js';
+import {
+  openGameFolder, readRegistration, createPlan, install, BACKUP_FOLDER, listBackupSets, stageBackupSets, compareWithCurrent, restoreBackupSet,
+} from '../formats/stage-install.js';
 import { stageGlb, stageObjZip } from '../formats/model-export.js';
 import { setViewCommands, openPalette } from '../palette.js';
 import { takePad, PAD } from '../gamepad.js';
@@ -2218,6 +2220,13 @@ export function renderStage(node, ctx) {
         ? `Write the same bundle into the game's Data\\stage in place of the stage it came from. Pick the game folder (the one holding Data); every file that changes is backed up first into ${BACKUP_FOLDER} next to Data`
         : 'Installing needs a browser that can write to a folder (Chrome or Edge). Download the bundle and copy it into Data\\stage instead',
     });
+    // Restore stock (StageViewerForm.Stock): the backups of this stage that installs and restores saved, each put back on request.
+    const stockBtn = button('Restore stock…', () => restoreStock(), {
+      disabled: !canInstall,
+      title: canInstall
+        ? `This stage's backups in the game's ${BACKUP_FOLDER} (every install and restore saves the files it replaces there first): put the game's files back as one of them has them`
+        : 'Restoring needs a browser that can write to a folder (Chrome or Edge)',
+    });
     function bakeParts() {
       const parts = [];
       if (edit.objects.some((o) => !o.gimmick && !isEmpty(o.state))) parts.push('objects');
@@ -2306,7 +2315,7 @@ export function renderStage(node, ctx) {
         : 'Move, hide or make objects Solid, terraform the ground, change the sky, fog or minimap, edit the collision, or set up the castle gimmicks, to write them into a copy of the bundle.';
       bakeBtn.disabled = !parts.length;
       installBtn.disabled = !parts.length || !canInstall;
-      if (!downloadBox.contains(bakeBtn)) downloadBox.replaceChildren(downloadNote, el('div', { class: 'toolbar' }, bakeBtn, installBtn));
+      if (!downloadBox.contains(bakeBtn)) downloadBox.replaceChildren(downloadNote, el('div', { class: 'toolbar' }, bakeBtn, installBtn, stockBtn));
     }
     /** Solid objects for export (CollectExportSolids): each one's collision shape, placed like the object. */
     function exportSolids() {
@@ -2410,19 +2419,15 @@ export function renderStage(node, ctx) {
           el('h2', { class: 'dialog-title' }, title),
           el('ul', { class: 'install-findings' }, plan.findings.map((f) =>
             el('li', { class: `install-${f.severity}` }, el('strong', {}, `${label[f.severity]}: ${f.message}`), el('div', { class: 'muted' }, f.detail)))),
-          okLabel && el('ol', { class: 'install-steps' }, plan.steps.map((x) => el('li', {}, x))),
+          ...(okLabel ? [el('ol', { class: 'install-steps' }, plan.steps.map((x) => el('li', {}, x)))] : []),
           el('div', { class: 'dialog-actions' }, okLabel
             ? [button('Cancel', () => done(false)), button(okLabel, () => done(true), { class: 'btn btn-primary', autofocus: true })]
             : button('Close', () => done(false), { class: 'btn btn-primary', autofocus: true })),
         );
       }).then((v) => v === true);
     }
-    /** Asks for the game folder (while the click still counts as the user's) and shows the plan: {root, plan}, or null. */
-    async function pickInstall() {
-      if (!canInstall) {
-        toast('Installing needs a browser that can write to a folder (Chrome or Edge). Download the bundle and copy it into Data\\stage instead.', 'warn', 10000);
-        return null;
-      }
+    /** The game folder as {game, data}, asked for while the click still counts as the user's; null (after a message) when not. */
+    async function pickGameFolder() {
       let picked;
       try {
         picked = await window.showDirectoryPicker({ id: 'happywars-game', mode: 'readwrite' });
@@ -2431,7 +2436,21 @@ export function renderStage(node, ctx) {
         return null;
       }
       try {
-        const root = await openGameFolder(picked);
+        return await openGameFolder(picked);
+      } catch (e) {
+        toast(e.message, 'error', 10000);
+        return null;
+      }
+    }
+    /** Asks for the game folder and shows the plan: {root, plan}, or null. */
+    async function pickInstall() {
+      if (!canInstall) {
+        toast('Installing needs a browser that can write to a folder (Chrome or Edge). Download the bundle and copy it into Data\\stage instead.', 'warn', 10000);
+        return null;
+      }
+      const root = await pickGameFolder();
+      if (!root) return null;
+      try {
         const plan = await createPlan(root.data, await readRegistration(root.data), edit.stage);
         if (plan.hasErrors) {
           await planDialog(plan, `${edit.stage}.bres can't be installed into "${root.game.name}"`, null);
@@ -2443,6 +2462,120 @@ export function renderStage(node, ctx) {
         return null;
       }
     }
+
+    // ----- Restore stock: the backups list (StageViewerForm.Stock.cs BackupWhen, BackupLabel, BackupDescription, RestoreBackupSet) -----
+    const BACKUP_ROWS = 12;
+    const leafName = (p) => (p ?? '').replace(/[\\/]+$/, '').split(/[\\/]/).pop();
+    const two = (n) => String(n).padStart(2, '0');
+    const backupWhen = (set) => {
+      const d = set.createdUtc;
+      return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`;
+    };
+    const restoredWhen = (d) => `restored ${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`;
+    /** What a set saved the files from, in a few words; names = every set folder's name, lowercased. */
+    function backupLabel(set, names) {
+      if (set.loadError != null) return "can't be read";
+      const source = set.source ?? '';
+      switch (set.operation) {
+        case 'install':
+          return `before installing ${source ? leafName(source) : 'a map'}`;
+        case 'pre-restore': {
+          if (source === 'stock') return 'before putting it back to stock';
+          const folder = leafName(source);
+          // The desktop asks whether that folder exists; a browser can only look among the sets in the same backups folder.
+          const parent = leafName(source.replace(/[\\/]+$/, '').replace(/[\\/][^\\/]*$/, ''));
+          const isSet = !!folder && parent.toLowerCase() === BACKUP_FOLDER.toLowerCase() && names.has(folder.toLowerCase());
+          return isSet ? `before restoring the backup ${folder}` : `before putting it back from ${folder || 'a file'}`;
+        }
+        case 'settings':
+          return `before a settings change${set.note ? ` (${set.note})` : ''}`;
+        default:
+          return set.operation ?? 'backup';
+      }
+    }
+    const backupDescription = (root, set) =>
+      set.loadError != null
+        ? `Its manifest can't be read (${set.loadError}), so it can't be restored. ${root.game.name}\\${BACKUP_FOLDER}\\${set.name}`
+        : `Puts back ${set.entries.map((e) => leafName(e.path)).join(', ')} as they were then. ${set.note ? `${set.note}. ` : ''}The current files are backed up first.`;
+    /** The Restore stock page: this stage's backup sets, newest first; one picked is restored after a confirmation. */
+    async function restoreStock() {
+      const root = await pickGameFolder();
+      if (!root) return;
+      let all, sets;
+      try {
+        all = await listBackupSets(root);
+        sets = await stageBackupSets(root, edit.stage, all);
+      } catch (e) {
+        return toast(`Could not read ${BACKUP_FOLDER}: ${e.message}`, 'error', 10000);
+      }
+      const names = new Set(all.map((x) => x.name.toLowerCase()));
+      const chosen = await openDialog((dlg, done) => {
+        dlg.classList.add('dialog-wide');
+        const rows = sets.slice(0, BACKUP_ROWS).map((set) =>
+          el('button', { type: 'button', class: 'backup-row', disabled: set.loadError != null, onclick: () => done(set) },
+            el('span', { class: 'backup-row-head' },
+              el('strong', {}, `${backupWhen(set)} — ${backupLabel(set, names)}`),
+              set.lastRestoredUtc && el('span', { class: 'muted' }, restoredWhen(set.lastRestoredUtc))),
+            el('span', { class: 'muted' }, backupDescription(root, set))));
+        dlg.append(
+          el('h2', { class: 'dialog-title' }, 'Restore stock'),
+          el('p', { class: 'muted' }, `${edit.stage} in "${root.game.name}"`),
+          el('h3', { class: 'backup-section' }, sets.length ? `Backups (${sets.length})` : 'Backups'),
+          sets.length
+            ? el('div', { class: 'backup-rows' }, rows)
+            : el('div', { class: 'backup-empty' }, el('strong', {}, 'No backups of this stage yet'),
+                el('div', { class: 'muted' }, 'Every install, restore and stock restore saves the files it replaces here first, so it can be undone.')),
+          el('div', { class: 'dialog-actions' }, button('Close', () => done(null), { class: 'btn btn-primary', autofocus: true })),
+        );
+      });
+      if (chosen) await restoreBackup(root, chosen, names);
+    }
+    /** RestoreBackupSet: what each file goes back to and what it is now, then the restore (a pre-restore set first). */
+    async function restoreBackup(root, set, names) {
+      let states;
+      try {
+        states = await compareWithCurrent(root, set);
+      } catch (e) {
+        return toast(`Could not compare the backup with the game's files: ${e.message}`, 'error', 10000);
+      }
+      const when = backupWhen(set);
+      if (states.size && [...states.values()].every((x) => x === 'as-backed-up'))
+        return toast(`The game's files already match the backup from ${when} — nothing to restore.`, 'info', 8000);
+      const now = { 'as-backed-up': 'already as backed up', 'as-written': 'as that left it' };
+      const changed = [...states.values()].includes('changed');
+      const ok = await openDialog((dlg, done) => {
+        dlg.classList.add('dialog-wide');
+        dlg.append(
+          el('h2', { class: 'dialog-title' }, 'Restore stock'),
+          el('p', { class: 'dialog-text' }, `Put the game's files back as they were ${when}, ${backupLabel(set, names)}?`),
+          el('ul', { class: 'restore-files' }, set.entries.map((e) =>
+            el('li', {}, `${e.existed ? 'restore' : 'remove'} Data\\${e.path} — now: ${now[states.get(e.path)] ?? 'changed since'}`))),
+          ...(changed ? [el('p', { class: 'dialog-text' },
+            'Some files were changed by something else since (a later install or restore, a game update or a manual edit). Restoring still works.')] : []),
+          el('p', { class: 'dialog-text' },
+            'Your edits stay in the editor. The current files are backed up first, so this can be undone from Backups under Restore stock…. Close Happy Wars before you go on.'),
+          el('div', { class: 'dialog-actions' },
+            button('Cancel', () => done(false)), button('Restore', () => done(true), { class: 'btn btn-primary', autofocus: true })),
+        );
+      }).then((v) => v === true);
+      if (!ok) return;
+      const was = status.textContent;
+      bakeBtn.disabled = installBtn.disabled = stockBtn.disabled = true;
+      let r;
+      try {
+        r = await restoreBackupSet(root, set, { onStep: (pct, text) => (status.textContent = `${text} (${pct}%)`) });
+      } catch (e) {
+        r = { ok: false, message: e.message, log: [] };
+      } finally {
+        status.textContent = was;
+        stockBtn.disabled = !canInstall;
+        renderDownload();
+      }
+      console.info(`Restore backup:\n${r.log.join('\n')}`);
+      // The desktop reopens the map from the game's file; here the map came from a file of its own, so it stays as it is.
+      if (r.ok) toast(`Game files put back as they were ${when}. Undo: Restore stock… → Backups → the newest one`, 'ok', 15000);
+      else toast(`Could not restore the backup: ${r.message}`, 'error', 15000);
+    }
     /**
      * Downloads a copy of the bundle with the objects (and their collision), sky (ApplySkyToBundle) and fog (FogExport)
      * written in; with toGame, installs that copy into the game folder picked first (StageInstaller.Install) instead.
@@ -2452,7 +2585,7 @@ export function renderStage(node, ctx) {
       if (!parts.length) return toast('Nothing to write into the bundle yet.');
       const target = toGame ? await pickInstall() : null;
       if (toGame && !target) return;
-      bakeBtn.disabled = installBtn.disabled = true;
+      bakeBtn.disabled = installBtn.disabled = stockBtn.disabled = true;
       const was = status.textContent;
       try {
         let archive = model;
@@ -2582,6 +2715,7 @@ export function renderStage(node, ctx) {
         toast(`The bundle could not be written: ${e.message}`, 'error', 10000);
       } finally {
         status.textContent = was;
+        stockBtn.disabled = !canInstall;
         renderDownload();
       }
     }

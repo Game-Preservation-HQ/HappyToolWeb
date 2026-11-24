@@ -368,13 +368,14 @@ async function writeManifest(root, set) {
     operation: set.operation,
     stageId: set.stageId,
     stageName: friendlyName(set.stageId),
-    createdUtc: roundTrip(set.createdUtc),
+    // A set read back keeps its own text (the desktop's has seven fractional digits; a Date keeps three).
+    createdUtc: set.createdText ?? roundTrip(set.createdUtc),
     // The desktop writes the full Data path; a browser only knows the folder names. Nothing reads it back.
     dataRoot: `${root.game.name}\\${root.data.name}`,
     source: set.source,
     note: set.note,
     status: set.status,
-    lastRestoredUtc: set.lastRestoredUtc ? roundTrip(set.lastRestoredUtc) : null,
+    lastRestoredUtc: set.lastRestoredText ?? (set.lastRestoredUtc ? roundTrip(set.lastRestoredUtc) : null),
     tool: 'HappyTool Web',
     files: set.entries.map((e) => ({
       role: e.role, path: e.path, existed: e.existed, length: e.length, sha256: e.sha256, backup: e.backup, writtenSha256: e.writtenSha256,
@@ -492,4 +493,246 @@ export async function install(root, plan, bytes, { source, onStep } = {}) {
   const message = `Installed ${id}.bres (${writes.length} file(s) written and verified).`;
   step(100, message);
   return done(true, message, set);
+}
+
+// ----- the backups list and restore (StageInstaller ListBackupSets, StageBackupSets, CompareWithCurrent, Restore, PutBack) -----
+
+const COMPANION_SUFFIXES = ['_stage_set_table.json', '_stage_gimmick.json', '_stage_tactics.json', '_stage_effect.json'];
+const DECO_SEASONS = ['easter', 'halloween', 'newyear', 'thanksgiving', 'valentine', 'xmas'];
+const DECO_SUFFIXES = ['_stage_gimmick.json', '_stage_effect.json'];
+const backslashed = (rel) => (rel ?? '').replace(/\//g, '\\');
+
+/** Stage bundles (stage\<id>.bres, stage\mini\<id>.bres) and the two registration files. */
+function isRegistrationOrStageBundle(rel) {
+  // The registration files are matched as written, before / becomes \, as the desktop does.
+  if (sameName(rel ?? '', FILE_LIST) || sameName(rel ?? '', TABLE)) return true;
+  const n = backslashed(rel);
+  if (!/^stage\\/i.test(n) || !/\.bres$/i.test(n) || n.length <= 11) return false;
+  let id = n.slice(6, -5);
+  if (/^mini\\/i.test(id)) id = id.slice(5);
+  return isValidStageId(id);
+}
+
+const isStageScript = (p) => p.length === 3 && sameName(p[0], 'ssn') && isValidStageId(p[1]) && sameName(p[2], 'stage_setting.nut');
+
+/** Restore guard: what installs write (stage bundles, registration, json\stage and json\stagedeco\<season> tables, GameEnvironment.json, stage scripts). */
+export function isRestorableDataFile(rel) {
+  if (isRegistrationOrStageBundle(rel)) return true;
+  const n = backslashed(rel);
+  // .NET's Path.GetInvalidPathChars: the double quote, < > | and the control characters.
+  if (n.includes('..') || /["<>|\x00-\x1f]/.test(n)) return false;
+  if (sameName(n, 'json\\game\\GameEnvironment.json')) return true;
+  const p = n.split('\\');
+  if (isStageScript(p)) return true;
+  const last = p[p.length - 1];
+  if (!(/\.json$/i.test(last) || /\.nut$/i.test(last)) || !sameName(p[0], 'json')) return false;
+  if (p.length === 3 && sameName(p[1], 'stage')) return true;
+  return p.length === 4 && sameName(p[1], 'stagedeco') && DECO_SEASONS.some((s) => sameName(s, p[2]));
+}
+
+/** A stage's own files: its bundles, its json\stage and stagedeco tables and its script; never the shared registration files. */
+export function isStageOwnedFile(rel, id) {
+  if (!rel || !isValidStageId(id)) return false;
+  const n = backslashed(rel);
+  if (sameName(n, `stage\\${id}.bres`) || sameName(n, `stage\\mini\\${id}.bres`)) return true;
+  if (sameName(n, TABLE) || sameName(n, FILE_LIST) || !isRestorableDataFile(n)) return false;
+  const p = n.split('\\');
+  const named = (suffixes) => suffixes.some((s) => sameName(p[p.length - 1], id + s));
+  if (isStageScript(p)) return sameName(p[1], id);
+  if (!sameName(p[0], 'json')) return false;
+  if (p.length === 3 && sameName(p[1], 'stage')) return named(COMPANION_SUFFIXES);
+  return p.length === 4 && sameName(p[1], 'stagedeco') && named(DECO_SUFFIXES);
+}
+
+const SET_NAME = /^(\d{8}-\d{6}) (.+?)(?: \(([^()]*)\))?(?: #\d+)?$/;
+
+/** Whether an unreadable set might hold a stage's own files, by its folder name (StageInstaller.MayHoldStageFiles). */
+function mayHoldStageFiles(set, id) {
+  const m = SET_NAME.exec(set.name);
+  if (!m) return true;
+  const op = m[3] ?? 'install';
+  if (op === 'pre-restore') return false;
+  return op !== 'install' || !isValidStageId(m[2]) || sameName(m[2], id);
+}
+
+/**
+ * .NET's round-trip "o" text as {date, key, text}: key (BigInt 100 ns ticks since 1970, UTC) keeps all seven
+ * fractional digits so sets made within one millisecond still sort; null when the text isn't one.
+ */
+function parseRoundTrip(text) {
+  const m = typeof text === 'string' && /^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d{1,7}))?(Z|[+-]\d\d:\d\d)?$/.exec(text);
+  if (!m) return null;
+  let ms = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+  if (Number.isNaN(ms)) return null;
+  // No zone (DateTimeKind.Unspecified) counts as UTC, as TryParseUtc does.
+  if (m[8] && m[8] !== 'Z') ms -= (m[8][0] === '-' ? -1 : 1) * (+m[8].slice(1, 3) * 60 + +m[8].slice(4, 6)) * 60000;
+  const frac = BigInt((m[7] ?? '').padEnd(7, '0'));
+  return { date: new Date(ms + Number(frac / 10000n)), key: BigInt(ms) * 10000n + frac, text };
+}
+
+/** The set folder's own stamp (local yyyyMMdd-HHmmss) as a time: a browser can't see a folder's creation time. */
+function stampTime(name) {
+  const m = /^(\d{4})(\d\d)(\d\d)-(\d\d)(\d\d)(\d\d) /.exec(name);
+  return m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : null;
+}
+
+async function readManifest(name, dir, fh) {
+  const fallback = stampTime(name) ?? new Date((await fh.getFile()).lastModified);
+  const set = {
+    name, dir, createdUtc: fallback, createdKey: BigInt(fallback.getTime()) * 10000n, createdText: null, operation: null, stageId: null,
+    source: null, note: null, status: null, lastRestoredUtc: null, lastRestoredText: null, entries: [], loadError: null,
+  };
+  try {
+    const o = JSON.parse(new TextDecoder().decode(await readBytes(fh)).replace(/^\uFEFF/, ''));
+    if (o?.format !== MANIFEST_FORMAT) throw new Error(`unknown manifest format '${o?.format ?? ''}'`);
+    const str = (v) => (v == null ? null : String(v));
+    set.operation = str(o.operation);
+    set.stageId = str(o.stageId);
+    set.source = str(o.source);
+    set.note = str(o.note);
+    set.status = str(o.status);
+    const created = parseRoundTrip(o.createdUtc);
+    if (created) Object.assign(set, { createdUtc: created.date, createdKey: created.key, createdText: created.text });
+    const restored = parseRoundTrip(o.lastRestoredUtc);
+    if (restored) Object.assign(set, { lastRestoredUtc: restored.date, lastRestoredText: restored.text });
+    for (const f of Array.isArray(o.files) ? o.files : []) {
+      if (!f || typeof f !== 'object' || Array.isArray(f)) continue;
+      set.entries.push({
+        role: str(f.role), path: str(f.path), existed: f.existed === true, length: Number(f.length) || 0,
+        sha256: str(f.sha256), backup: str(f.backup), writtenSha256: str(f.writtenSha256),
+      });
+    }
+    if (!set.entries.length) throw new Error('manifest lists no files');
+  } catch (e) {
+    set.loadError = e.message;
+  }
+  return set;
+}
+
+/** Every backup set under <game>\HappyTool Backups, newest first; an unreadable manifest is listed with loadError. */
+export async function listBackupSets(root) {
+  const backups = await child(root.game, BACKUP_FOLDER, 'directory');
+  if (!backups) return [];
+  const list = [];
+  for await (const h of backups.values()) {
+    if (h.kind !== 'directory') continue;
+    const fh = await child(h, MANIFEST, 'file');
+    if (fh) list.push(await readManifest(h.name, h, fh));
+  }
+  return list.sort((a, b) => (a.createdKey !== b.createdKey ? (a.createdKey < b.createdKey ? 1 : -1) : -cmpIgnoreCase(a.name, b.name)));
+}
+
+/** The sets that touched a stage: its own installs and restores, sets holding its files, and unreadable sets that might. */
+export async function stageBackupSets(root, id, all = null) {
+  return (all ?? (await listBackupSets(root))).filter((s) =>
+    s.loadError != null ? mayHoldStageFiles(s, id) : sameName(s.stageId ?? '', id) || s.entries.some((e) => isStageOwnedFile(e.path, id)));
+}
+
+/** Each file of a set against the game now, by path: 'as-backed-up', 'as-written' (what the operation wrote) or 'changed'. */
+export async function compareWithCurrent(root, set) {
+  const states = new Map();
+  for (const e of set.entries) {
+    let now = null;
+    try {
+      checkDataPath(e.path);
+      const fh = await fileAt(root.data, e.path);
+      now = fh ? await sha256(await readBytes(fh)) : null;
+    } catch {
+      now = null;
+    }
+    const original = e.existed ? e.sha256?.toLowerCase() ?? null : null;
+    states.set(e.path, now === original ? 'as-backed-up' : e.writtenSha256 && now === e.writtenSha256.toLowerCase() ? 'as-written' : 'changed');
+  }
+  return states;
+}
+
+/** A Data-relative path checked as StageDataRoot.Resolve checks it: not rooted, never above Data. */
+function checkDataPath(rel) {
+  if (!rel || !rel.trim() || /^([A-Za-z]:|[\\/])/.test(rel)) throw new Error(`Invalid Data-relative path: ${rel}`);
+  let depth = 0;
+  for (const p of parts(rel)) {
+    if (p === '..') depth--;
+    else if (p !== '.') depth++;
+    if (depth < 0) throw new Error(`Path escapes the Data folder: ${rel}`);
+  }
+}
+
+/**
+ * Puts every file of a set back as it was before that operation (StageInstaller.Restore): the whole set is checked
+ * first, the current files become a "pre-restore" set, each write is read back, and a failure puts the previous state
+ * back. Resolves to {ok, message, log, preRestore}; onStep(pct, text) reports progress.
+ */
+export async function restoreBackupSet(root, set, { onStep } = {}) {
+  const log = [];
+  const step = (pct, text) => {
+    log.push(text);
+    onStep?.(pct, text);
+  };
+  const done = (ok, message, preRestore = null) => ({ ok, message, log, preRestore });
+  if (!set || set.loadError != null) return done(false, `This backup set can't be restored: ${set?.loadError ?? 'no set selected'}.`);
+
+  step(5, `Verifying backup set ${set.name}…`);
+  const byPath = new Map();
+  for (const e of set.entries) {
+    try {
+      checkDataPath(e.path);
+    } catch (err) {
+      return done(false, err.message);
+    }
+    if (!isRestorableDataFile(e.path)) return done(false, `Backup manifest names an unexpected file: ${e.path}.`);
+    if (!e.existed) continue;
+    const copy = e.backup && !parts(e.backup).includes('..') ? await fileAt(set.dir, e.backup) : null;
+    if (!copy) return done(false, `Backup copy missing for ${e.path}.`);
+    const bytes = await readBytes(copy);
+    if (e.sha256 && (await sha256(bytes)) !== e.sha256.toLowerCase())
+      return done(false, `Backup copy of ${e.path} is corrupt (SHA-256 mismatch); nothing was restored.`);
+    byPath.set(e.path.toLowerCase(), bytes);
+  }
+
+  // PutBack: the current state first, as its own set, so the restore can itself be undone.
+  step(20, 'Saving the current state as a pre-restore backup…');
+  let pre;
+  try {
+    // The desktop writes the set folder's full path; a browser only knows the names below the game folder.
+    pre = await createBackupSet(root, 'pre-restore', set.stageId ?? 'stage', `${root.game.name}\\${BACKUP_FOLDER}\\${set.name}`,
+      `State before restoring '${set.name}'`, set.entries.map((e) => e.path), step);
+  } catch (err) {
+    return done(false, `Could not back up the current state, so nothing was restored: ${err.message}`);
+  }
+  const applied = [];
+  try {
+    let n = 0;
+    for (const e of set.entries) {
+      step(40 + Math.trunc((50 * n++) / set.entries.length), `${e.existed ? 'Restoring' : 'Removing'} Data\\${e.path}…`);
+      applied.push({ rel: e.path });
+      if (e.existed) {
+        const bytes = byPath.get(e.path.toLowerCase());
+        const fh = await fileFor(root.data, e.path);
+        await writeBytes(fh, bytes);
+        const written = await sha256(await readBytes(fh));
+        if (written !== (await sha256(bytes))) throw new Error(`Read-back verification failed for ${e.path}.`);
+        // Lets "changed since" work when this pre-restore set is itself restored later.
+        pre.entries.find((x) => sameName(x.path, e.path)).writtenSha256 = written;
+      } else {
+        const fh = await fileAt(root.data, e.path);
+        if (fh) await (await parentOf(root.data, e.path, false)).dir.removeEntry(fh.name);
+      }
+    }
+    pre.status = 'complete';
+    await writeManifest(root, pre);
+  } catch (err) {
+    step(95, `Restore failed (${err.message}) — putting the previous state back…`);
+    const problem = await rollBack(root, pre, applied);
+    pre.status = problem == null ? 'rolled-back' : 'failed';
+    await writeManifest(root, pre).catch(() => {});
+    const why = /[.!?]$/.test(err.message) ? err.message : `${err.message}.`;
+    return done(false, `Restore failed: ${why}` +
+      (problem == null ? ' The previous state was put back.' : ` Could not undo: ${problem} — restore '${pre.name}' manually.`), pre);
+  }
+  set.lastRestoredUtc = new Date();
+  set.lastRestoredText = null;
+  await writeManifest(root, set).catch(() => {});
+  const message = `Restored ${set.entries.length} file(s) from ${set.name}.`;
+  step(100, message);
+  return done(true, message, pre);
 }
