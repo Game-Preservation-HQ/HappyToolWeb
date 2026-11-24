@@ -875,11 +875,29 @@ async function rollBack(root, set, applied) {
 }
 
 /**
+ * Where the tables the map editor exports beside a bundle go for stage id (StageInstaller.CompanionTables): files maps
+ * the export's suffix ('_stage_gimmick.json', '_stagedeco_xmas_stage_effect.json', '_ssn_stage_setting.nut', …) to its
+ * bytes. Returns [{role, rel, bytes}] in the desktop's order, role being the file's name as the desktop logs it.
+ */
+export function companionWrites(id, files) {
+  const out = [];
+  const add = (suffix, rel) => {
+    if (files?.[suffix]) out.push({ role: rel.slice(rel.lastIndexOf('\\') + 1), rel, bytes: files[suffix] });
+  };
+  for (const s of COMPANION_SUFFIXES) add(s, `json\\stage\\${id}${s}`);
+  for (const season of DECO_SEASONS) for (const kind of DECO_SUFFIXES) add(`_stagedeco_${season}${kind}`, `json\\stagedeco\\${season}\\${id}${kind}`);
+  // The stage script (the game also reads it from Data\ssn\<id>).
+  add('_ssn_stage_setting.nut', `ssn\\${id}\\stage_setting.nut`);
+  return out;
+}
+
+/**
  * Installs bytes (the bundle as Download bundle writes it) by plan into root ({game, data} from openGameFolder):
  * backup set first, then each write read back, rolled back from the set on any failure. source names the bundle in the
- * manifest. Resolves to {ok, message, log, set}; onStep(pct, text) reports progress.
+ * manifest. companions ({suffix: bytes}) are the tables the map editor's export writes beside the bundle; they go in
+ * after the bundles, where companionWrites puts them. Resolves to {ok, message, log, set}; onStep(pct, text) reports progress.
  */
-export async function install(root, plan, bytes, { source, onStep, lint } = {}) {
+export async function install(root, plan, bytes, { source, onStep, lint, companions } = {}) {
   const log = [];
   const step = (pct, text) => {
     log.push(text);
@@ -966,6 +984,15 @@ export async function install(root, plan, bytes, { source, onStep, lint } = {}) 
   const writes = [{ role: 'bundle', rel: plan.bundleRel, bytes }];
   // Lower quality levels load stage\mini\<id>.bres instead when it exists; the full-size bundle works in its place.
   if (await fileAt(root.data, plan.miniRel)) writes.push({ role: 'low-quality bundle', rel: plan.miniRel, bytes });
+  // Tables the map editor exported next to the bundle: the gimmick, tactics and effect tables and the stage script.
+  for (const c of companionWrites(id, companions)) {
+    try {
+      await decodeLayers(c.bytes); // must still decode
+    } catch (e) {
+      return done(false, `${c.role} doesn't decode (${e.message}); nothing was changed.`);
+    }
+    writes.push(c);
+  }
   if (fileList) writes.push({ role: 'file list', rel: FILE_LIST, bytes: fileList });
   if (table) writes.push({ role: 'stage table', rel: TABLE, bytes: table });
 

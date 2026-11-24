@@ -2224,7 +2224,7 @@ export function renderStage(node, ctx) {
     const canInstall = !!window.showDirectoryPicker;
     const installBtn = button('Install into game…', () => bakeBundle(true), {
       title: canInstall
-        ? `Write the same bundle into the game's Data\\stage in place of the stage it came from. Pick the game folder (the one holding Data); every file that changes is backed up first into ${BACKUP_FOLDER} next to Data`
+        ? `Write the same bundle into the game's Data\\stage in place of the stage it came from, with the gimmick, tactics and effect tables and stage script the edits change. Pick the game folder (the one holding Data); every file that changes is backed up first into ${BACKUP_FOLDER} next to Data`
         : 'Installing needs a browser that can write to a folder (Chrome or Edge). Download the bundle and copy it into Data\\stage instead',
     });
     // Restore stock (StageViewerForm.Stock): the backups of this stage that installs and restores saved, each put back on request.
@@ -3363,6 +3363,14 @@ export function renderStage(node, ctx) {
         await pause();
         const bytes = await encodeLayers(writeBres(archive), writableLayers((node.mapBase ?? node).layers || []));
         if (target) {
+          // The tables the desktop export writes beside the bundle go in with it, under the stage id installed to.
+          let companions;
+          try {
+            companions = await exportedTables();
+          } catch (e) {
+            console.error(e);
+            return toast(`The map's tables could not be written (${e.message}); nothing was installed.`, 'error', 15000);
+          }
           // StageLint on the bytes about to be written, then its findings with the plan's (the plan was made, and
           // confirmed, before the bundle existed, so this is the only point the bundle itself can be checked).
           status.textContent = 'Checking the bundle…';
@@ -3384,6 +3392,7 @@ export function renderStage(node, ctx) {
             const r = await install(target.root, target.plan, bytes, {
               source: `${edit.stage}.bres`,
               lint,
+              companions,
               onStep: (pct, text) => (status.textContent = `${text} (${pct}%)`),
             });
             console.info(`Install into game:\n${r.log.join('\n')}`);
@@ -5867,13 +5876,18 @@ export function renderStage(node, ctx) {
       nudgeEffect(e, [0, 1, 2].map((i) => (fw[i] * arrows[0] + rt[i] * arrows[1]) * s), `fxk:${e.id}`);
       return true;
     }
+    /** The effect table with the hand-moved effects and sounds, {r, bytes}, or null when none has moved. */
+    async function effectFile() {
+      const r = movedEffectTable(fxTable, (rec) => edit.effectMoved.get(rec.id) ?? null);
+      return r ? { r, bytes: await effectTableBytes(fxTable, r.text) } : null;
+    }
     async function downloadEffectTable() {
       if (!fxTable) return;
       let r, bytes;
       try {
-        r = movedEffectTable(fxTable, (rec) => edit.effectMoved.get(rec.id) ?? null);
-        if (!r) return toast('No effect or sound has been moved yet.');
-        bytes = await effectTableBytes(fxTable, r.text);
+        const fx = await effectFile();
+        if (!fx) return toast('No effect or sound has been moved yet.');
+        ({ r, bytes } = fx);
       } catch (e) {
         console.error(e);
         return toast(`The effect table could not be written: ${e.message}`, 'error');
@@ -6245,23 +6259,44 @@ export function renderStage(node, ctx) {
       // Like the desktop: the copy keeps the turn and goes where the view aims.
       await addGimmick(kind, null, g.rotation.slice());
     }
+    /**
+     * What Download gimmick table writes, each [bytes, name, type, suffix] (suffix as StageInstaller.CompanionTables
+     * reads it beside the bundle), with the table edit's counts. sx is setupExport()'s.
+     */
+    async function gimmickFiles(sx) {
+      const gm = scene.gimmicks;
+      const files = [];
+      const r = editedGimmickTable(gm.table.text, gm.placements, setupRules.setupFields);
+      // The stage collision removed or moved with its object (WithStageVolumeEdits), on top of the gimmicks' edits.
+      const text = volumesEdited() ? withVolumeEdits(r?.text ?? gm.table.text) : r?.text;
+      if (text != null && text !== gm.table.text)
+        files.push([await gimmickTableBytes(gm.table, text), gm.table.name, 'application/json', '_stage_gimmick.json']);
+      // The installed copies the setup changes, wrapped like them and named as the desktop export names them.
+      const nutName = `${edit.stage}_ssn_stage_setting.nut`, tacticsName = `${edit.stage}_stage_tactics.json`;
+      if (sx && !sx.planEmpty && setupFiles.loose)
+        files.push([await companionBytes(setupFiles.loose, (b) => applyStageScript(b, sx.plan).bytes, nutName), nutName, 'text/plain', '_ssn_stage_setting.nut']);
+      if (sx?.tacticsEdit && setupFiles.tactics)
+        files.push([await companionBytes(setupFiles.tactics, (b) => applyTactics(b, sx.copies, sx.values, sx.moves), tacticsName), tacticsName, 'application/json', '_stage_tactics.json']);
+      return { files, r };
+    }
+    /**
+     * The tables the desktop export writes beside the bundle, by suffix, for Install into game: the gimmick table, stage
+     * script and tactics (gimmickFiles) and the effect table (effectFile), each only when the edits change it.
+     */
+    async function exportedTables() {
+      const out = {};
+      if (scene.gimmicks) for (const f of (await gimmickFiles(setupExport())).files) out[f[3]] = f[0];
+      const fx = fxTable ? await effectFile() : null;
+      if (fx) out['_stage_effect.json'] = fx.bytes;
+      return out;
+    }
     async function downloadGimmickTable() {
       const gm = scene.gimmicks;
       if (!gm) return;
       const sx = setupExport(); // also brings the placements up to date
-      const files = [];
-      let r;
+      let files, r;
       try {
-        r = editedGimmickTable(gm.table.text, gm.placements, setupRules.setupFields);
-        // The stage collision removed or moved with its object (WithStageVolumeEdits), on top of the gimmicks' edits.
-        const text = volumesEdited() ? withVolumeEdits(r?.text ?? gm.table.text) : r?.text;
-        if (text != null && text !== gm.table.text) files.push([await gimmickTableBytes(gm.table, text), gm.table.name, 'application/json']);
-        // The installed copies the setup changes, wrapped like them and named as the desktop export names them.
-        const nutName = `${edit.stage}_ssn_stage_setting.nut`, tacticsName = `${edit.stage}_stage_tactics.json`;
-        if (sx && !sx.planEmpty && setupFiles.loose)
-          files.push([await companionBytes(setupFiles.loose, (b) => applyStageScript(b, sx.plan).bytes, nutName), nutName, 'text/plain']);
-        if (sx?.tacticsEdit && setupFiles.tactics)
-          files.push([await companionBytes(setupFiles.tactics, (b) => applyTactics(b, sx.copies, sx.values, sx.moves), tacticsName), tacticsName, 'application/json']);
+        ({ files, r } = await gimmickFiles(sx));
       } catch (e) {
         console.error(e);
         return toast(`The gimmick table could not be written: ${e.message}`, 'error');
@@ -6270,7 +6305,7 @@ export function renderStage(node, ctx) {
         return toast(sx && !sx.planEmpty && setupFiles.bundle
           ? 'This setup only changes the stage script inside the map: use Download bundle.'
           : 'No gimmick has been moved, turned, removed or set up yet.');
-      for (const f of files) downloadBytes(...f);
+      for (const [bytes, name, type] of files) downloadBytes(bytes, name, type);
       const lines = r ? [`Gimmicks: ${r.moved} moved, ${r.removed} removed, ${r.added} added — table written to ${gm.table.name}.`] : [];
       const vl = volumesLine();
       if (vl) lines.push(vl);
