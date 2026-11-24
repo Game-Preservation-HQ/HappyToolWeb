@@ -3,6 +3,7 @@ import { ascii4, extOf, looksLikeText } from '../util.js';
 import { isBres } from './bres.js';
 import { isDds } from './dds.js';
 import { looksLikeLngHeader, parseLng } from './lng.js';
+import { looksLikeRml } from './rml.js';
 
 const TEXT_EXT = new Set(['.txt', '.xml', '.csv', '.cfg', '.ini', '.nut', '.lua', '.html', '.htm', '.js', '.css', '.yml', '.yaml', '.md', '.log', '.shader', '.fx', '.hlsl']);
 const IMAGE_MAGIC = [
@@ -20,6 +21,10 @@ export const KIND_LABELS = {
   dds: 'DDS texture',
   image: 'Image',
   nutc: 'Compiled script',
+  vmd: 'Voice macro',
+  rml: 'Material definition',
+  vir: 'Resource descriptor',
+  fnt: 'Bitmap font',
   hex: 'Binary',
 };
 
@@ -37,6 +42,10 @@ export function sniff(u8, name = '') {
   if (isDds(u8)) return { kind: 'dds' };
   for (const [magic, mime] of IMAGE_MAGIC) if (magic.every((b, i) => u8[i] === b)) return { kind: 'image', mime };
   if (u8.length >= 2 && u8[0] === 0xfa && u8[1] === 0xfa) return { kind: 'nutc' }; // Squirrel bytecode
+  if (ext === '.vmd') return { kind: 'vmd' }; // the desktop opens .vmd by name; a bad header shows its error
+  if (looksLikeRml(u8) || ext === '.rml') return { kind: 'rml' }; // bundles open any 0MF entry (.rmd too) as a material
+  if (ext === '.vir') return { kind: 'vir' }; // the desktop opens .vir by name and warns when it isn't TRF
+  if (ext === '.fnt') return { kind: 'fnt' }; // by name too (app.js keeps a bundle entry without FTDF as bytes)
   if (ext === '.lng' || (looksLikeLngHeader(u8) && !looksLikeText(u8))) {
     try {
       parseLng(u8);

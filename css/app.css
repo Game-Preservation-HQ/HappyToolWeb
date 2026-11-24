@@ -716,3 +716,14 @@ span.twisty { cursor: default; }
 .nut-tb-list summary { cursor: pointer; padding: 2px 0; font-weight: 600; }
 .nut-tb-item { display: flex; gap: 6px; align-items: center; padding: 1px 4px 1px 12px; cursor: grab; font-family: var(--mono); font-size: 12px; white-space: nowrap; border-radius: 3px; }
 .nut-tb-item:hover, .nut-tb-item:focus { background: var(--sel); outline: none; }
+
+/* ---------- small binary editors (.vmd, .rml, .vir, .fnt) ---------- */
+.vmd-view .check, .rml-view .check { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; white-space: nowrap; }
+.vmd-grid td:has(> input) { padding: 1px 4px; }
+.vmd-cell { width: 100%; min-width: 5em; font: inherit; color: var(--text); background: transparent; border: 1px solid transparent; border-radius: 3px; padding: 2px 5px; }
+.vmd-cell.num { text-align: right; font-variant-numeric: tabular-nums; }
+.vmd-cell:hover { border-color: var(--border); }
+.vmd-cell:focus { border-color: var(--accent, var(--border)); background: var(--surface); outline: none; }
+.rml-grid td.rml-node { font-family: var(--mono); font-size: 12.5px; }
+.rml-grid td.rml-node .twisty { height: 18px; vertical-align: middle; }
+.rml-grid td.rml-value { padding: 1px 4px; min-width: 16em; }
