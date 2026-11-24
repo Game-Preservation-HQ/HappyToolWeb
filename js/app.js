@@ -12,6 +12,7 @@ import { renderText } from './views/text-view.js';
 import { renderNut } from './views/nut-view.js';
 import { renderMedia } from './views/media-view.js';
 import { renderHex } from './views/hex-view.js';
+import { renderTanda } from './views/tanda-view.js';
 import { dataRootOf, preferredLng, isSearchable } from './formats/lng-refs.js';
 import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictures } from './browser.js';
 import { loadHandle, saveHandle, forgetHandle, readDirectory } from './data-folder.js';
@@ -475,6 +476,22 @@ function renderView() {
         .filter((r) => r.path.toLowerCase().startsWith(base) && !r.path.slice(base.length).includes('/'))
         .map((r) => ({ name: r.path.slice(base.length), path: r.path, read: async () => new Uint8Array(await r.file.arrayBuffer()) }));
     },
+    /**
+     * The files of the open file's folder (or of `rel` from it, `..` for its parent), not those in its subfolders,
+     * read from disk when asked: the .tanda viewer's companion bundle.
+     */
+    folderFiles: (rel = '') => {
+      const parts = (current?.path ?? '').split('/').slice(0, -1);
+      for (const seg of rel.split('/').filter(Boolean)) {
+        if (seg !== '..') parts.push(seg);
+        else if (!parts.length) return [];
+        else parts.pop();
+      }
+      const base = parts.length ? parts.join('/').toLowerCase() + '/' : '';
+      return files
+        .filter((r) => r.path.toLowerCase().startsWith(base) && !r.path.slice(base.length).includes('/'))
+        .map((r) => ({ name: r.path.slice(base.length), path: r.path, read: async () => new Uint8Array(await r.file.arrayBuffer()) }));
+    },
     /** Every .nut script among the open files (the script editor's go to definition and code assist), read when asked. */
     scripts: () => files.filter((r) => /\.nut$/i.test(r.path)).map((r) => ({ path: r.path, read: async () => new Uint8Array(await r.file.arrayBuffer()) })),
     /** Opens an open file by path and hands the script editor where to put the caret ({line, name} or {pos, end}). */
@@ -540,6 +557,8 @@ function pickView(node, ctx) {
     case 'dds':
     case 'image':
       return renderMedia(node, ctx, ctx.showHex);
+    case 'tanda':
+      return renderTanda(node, ctx);
     case 'nutc':
       return renderHex(node, ctx, 'Compiled Squirrel script (bytecode). Shown as bytes.');
     default:
