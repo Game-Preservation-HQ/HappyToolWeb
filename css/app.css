@@ -397,6 +397,12 @@ kbd {
 .dialog .input { width: 100%; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .dialog-wide { width: min(600px, calc(100vw - 32px)); }
+.dialog-slots { width: min(980px, calc(100vw - 32px)); }
+.slot-caption { margin: 10px 0 6px; }
+.slot-grid-wrap { flex: none; max-height: 38vh; margin-bottom: 10px; }
+.slot-grid-wrap td input { margin: 0 4px 0 0; vertical-align: -2px; }
+.grid tbody tr.slot-off { color: var(--muted); }
+.install-options { display: grid; gap: 4px; margin: 0 0 12px; }
 .install-findings { list-style: none; margin: 0 0 12px; padding: 0; display: grid; gap: 8px; }
 .install-findings li { padding: 6px 10px; border-radius: var(--radius); border-left: 4px solid var(--border); }
 .install-findings .install-error { border-left-color: var(--danger); background: var(--error-bg); }

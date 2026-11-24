@@ -21,7 +21,7 @@ import { downloadBytes } from '../util.js';
 import {
   openGameFolder, readRegistration, createPlan, install, BACKUP_FOLDER, listBackupSets, stageBackupSets, compareWithCurrent, restoreBackupSet,
   isValidStageId, describeStage, planStockRestore, stockState, restoreStock as putStageBackToStock, stockBundle, planRestoreFromCopy,
-  restoreFromCopy, sha256, applyLint, combinedFindings,
+  restoreFromCopy, sha256, applyLint, combinedFindings, friendlyName,
 } from '../formats/stage-install.js';
 import { lintBundle } from '../formats/stage-lint.js';
 import { stageGlb, stageObjZip } from '../formats/model-export.js';
@@ -2417,21 +2417,101 @@ export function renderStage(node, ctx) {
         [...notes, ...rep.warnings].map((x) => ` ${x}`).join('');
       return { entries: kept, line };
     }
-    /** The install plan's findings (and its steps, when it can go ahead) in a dialog; resolves to true for Install. */
-    function planDialog(plan, title, okLabel) {
+    const isMenuSlot = (s) => s.menuNum != null && s.menuNum >= 1 && s.menuNum <= 11;
+    const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    /** A stage's cells in the target list (StageInstallDialog.SlotRow): menu, stage, name, installed file, listed, tables, note. */
+    const slotCells = (s) => [
+      s.menuNum ?? '—',
+      s.id,
+      friendlyName(s.id) ?? '',
+      s.bundleExists ? `${(s.bundleLength / 1048576).toFixed(1)} MB, ${ymd(s.bundleModified)}` : 'not installed',
+      s.listedInFileList ? 'yes' : 'no',
+      s.hasStageTables ? 'yes' : 'missing',
+      !s.inTable ? 'no gemini_stage_table.json entry'
+        : s.menuNum == null ? 'no MenuNum — not in Skirmish'
+          : s.menuNum === 12 ? 'slot 12 is DLC-gated'
+            : !isMenuSlot(s) ? 'beyond the 11-slot menu cap' : '',
+    ];
+    /**
+     * Where to install, as StageInstallDialog's "Replace an existing stage" page asks it: the game's stages in Skirmish
+     * menu order (stages outside the menu greyed), its two options, and the plan for the stage picked, worked out again on
+     * every change: its findings, and its steps when it can go ahead. The map's own stage is picked first when it is a
+     * Skirmish slot the game has (the desktop follows the bundle's stage the same way), otherwise sbabA. Resolves to the
+     * plan, or null.
+     */
+    function targetDialog(root, snap) {
       const label = { error: 'Problem', warning: 'Warning', info: 'Note' };
+      const own = snap.find(edit.stage);
+      let picked = (own && isMenuSlot(own) && own.bundleExists ? own : snap.find('sbabA') ?? snap.slots[0])?.id;
+      const rewrapBox = el('input', { type: 'checkbox', checked: true });
+      const retargetBox = el('input', { type: 'checkbox', checked: true });
+      const planBox = el('div', { class: 'install-plan', 'aria-live': 'polite' });
+      let plan = null;
+      let seq = 0;
       return openDialog((dlg, done) => {
-        dlg.classList.add('dialog-wide');
+        const ok = button('Install', () => plan && !plan.hasErrors && done(plan), { class: 'btn btn-primary', disabled: true });
+        const refresh = async () => {
+          const n = ++seq;
+          ok.disabled = true;
+          let p;
+          try {
+            p = await createPlan(root.data, snap, picked, { retarget: retargetBox.checked, rewrap: rewrapBox.checked, authoredFor: edit.stage });
+          } catch (e) {
+            if (n === seq) planBox.replaceChildren(el('p', { class: 'muted' }, `The plan could not be made: ${e.message}`));
+            return;
+          }
+          if (n !== seq) return;
+          plan = p;
+          planBox.replaceChildren(
+            el('ul', { class: 'install-findings' }, p.findings.map((f) =>
+              el('li', { class: `install-${f.severity}` }, el('strong', {}, `${label[f.severity]}: ${f.message}`), el('div', { class: 'muted' }, f.detail)))),
+            ...(p.hasErrors ? [] : [el('ol', { class: 'install-steps' }, p.steps.map((x) => el('li', {}, x)))]),
+          );
+          ok.disabled = p.hasErrors;
+        };
+        const rows = snap.slots.map((s) => {
+          const cells = slotCells(s);
+          const radio = el('input', { type: 'radio', name: 'install-slot', value: s.id, checked: s.id === picked, 'aria-label': `${s.id} ${cells[2]}`.trim() });
+          const tr = el('tr', { class: isMenuSlot(s) ? null : 'slot-off' },
+            el('td', { class: 'num' }, radio, ` ${cells[0]}`), ...cells.slice(1).map((c, i) => el('td', { class: i === 0 ? 'name' : null }, String(c))));
+          const pick = () => {
+            if (picked === s.id) return;
+            picked = s.id;
+            radio.checked = true;
+            for (const r of rows) r.tr.classList.toggle('sel', r.id === picked);
+            refresh();
+          };
+          radio.addEventListener('change', pick);
+          tr.addEventListener('click', pick);
+          if (s.id === picked) tr.classList.add('sel');
+          return { id: s.id, tr, radio };
+        });
+        rewrapBox.addEventListener('change', refresh);
+        retargetBox.addEventListener('change', refresh);
+        const installed = snap.slots.filter((s) => s.bundleExists).length;
+        const visible = snap.slots.filter(isMenuSlot).length;
+        dlg.classList.add('dialog-slots');
         dlg.append(
-          el('h2', { class: 'dialog-title' }, title),
-          el('ul', { class: 'install-findings' }, plan.findings.map((f) =>
-            el('li', { class: `install-${f.severity}` }, el('strong', {}, `${label[f.severity]}: ${f.message}`), el('div', { class: 'muted' }, f.detail)))),
-          ...(okLabel ? [el('ol', { class: 'install-steps' }, plan.steps.map((x) => el('li', {}, x)))] : []),
-          el('div', { class: 'dialog-actions' }, okLabel
-            ? [button('Cancel', () => done(false)), button(okLabel, () => done(true), { class: 'btn btn-primary', autofocus: true })]
-            : button('Close', () => done(false), { class: 'btn btn-primary', autofocus: true })),
+          el('h2', { class: 'dialog-title' }, `Install ${edit.stage}.bres into "${root.game.name}"`),
+          el('p', { class: 'muted' }, `Happy Wars Data folder — ${installed} stage bundle(s) installed, ${visible} Skirmish slot(s) with MenuNum 1–11. Backups: ${root.game.name}\\${BACKUP_FOLDER}`),
+          el('p', { class: 'slot-caption', id: 'install-slot-caption' }, 'Target slot — pick the stage your bundle replaces (Skirmish menu order):'),
+          el('div', { class: 'grid-wrap slot-grid-wrap' },
+            el('table', { class: 'grid', 'aria-labelledby': 'install-slot-caption' },
+              el('thead', {}, el('tr', {}, ['Menu', 'Stage', 'Skirmish name', 'Installed file', 'In stageFileList.nut', 'Gameplay tables', 'Note'].map((h) => el('th', {}, h)))),
+              el('tbody', {}, rows.map((r) => r.tr)))),
+          el('div', { class: 'install-options' },
+            el('label', {}, rewrapBox, " Re-wrap as BFBR + ZRES (like the shipped Steam stages) when the bundle isn't already"),
+            el('label', {}, retargetBox, ' Rename the bundle\'s own files for the slot it replaces (a Forest port over Rainbow: sforA.rrm → sligA.rrm …)')),
+          planBox,
+          el('div', { class: 'dialog-actions' }, button('Cancel', () => done(null)), ok),
         );
-      }).then((v) => v === true);
+        refresh();
+        requestAnimationFrame(() => {
+          const r = rows.find((x) => x.id === picked);
+          r?.tr.scrollIntoView({ block: 'nearest' });
+          r?.radio.focus();
+        });
+      });
     }
     /**
      * The built bundle's check (stage-lint.js) with the plan's findings, most severe first (StageInstaller.CombinedFindings),
@@ -2441,11 +2521,8 @@ export function renderStage(node, ctx) {
     function lintDialog(list, plan, blocked) {
       const label = { error: 'Problem', warning: 'Warning', info: 'Note' };
       const warnings = list.filter((f) => f.severity === 'warning').length;
-      const title = blocked
-        ? `${edit.stage}.bres can't be installed`
-        : warnings
-          ? `${warnings} warning(s): install ${edit.stage}.bres anyway?`
-          : `Install ${edit.stage}.bres?`;
+      const name = `${plan.slot?.id ?? plan.id}.bres`;
+      const title = blocked ? `${name} can't be installed` : warnings ? `${warnings} warning(s): install ${name} anyway?` : `Install ${name}?`;
       return openDialog((dlg, done) => {
         dlg.classList.add('dialog-wide');
         dlg.append(
@@ -2484,7 +2561,7 @@ export function renderStage(node, ctx) {
         return null;
       }
     }
-    /** Asks for the game folder and shows the plan: {root, plan}, or null. */
+    /** Asks for the game folder, then where to install (targetDialog): {root, plan}, or null. */
     async function pickInstall() {
       if (!canInstall) {
         toast('Installing needs a browser that can write to a folder (Chrome or Edge). Download the bundle and copy it into Data\\stage instead.', 'warn', 10000);
@@ -2493,12 +2570,8 @@ export function renderStage(node, ctx) {
       const root = await pickGameFolder();
       if (!root) return null;
       try {
-        const plan = await createPlan(root.data, await readRegistration(root.data), edit.stage);
-        if (plan.hasErrors) {
-          await planDialog(plan, `${edit.stage}.bres can't be installed into "${root.game.name}"`, null);
-          return null;
-        }
-        return (await planDialog(plan, `Install ${edit.stage}.bres into "${root.game.name}"?`, 'Install')) ? { root, plan } : null;
+        const plan = await targetDialog(root, await readRegistration(root.data));
+        return plan ? { root, plan, retargetFrom: plan.retargetFrom } : null;
       } catch (e) {
         toast(e.message, 'error', 10000);
         return null;
@@ -3216,8 +3289,9 @@ export function renderStage(node, ctx) {
           const list = combinedFindings(lint, target.plan);
           console.info(`Pre-install check of ${edit.stage}.bres:\n${list.map((f) => `${f.severity} ${f.code} (${f.source}) ${f.message}`).join('\n')}`);
           const blocked = !lint.readable || lint.hasErrors || target.plan.hasErrors;
-          // Asked again only when the check has something to say: a problem, a warning, or the re-wrap changing a step.
-          const choice = blocked || target.plan.willRewrap || list.some((f) => f.severity === 'warning')
+          // Asked again only when the check has something to say: a problem, a warning, the re-wrap changing a step, or
+          // the bundle turning out to be made for another stage than the confirmed plan assumed.
+          const choice = blocked || target.plan.willRewrap || target.plan.retargetFrom !== target.retargetFrom || list.some((f) => f.severity === 'warning')
             ? await lintDialog(list, target.plan, blocked)
             : 'install';
           if (choice === 'download') {

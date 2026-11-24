@@ -2,9 +2,10 @@
 // Install, CreateBackupSet, WriteManifest, RollBack, RestoreEntry) and StageRegistration.cs (the Data root,
 // ReadRegistration, the stageFileList.nut scan, StageNames).
 //
-// This first part installs over the stage the map came from (the desktop's "Replace an existing stage" with that
-// stage picked): Data\stage\<id>.bres, and Data\stage\mini\<id>.bres too when the game has one (the game loads that
-// copy on lower graphics settings; the full bundle works there). Every file that changes is copied first into a backup
+// This part installs over a stage the game has (the desktop's "Replace an existing stage"): Data\stage\<id>.bres, and
+// Data\stage\mini\<id>.bres too when the game has one (the game loads that copy on lower graphics settings; the full
+// bundle works there). A bundle made for another stage gets its files renamed for the slot (Retarget), and a slot
+// stageFileList.nut doesn't list is added to it. Every file that changes is copied first into a backup
 // set in HappyTool Backups next to Data, in the desktop's layout and manifest, so the desktop's Backups list shows the
 // set and can restore it. Each write is read back and its SHA-256 checked; a failure puts the files back from the set.
 //
@@ -12,7 +13,7 @@
 // folder (the one holding Data). The game can't be seen running from a browser, so the plan always says to close it.
 
 import { decodeLayers, encodeLayers } from './wrappers.js';
-import { parseBres } from './bres.js';
+import { parseBres, writeBres } from './bres.js';
 import { stripJsonComments } from './json.js';
 
 export const FILE_LIST = 'stage\\stageFileList.nut';
@@ -134,8 +135,8 @@ export async function openGameFolder(picked) {
   throw new Error(`"${picked.name}" isn't the Happy Wars game folder: it has no Data folder with ${FILE_LIST} and ${TABLE}.`);
 }
 
-/** The bundle names in stageFileList.nut's gStageFileList array (StageFileListText.TryScan). */
-export function scanFileList(text) {
+/** gStageFileList's entries with their places (StageFileListText.TryScan): {open, close, list: [{value, start, end}]}. */
+function scanFileListEntries(text) {
   const name = indexOfCode(text, ARRAY_NAME);
   if (name < 0) throw new Error(`${ARRAY_NAME} not found.`);
   const open = text.indexOf('[', name);
@@ -143,7 +144,7 @@ export function scanFileList(text) {
   const list = [];
   for (let i = open + 1; i < text.length; ) {
     const c = text[i];
-    if (c === ']') return list;
+    if (c === ']') return { open, close: i, list };
     if (c === '/' && text[i + 1] === '/') {
       const eol = text.indexOf('\n', i);
       i = eol < 0 ? text.length : eol + 1;
@@ -153,12 +154,116 @@ export function scanFileList(text) {
     } else if (c === '"') {
       const end = text.indexOf('"', i + 1);
       if (end < 0) break;
-      list.push(text.slice(i + 1, end));
+      list.push({ value: text.slice(i + 1, end), start: i, end: end + 1 });
       i = end + 1;
     } else i++;
   }
   throw new Error(`${ARRAY_NAME} is not closed with ']'.`);
 }
+
+/** The bundle names in stageFileList.nut's gStageFileList array (StageFileListText.TryParse). */
+export const scanFileList = (text) => scanFileListEntries(text).list.map((e) => e.value);
+
+/** The newline the text uses after from, LF when there is none (StageText.DetectNewline). */
+function detectNewline(text, from) {
+  const n = text.indexOf('\n', Math.max(0, from));
+  return n < 0 ? '\n' : n > 0 && text[n - 1] === '\r' ? '\r\n' : '\n';
+}
+const lineStart = (text, index) => text.lastIndexOf('\n', Math.max(0, index - 1)) + 1;
+
+/**
+ * stageFileList.nut's text with "name" added to gStageFileList in its alphabetical place (the shipped list is sorted),
+ * in the file's own newline and indent, everything else untouched (StageFileListText.TryAddEntry); the text as it is
+ * when the list has the name already. Throws with the desktop's message when the result doesn't read back as the old
+ * list plus the name.
+ */
+export function addFileListEntry(text, name) {
+  const { open, list } = scanFileListEntries(text);
+  if (list.some((e) => sameName(e.value, name))) return text;
+  const nl = detectNewline(text, open);
+  const quoted = `"${name}"`;
+  const before = list.find((e) => cmpIgnoreCase(e.value, name) > 0);
+  let out;
+  if (before) {
+    const at = lineStart(text, before.start);
+    const indent = text.slice(at, before.start);
+    // Several entries on one line: insert inline, Squirrel takes whitespace-separated array items.
+    out = indent.trim() === ''
+      ? text.slice(0, at) + indent + quoted + nl + text.slice(at)
+      : `${text.slice(0, before.start)}${quoted} ${text.slice(before.start)}`;
+  } else if (list.length) {
+    const last = list[list.length - 1];
+    const at = lineStart(text, last.start);
+    let indent = text.slice(at, last.start);
+    if (indent.trim() !== '') indent = '';
+    out = text.slice(0, last.end) + nl + indent + quoted + text.slice(last.end);
+  } else out = text.slice(0, open + 1) + nl + quoted + nl + text.slice(open + 1);
+  let after;
+  try {
+    after = scanFileList(out);
+  } catch (e) {
+    throw new Error(`Edited file list does not parse: ${e.message}`);
+  }
+  const expected = list.map((e) => e.value);
+  if (after.length !== expected.length + 1 || !after.includes(name) || !expected.every((v) => after.includes(v)))
+    throw new Error('Edited file list does not contain the expected entries.');
+  return out;
+}
+
+/**
+ * Renames, in place, the archive's files named for stage from so the game finds them in stage to's slot
+ * (StageInstaller.RetargetNames): a name starting with from (any case) starts with to instead, and minimap_<from>.dds
+ * becomes minimap_<to>.dds (other textures keep their names). A new name the bundle already has is left alone and
+ * listed in clashes. Returns {renamed: [[old, new]], clashes}.
+ */
+export function retargetNames(archive, from, to) {
+  const renamed = [];
+  const clashes = [];
+  if (!archive?.entries || !from || !to) return { renamed, clashes };
+  const key = (n) => n.toUpperCase();
+  const taken = new Set(archive.entries.filter((e) => e?.name != null).map((e) => key(e.name)));
+  for (const e of archive.entries) {
+    const name = e?.name;
+    if (!name) continue;
+    let nn = null;
+    if (/\.dds$/i.test(name)) {
+      if (key(name) === key(`minimap_${from}.dds`)) nn = `minimap_${to}.dds`;
+    } else if (key(name).startsWith(key(from))) nn = to + name.slice(from.length);
+    if (nn == null || nn === name) continue;
+    if (taken.has(key(nn))) {
+      clashes.push(name);
+      continue;
+    }
+    taken.delete(key(name));
+    taken.add(key(nn));
+    renamed.push([name, nn]);
+    e.name = nn;
+  }
+  archive.name = to;
+  return { renamed, clashes };
+}
+
+/** Same files in the same order with the same commands and bytes, names equal or renamed as listed (SameContents). */
+function sameContents(before, after, renamed) {
+  if (!before?.entries || !after?.entries || before.entries.length !== after.entries.length) return false;
+  const map = new Map(renamed);
+  return before.entries.every((a, i) => {
+    const b = after.entries[i];
+    return (map.get(a.name) ?? a.name) === b.name && a.cmd === b.cmd && a.pointer === b.pointer && sameBytes(a.data, b.data);
+  });
+}
+
+/** plain wrapped as a registration file was (ZRES, then BFBR), checked by decoding it back (StageInstaller.EncodeLike). */
+async function encodeLike(plain, layers) {
+  const want = ['BFBR', 'ZRES'].filter((l) => layers.includes(l));
+  const encoded = await encodeLayers(plain, want);
+  const back = await decodeLayers(encoded);
+  if (back.layers.join() !== want.join() || !sameBytes(back.payload, plain))
+    throw new Error('Re-encoding a registration file did not round-trip.');
+  return encoded;
+}
+
+const latin1Bytes = (text) => Uint8Array.from(text, (c) => c.charCodeAt(0));
 
 /** First occurrence of token outside comments. */
 function indexOfCode(text, token) {
@@ -234,7 +339,9 @@ export async function readRegistration(data) {
     const want = `${s.id}.bres`;
     const bundle = stageFiles.get(want.toLowerCase());
     s.bundleExists = !!bundle;
-    s.bundleLength = bundle ? (await bundle.getFile()).size : 0;
+    const file = bundle ? await bundle.getFile() : null;
+    s.bundleLength = file ? file.size : 0;
+    s.bundleModified = file ? new Date(file.lastModified) : null;
     const listedAs = listed.find((b) => sameName(b, want));
     s.listedInFileList = listedAs != null;
     s.listedAs = listedAs != null && listedAs !== want ? listedAs : null;
@@ -249,19 +356,20 @@ export async function readRegistration(data) {
 
 /**
  * The install plan for putting the bundle into stage id's slot in place of the bundle there (CreatePlan for
- * ReplaceExisting): {id, slot, bundleRel, miniRel, targetExists, miniExists, findings: [{severity, code, message,
- * detail}], steps, hasErrors}. A slot stageFileList.nut doesn't list is refused here: adding it isn't ported yet.
+ * ReplaceExisting): {id, slot, bundleRel, miniRel, targetExists, miniExists, addToFileList, retargetFrom, willRewrap,
+ * findings: [{severity, code, message, detail}], steps, hasErrors}. A slot stageFileList.nut doesn't list is added to it.
+ * retarget (rename a bundle made for another stage for this slot) and rewrap (ZRES + BFBR when it isn't) are the
+ * dialog's two options, both on as the desktop's. The bundle's own stage comes from its check (applyLint); until then
+ * authoredFor stands in for it.
  */
-export async function createPlan(data, snap, stageId) {
+export async function createPlan(data, snap, stageId, { retarget = true, rewrap = true, authoredFor = null } = {}) {
   const id = String(stageId ?? '').trim();
-  const plan = { id, slot: null, findings: [], steps: [], hasErrors: false };
-  const add = (severity, code, message, detail) => {
-    plan.findings.push({ severity, code, message, detail });
-    if (severity === 'error') plan.hasErrors = true;
-  };
+  const plan = { id, slot: null, retarget, rewrap, authoredFor, lint: null, base: [], final: false };
+  const add = (severity, code, message, detail) => plan.base.push({ severity, code, message, detail });
   if (!isValidStageId(id)) {
     add('error', 'INVALID_ID', `Invalid stage id '${id}'`, 'Use letters, digits and underscores only (e.g. sforA).');
-    return plan;
+    plan.final = true;
+    return settle(plan);
   }
   const slot = snap.find(id);
   const sid = slot?.id ?? id;
@@ -272,12 +380,11 @@ export async function createPlan(data, snap, stageId) {
   plan.miniExists = !!(await fileAt(data, plan.miniRel));
   if (!slot) {
     add('error', 'SLOT_UNKNOWN', `'${id}' is not an installed or registered stage`,
-      'Open a bundle of one of the game\'s stages to install it in its place, or add it as a new stage with the desktop HappyTool.');
-    return plan;
+      'Pick one of the listed stages to replace, or add it as a new stage with the desktop HappyTool.');
+    plan.final = true;
+    return settle(plan);
   }
-  if (!slot.listedInFileList)
-    add('error', 'NOT_LISTED', `'${sid}' isn't listed in stage\\stageFileList.nut`,
-      'Adding a stage to the list isn\'t in the web version yet: install it with the desktop HappyTool, or open a stage the list has.');
+  plan.addToFileList = !slot.listedInFileList;
   const menu = slot.menuNum;
   if (menu == null)
     add('warning', 'NOT_IN_MENU', `'${id}' has no MenuNum — it won't appear in Skirmish`,
@@ -302,48 +409,64 @@ export async function createPlan(data, snap, stageId) {
       add('warning', 'STAGE_TABLES_MISSING', `json\\stage has no gameplay tables for '${id}'`,
         `Missing: ${missing.join(', ')}. The game reads area / gimmick / effect data from these files; without them the stage may crash or play without objectives. Replacing an existing stage avoids this.`);
   }
-  add('info', 'CLOSE_GAME', 'Close Happy Wars first',
-    "It keeps stage files open, and it only reads the stage list at startup. A browser can't see whether it is running.");
+  return settle(plan);
+}
 
-  const target = `Data\\stage\\${sid}.bres`;
-  if (plan.targetExists) plan.steps.push(`Back up the current ${target}`);
-  plan.steps.push(`${plan.targetExists ? 'Replace' : 'Write'} ${target} (byte-for-byte copy)`);
-  if (plan.miniExists)
-    plan.steps.push(`Back up and replace Data\\stage\\mini\\${sid}.bres too (the game loads that copy instead on lower graphics settings)`);
-  plan.steps.push('Read every written file back and verify its SHA-256');
+/** The findings and steps that depend on the bundle (its own stage, its wrapping) and the two options, worked out again. */
+function settle(plan) {
+  const findings = [...plan.base];
+  const steps = [];
+  plan.retargetFrom = null;
+  plan.willRewrap = false;
+  if (!plan.final) {
+    const { id, lint } = plan;
+    const sid = plan.slot.id;
+    plan.willRewrap = !!(plan.rewrap && lint?.readable && !lint.isSteamWrapped);
+    const authoredFor = lint ? lint.detectedStageId : plan.authoredFor;
+    const otherStage = isValidStageId(authoredFor) && authoredFor.toLowerCase() !== id.toLowerCase();
+    const add = (severity, code, message, detail) => findings.push({ severity, code, message, detail });
+    if (otherStage && plan.retarget) {
+      plan.retargetFrom = authoredFor;
+      add('info', 'RETARGET', `The bundle's ${authoredFor} files are renamed for the '${id}' slot`,
+        `${authoredFor}.rrm → ${id}.rrm, ${authoredFor}_Chit.ccp → ${id}_Chit.ccp, camera / light json and minimap likewise, so the game finds them when it loads ${id}. Textures keep their names; your file is not modified.`);
+    } else if (otherStage)
+      add('warning', 'NOT_RETARGETED', `The bundle's files are named for '${authoredFor}', not '${id}'`,
+        `The game loads ${id}.rrm, ${id}_Chit.ccp … when it loads this slot; with renaming off they keep their ${authoredFor} names and may not be found.`);
+    if (otherStage && plan.slot.hasStageTables)
+      add('info', 'SLOT_TABLES_MISMATCH', `Installing '${authoredFor}' into the '${id}' slot`,
+        `The slot keeps json\\stage\\${id}_stage_*.json (areas, gimmicks, effects authored for ${friendlyName(id) ?? id}), so objectives are placed at ${id}'s coordinates.`);
+    // The desktop warns here when it sees the game running; a browser can't, so it always says to close it.
+    add('info', 'CLOSE_GAME', 'Close Happy Wars first',
+      "It keeps stage files open, and it only reads the stage list at startup. A browser can't see whether it is running.");
+
+    const target = `Data\\stage\\${sid}.bres`;
+    if (plan.targetExists) steps.push(`Back up the current ${target}`);
+    if (plan.addToFileList) steps.push(`Back up stage\\stageFileList.nut and add "${id}.bres" to it`);
+    if (plan.retargetFrom)
+      steps.push(`Rename the bundle's ${plan.retargetFrom} files for ${id} (models, collision, effects, camera / light, minimap)`);
+    steps.push(`${plan.targetExists ? 'Replace' : 'Write'} ${target}${
+      plan.willRewrap ? ' (re-wrapped as ZRES + BFBR)' : plan.retargetFrom ? ' (re-encoded with the new names)' : ' (byte-for-byte copy)'}`);
+    if (plan.miniExists)
+      steps.push(`Back up and replace Data\\stage\\mini\\${sid}.bres too (the game loads that copy instead on lower graphics settings)`);
+    steps.push('Read every written file back and verify its SHA-256');
+  }
+  plan.findings = findings;
+  plan.steps = steps;
+  plan.hasErrors = findings.some((f) => f.severity === 'error');
   return plan;
 }
 
-const WRITE_COPY = ' (byte-for-byte copy)';
 const sameBytes = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
 
 /**
- * The parts of CreatePlan that need the bundle's lint (stage-lint.js), added once the bundle is built: the plan itself
- * is made first, while the folder pick still counts as the user's click. Re-wrapping is on, as the desktop's default;
- * renaming another stage's files for this slot (Retarget) isn't in the web yet, so a bundle made for another stage gets
- * the desktop's renaming-off warning.
+ * The plan worked out again with the bundle's check (stage-lint.js), once the bundle is built (the plan itself is made
+ * first, while the folder pick still counts as the user's click): the stage the bundle was made for decides the
+ * renaming (or its warning), and its wrapping the re-wrap step. rewrap, when given, replaces the plan's option.
  */
-export function applyLint(plan, lint, { rewrap = true } = {}) {
+export function applyLint(plan, lint, { rewrap = plan.rewrap } = {}) {
   plan.lint = lint;
-  plan.willRewrap = !!(rewrap && lint?.readable && !lint.isSteamWrapped);
-  const id = plan.slot?.id ?? plan.id;
-  const authoredFor = lint?.detectedStageId;
-  const otherStage = isValidStageId(authoredFor) && authoredFor.toLowerCase() !== id.toLowerCase();
-  const found = [];
-  if (otherStage)
-    found.push({ severity: 'warning', code: 'NOT_RETARGETED', message: `The bundle's files are named for '${authoredFor}', not '${id}'`,
-      detail: `The game loads ${id}.rrm, ${id}_Chit.ccp … when it loads this slot; with renaming off they keep their ${authoredFor} names and may not be found.` });
-  if (otherStage && plan.slot?.hasStageTables)
-    found.push({ severity: 'info', code: 'SLOT_TABLES_MISMATCH', message: `Installing '${authoredFor}' into the '${id}' slot`,
-      detail: `The slot keeps json\\stage\\${id}_stage_*.json (areas, gimmicks, effects authored for ${friendlyName(id) ?? id}), so objectives are placed at ${id}'s coordinates.` });
-  // The desktop adds these just before its game-running check, which the web's close-the-game note stands for.
-  const at = plan.findings.findIndex((f) => f.code === 'CLOSE_GAME');
-  plan.findings.splice(at < 0 ? plan.findings.length : at, 0, ...found);
-  if (plan.willRewrap) {
-    const i = plan.steps.findIndex((x) => x.endsWith(WRITE_COPY));
-    if (i >= 0) plan.steps[i] = plan.steps[i].slice(0, -WRITE_COPY.length) + ' (re-wrapped as ZRES + BFBR)';
-  }
-  return plan;
+  plan.rewrap = rewrap;
+  return settle(plan);
 }
 
 const RANK = { info: 0, warning: 1, error: 2 };
@@ -486,13 +609,30 @@ export async function install(root, plan, bytes, { source, onStep, lint } = {}) 
   const id = plan.slot.id;
   // The bytes going to disk must still open as a BRES container.
   let payload;
+  let layers;
   try {
-    payload = (await decodeLayers(bytes)).payload;
+    ({ payload, layers } = await decodeLayers(bytes));
     parseBres(payload);
   } catch (e) {
     return done(false, `The bundle doesn't open as a BRES container (${e.message}); nothing was changed.`);
   }
-  if (plan.willRewrap) {
+  if (plan.retargetFrom) {
+    step(8, `Renaming the bundle's ${plan.retargetFrom} files for ${id}…`);
+    const original = parseBres(payload);
+    const archive = parseBres(payload);
+    const { renamed, clashes } = retargetNames(archive, plan.retargetFrom, id);
+    for (const [from, to] of renamed) log.push(`  ${from} → ${to}`);
+    for (const c of clashes) log.push(`  kept ${c} (the bundle already has a file with the new name)`);
+    payload = writeBres(archive);
+    const zres = layers.includes('ZRES') || plan.willRewrap;
+    const bfbr = layers.includes('BFBR') || plan.willRewrap;
+    bytes = await encodeLayers(payload, [...(bfbr ? ['BFBR'] : []), ...(zres ? ['ZRES'] : [])]);
+    // Read it back: the same files and contents in the same order, only the names changed.
+    const back = (await decodeLayers(bytes)).payload;
+    if (!sameBytes(back, payload) || !sameContents(original, parseBres(back), renamed))
+      return done(false, 'The renamed bundle did not read back with the same contents; nothing was changed.');
+    log.push(`Renamed ${renamed.length} file(s) for ${id}.`);
+  } else if (plan.willRewrap) {
     step(10, 'Re-wrapping bundle as ZRES + BFBR…');
     bytes = await encodeLayers(payload, ['BFBR', 'ZRES']);
     const check = await decodeLayers(bytes);
@@ -507,11 +647,25 @@ export async function install(root, plan, bytes, { source, onStep, lint } = {}) 
   } catch (e) {
     return done(false, `${e.message} Nothing was changed.`);
   }
-  if (!snap.find(id)?.listedInFileList) return done(false, `'${id}' is no longer listed in stage\\stageFileList.nut; nothing was changed.`);
+  let fileList = null;
+  if (plan.addToFileList) {
+    let text;
+    try {
+      text = addFileListEntry(latin1(snap.fileList.plain), `${id}.bres`);
+    } catch (e) {
+      return done(false, `stageFileList.nut: ${e.message}`);
+    }
+    try {
+      fileList = await encodeLike(latin1Bytes(text), snap.fileList.layers);
+    } catch (e) {
+      return done(false, `${e.message} Nothing was changed.`);
+    }
+  }
 
   const writes = [{ role: 'bundle', rel: plan.bundleRel, bytes }];
   // Lower quality levels load stage\mini\<id>.bres instead when it exists; the full-size bundle works in its place.
   if (await fileAt(root.data, plan.miniRel)) writes.push({ role: 'low-quality bundle', rel: plan.miniRel, bytes });
+  if (fileList) writes.push({ role: 'file list', rel: FILE_LIST, bytes: fileList });
 
   step(35, 'Backing up files that will change…');
   let set;
@@ -523,11 +677,11 @@ export async function install(root, plan, bytes, { source, onStep, lint } = {}) 
   step(60, `Backup set: ${BACKUP_FOLDER}\\${set.name}`);
 
   const applied = [];
-  const want = await sha256(bytes);
   try {
     let n = 0;
     for (const w of writes) {
       step(65 + Math.trunc((25 * n++) / writes.length), `Writing Data\\${w.rel}…`);
+      const want = await sha256(w.bytes);
       const fh = await fileFor(root.data, w.rel);
       applied.push(w);
       await writeBytes(fh, w.bytes);
