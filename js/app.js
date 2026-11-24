@@ -3,6 +3,7 @@ import { el, button, toast, pickFiles, openDialog, ask, confirmBox } from './ui.
 import { decodeLayers, encodeLayers, writableLayers } from './formats/wrappers.js';
 import { parseBres, writeBres } from './formats/bres.js';
 import { parseLng, writeLng, validateLng } from './formats/lng.js';
+import { parseVmd, writeVmd } from './formats/vmd.js';
 import { sniff, KIND_LABELS, describeMagic } from './formats/sniff.js';
 import { decodeText, encodeText, bytesEqual, formatSize, baseName, downloadBytes } from './util.js';
 import { renderBres } from './views/bres-view.js';
@@ -12,6 +13,7 @@ import { renderText } from './views/text-view.js';
 import { renderNut } from './views/nut-view.js';
 import { renderMedia } from './views/media-view.js';
 import { renderHex } from './views/hex-view.js';
+import { renderVmd } from './views/vmd-view.js';
 import { dataRootOf, preferredLng, isSearchable } from './formats/lng-refs.js';
 import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictures } from './browser.js';
 import { loadHandle, saveHandle, forgetHandle, readDirectory } from './data-folder.js';
@@ -172,6 +174,7 @@ function loadModel(node) {
   try {
     if (s.kind === 'bres') node.model = parseBres(node.payload);
     else if (s.kind === 'lng') node.model = parseLng(node.payload);
+    else if (s.kind === 'vmd') node.model = parseVmd(node.payload);
     else if (s.kind === 'json' || s.kind === 'text') {
       node.model = decodeText(node.payload);
       if (!bytesEqual(encodeText(node.model.text, node.model.encoding), node.payload))
@@ -198,6 +201,8 @@ function serialize(node) {
     case 'json':
     case 'text':
       return encodeText(node.model.text, node.model.encoding);
+    case 'vmd':
+      return writeVmd(node.model);
     default:
       return node.payload;
   }
@@ -542,6 +547,8 @@ function pickView(node, ctx) {
       return renderMedia(node, ctx, ctx.showHex);
     case 'nutc':
       return renderHex(node, ctx, 'Compiled Squirrel script (bytecode). Shown as bytes.');
+    case 'vmd':
+      return renderVmd(node, ctx);
     default:
       return renderHex(node, ctx, node.payload.length ? `Binary data (starts with ${describeMagic(node.payload)}). Shown as bytes.` : null);
   }
