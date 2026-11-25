@@ -23,6 +23,7 @@ import { renderFnt } from './views/fnt-view.js';
 import { renderTanda } from './views/tanda-view.js';
 import { renderRra } from './views/rra-view.js';
 import { renderSgfx } from './views/sgfx-view.js';
+import { openMovieDoc } from './formats/swf-tags.js';
 import { dataRootOf, preferredLng, isSearchable } from './formats/lng-refs.js';
 import { buildTree, renderSidebar, renderFolder, findFile, stageIdFor, loadStagePictures } from './browser.js';
 import { loadHandle, saveHandle, forgetHandle, readDirectory } from './data-folder.js';
@@ -208,6 +209,7 @@ function loadModel(node) {
     else if (s.kind === 'lng') node.model = parseLng(node.payload);
     else if (s.kind === 'vmd') node.model = parseVmd(node.payload, !!node.parent);
     else if (s.kind === 'rml') node.model = parseRml(node.payload);
+    else if (s.kind === 'sgfx') node.model = openMovieDoc(node.payload); // read in the background; the view waits for it
     else if (s.kind === 'vir' && !isTrf(node.payload)) node.warning = VIR_WARNING;
     else if (s.kind === 'fnt' && !looksLikeFtdf(node.payload)) {
       if (node.parent) node.kind = 'hex'; // the desktop's bundle editor opens only FTDF .fnt entries as fonts
@@ -243,14 +245,22 @@ function serialize(node) {
       return writeVmd(node.model);
     case 'rml':
       return serializeRml(node.model);
+    case 'sgfx':
+      return node.model.bytes(); // settle(node) first: the movie is compressed in the background
     default:
       return node.payload;
   }
 }
 
+/** Waits for a model that writes itself in the background (a Scaleform movie) to finish, so serialize() can run. */
+async function settle(node) {
+  if (node?.dirty && node.kind === 'sgfx' && node.model?.flush) await node.model.flush();
+}
+
 /** Write a child's edits back into its parent bundle entry, re-wrapping it the way it was stored. */
 async function commit(node) {
   if (!node.dirty || !node.parent) return;
+  await settle(node);
   const payload = serialize(node);
   const layers = writableLayers(node.layers);
   const bytes = await encodeLayers(payload, layers);
@@ -341,6 +351,7 @@ async function save(name) {
   try {
     for (let i = s.length - 1; i > 0; i--) await commit(s[i]);
     const root = s[0];
+    await settle(root);
     const payload = serialize(root);
     const layers = writableLayers(root.layers);
     const bytes = await encodeLayers(payload, layers);
@@ -445,7 +456,12 @@ function renderInfo() {
   }
   parts.push(el('span', { class: 'spacer' }));
   if (node.kind !== 'hex' && node.kind !== 'nutc')
-    parts.push(button(node.showHex ? 'Show preview' : 'Show bytes', () => ((node.showHex = !node.showHex), renderInfo(), renderView())));
+    parts.push(button(node.showHex ? 'Show preview' : 'Show bytes', async () => {
+      if (!node.showHex) await settle(node).catch(() => {}); // a write that fails shows its message in the hex view
+      node.showHex = !node.showHex;
+      renderInfo();
+      renderView();
+    }));
   if (node.layers.length)
     parts.push(button('Download unwrapped', downloadUnwrapped, { title: 'Save the contents without the BFBR / ZRES shells' }));
   if (node.parent) parts.push(button('Replace…', replaceNode, { title: 'Replace this entry with a file from disk' }));
@@ -504,7 +520,12 @@ function renderView() {
         render();
       },
     },
-    showHex: () => ((node.showHex = true), renderInfo(), renderView()),
+    showHex: async () => {
+      await settle(node).catch(() => {});
+      node.showHex = true;
+      renderInfo();
+      renderView();
+    },
     /** The stage bundles among the open files (the map editor's "another stage's sky"), read from disk when asked. */
     stageBundles: () =>
       files
@@ -659,6 +680,7 @@ function emptyState() {
 async function downloadUnwrapped() {
   const node = top();
   try {
+    await settle(node);
     const bytes = serialize(node);
     downloadBytes(bytes, baseName(node.name));
   } catch (e) {

@@ -211,7 +211,7 @@ export const TAG_NAMES = {
 export const tagName = (code) => TAG_NAMES[code] ?? `Unknown (${code})`;
 
 /** Scaleform's tags hold their files and ids at fixed places: read what each one names, or null. */
-function readScaleformTag(code, d) {
+export function readScaleformTag(code, d) {
   const at = { p: 0 };
   switch (code) {
     case 1000: { // ExporterInfo: version, [flags], bitmap format, prefix, SWF name
