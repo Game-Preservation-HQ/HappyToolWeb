@@ -4,6 +4,7 @@
 // edges, clip actions, glyphs) are shown with their size.
 import { el, button, toast, openDialog } from '../ui.js';
 import { fontLayout, toHex, fromHex, FILTER_NAMES } from '../formats/swf-tags.js';
+import { actionBlocksOfTag, replaceActionBlock } from '../formats/avm1.js';
 
 // ---------- the action seam ----------
 
@@ -199,7 +200,7 @@ const placeSpecs = (code) => [
         { k: 'reserved', l: 'Reserved flag', t: 'bool' },
       ]
     : []),
-  { k: 'clipActions', l: 'Clip actions', t: 'bytes' },
+  { k: 'clipActions', l: 'Clip actions', t: 'actionList', code: 26, prefix: [0x80, 0, 0], removable: true },
 ];
 
 const symbolList = (l) => ({ k: 'symbols', l, t: 'list', table: true, item: [{ k: 'id', l: 'Id', t: 'char' }, { k: 'name', l: 'Name', t: 'str' }], add: (list) => ({ id: list.at(-1)?.id ?? 1, name: '' }) });
@@ -263,7 +264,7 @@ export function specsFor(code, f) {
             { k: 'blendMode', l: 'Blend mode', t: 'enum', options: BLEND, opt: () => 1 },
           ],
         },
-        { k: 'actions', l: 'Condition actions', t: 'bytes' },
+        { k: 'actions', l: 'Condition actions', t: 'actionList', code: 34, prefix: [0, 0, 0, 2, 0] },
       ];
     case 37:
       return [
@@ -466,6 +467,59 @@ function bytesInfo(u8, onRemove) {
   return el('details', { class: 'sgfx-bytes' }, el('summary', {}, `${u8.length} byte${u8.length === 1 ? '' : 's'}`, onRemove ? ' ' : null, onRemove ? button('Remove', (e) => (e.preventDefault(), onRemove()), { class: 'btn btn-sm btn-danger-quiet' }) : null), hexBlock(u8, 512));
 }
 
+/**
+ * The action blocks inside a field that holds several (a place tag's clip actions, a DefineButton2's conditions): one
+ * action editor per block, opened on demand. s.prefix is the bytes that make the field a tag body of type s.code for
+ * actionBlocksOfTag; each edit finds the block again in the field as it is now, so the sizes after it stay right.
+ */
+function actionListControl(s, obj, io) {
+  const v = obj[s.k];
+  if (v == null || !v.length) return el('span', { class: 'muted small' }, '(none)');
+  const pre = Uint8Array.from(s.prefix);
+  const body = () => {
+    const cur = obj[s.k];
+    const b = new Uint8Array(pre.length + cur.length);
+    b.set(pre);
+    b.set(cur, pre.length);
+    return b;
+  };
+  const version = io.version ?? 10;
+  const remove = s.removable ? button('Remove', () => setValue(obj, s.k, null, io) && io.redraw(), { class: 'btn btn-sm btn-danger-quiet' }) : null;
+  let blocks;
+  try {
+    blocks = actionBlocksOfTag(s.code, body(), version);
+  } catch (e) {
+    return el('span', { class: 'sgfx-inline' }, bytesInfo(v, null), el('span', { class: 'muted small' }, ` ${e.message}`), remove);
+  }
+  const editor = io.actions ?? actionEditor;
+  const wrap = el('div', { class: 'sgfx-action-list' },
+    el('div', { class: 'meta-row' }, el('span', { class: 'muted small' }, `${blocks.length} action block${blocks.length === 1 ? '' : 's'} · ${v.length} bytes`), el('span', { class: 'spacer' }), remove));
+  blocks.forEach((blk, i) => {
+    const box = el('div', { class: 'sgfx-actions' });
+    const size = el('span', { class: 'muted small' }, ` · ${blk.length} bytes`);
+    const det = el('details', { class: 'sgfx-action-block' }, el('summary', {}, blk.name, size), box);
+    det.addEventListener('toggle', () => {
+      if (!det.open || box.childNodes.length) return;
+      const cur = body();
+      const b = actionBlocksOfTag(s.code, cur, version)[i];
+      editor(box, cur.slice(b.offset, b.offset + b.length), (next) => {
+        let out;
+        try {
+          const now = body();
+          out = replaceActionBlock(now, actionBlocksOfTag(s.code, now, version)[i], next).slice(pre.length);
+        } catch (e) {
+          toast(`That doesn’t fit: ${e.message}`, 'error');
+          return io.redraw();
+        }
+        if (!setValue(obj, s.k, out, io) || editor === renderActionEditor) return io.redraw();
+        size.textContent = ` · ${next.length} bytes`;
+      });
+    });
+    wrap.append(det);
+  });
+  return wrap;
+}
+
 function control(s, obj, io) {
   const v = obj[s.k];
   switch (s.t) {
@@ -567,17 +621,22 @@ function control(s, obj, io) {
     }
     case 'bytes':
       if (v == null) return el('span', { class: 'muted small' }, '(none)');
-      return bytesInfo(v, s.k === 'clipActions' ? () => setValue(obj, s.k, null, io) && io.redraw() : null);
+      return bytesInfo(v, null);
     case 'filters':
       if (v == null) return el('span', { class: 'muted small' }, '(none)');
       return el('span', { class: 'sgfx-inline' }, el('span', {}, `${v.kinds.join(', ')} (${v.bytes.length} bytes)`), button('Remove', () => setValue(obj, s.k, null, io) && io.redraw(), { class: 'btn btn-sm btn-danger-quiet' }));
     case 'actions': {
       const box = el('div', { class: 'sgfx-actions' });
-      (io.actions ?? actionEditor)(box, v, (next) => {
-        if (setValue(obj, s.k, next, io)) io.redraw();
+      const editor = io.actions ?? actionEditor;
+      // The hex editor shows the bytes, so it is drawn again; a p-code editor already shows its new block and keeps its
+      // place (tab, caret). A change that doesn't fit is taken back and the editor is drawn again from the tag.
+      editor(box, v, (next) => {
+        if (!setValue(obj, s.k, next, io) || editor === renderActionEditor) io.redraw();
       });
       return box;
     }
+    case 'actionList':
+      return actionListControl(s, obj, io);
     case 'font':
       return fontControl(obj, io);
     case 'obj': {

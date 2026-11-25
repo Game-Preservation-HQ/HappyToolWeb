@@ -877,6 +877,11 @@ span.twisty { cursor: default; }
 .anim-keys { min-height: 0; }
 .anim-keys .grid td { font-family: var(--mono); font-size: 12px; padding: 1px 6px; }
 
+/* the movie editor's lists of action blocks (clip actions, button conditions) */
+.sgfx-action-list { display: grid; gap: 6px; min-width: 0; }
+.sgfx-action-block > summary { cursor: pointer; font-size: 13px; }
+.sgfx-action-block[open] > summary { margin-bottom: 6px; }
+
 /* AVM1 editor */
 .avm1-editor { min-height: 320px; }
 .avm1-editor .tabs-bar { gap: 6px 10px; }

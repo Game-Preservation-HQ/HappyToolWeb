@@ -11,8 +11,22 @@ import {
   definedId, withDefinedId, usesOf, freeCharacterId, exportNames, bytesEqual, fromHex,
 } from '../formats/swf-tags.js';
 import { specsFor, fieldsForm, hexBlock, editHex, colorText, renderActionEditor, setActionEditor } from './sgfx-forms.js';
+import { renderActionEditor as renderPcodeEditor } from './avm1-editor.js';
 
 export { renderActionEditor, setActionEditor };
+
+// Action blocks open in the p-code editor; one it can't read falls back to the hex view with the reason.
+setActionEditor((container, bytes, onChange) => {
+  try {
+    return renderPcodeEditor(container, bytes, onChange);
+  } catch (e) {
+    const draw = (b) => {
+      renderActionEditor(container, b, (next) => (onChange(next), draw(next)));
+      container.prepend(el('p', { class: 'muted small' }, `The p-code editor can’t read this block (${e.message}); it is shown as bytes.`));
+    };
+    draw(bytes);
+  }
+});
 
 const SIGNATURES = [
   ['CFX', 'CFX: Scaleform, zlib'],
@@ -767,6 +781,7 @@ function editor(node, ctx, doc, view) {
       const specs = specsFor(tag.code, d.fields);
       const fields = freshFields(tag);
       const io = {
+        version: movie.version,
         commit: () => {
           if (tag.sprite) {
             const cmds = [];
