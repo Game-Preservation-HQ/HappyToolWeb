@@ -1149,3 +1149,659 @@ export function replaceActionBlock(data, block, bytes) {
   }
   return out;
 }
+
+// ---------- decompiler: read-only ActionScript 2 ----------
+
+const PROPS = ['_x', '_y', '_xscale', '_yscale', '_currentframe', '_totalframes', '_alpha', '_visible', '_width', '_height', '_rotation', '_target', '_framesloaded', '_name', '_droptarget', '_url', '_highquality', '_focusrect', '_soundbuftime', '_quality', '_xmouse', '_ymouse'];
+const IDENT = /^[A-Za-z_$][\w$]*$/;
+const PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/;
+const IND = '   ';
+// operator precedence, higher binds tighter
+const P = { assign: 1, cond: 2, or: 3, and: 4, bor: 5, bxor: 6, band: 7, eq: 8, rel: 9, shift: 10, add: 11, mul: 12, unary: 13, post: 14, call: 15, prim: 16 };
+const BINARY = {
+  0x0a: ['+', P.add], 0x0b: ['-', P.add], 0x0c: ['*', P.mul], 0x0d: ['/', P.mul], 0x0e: ['==', P.eq], 0x0f: ['<', P.rel],
+  0x10: ['&&', P.and], 0x11: ['||', P.or], 0x13: ['eq', P.eq], 0x21: ['add', P.add], 0x29: ['lt', P.rel], 0x3f: ['%', P.mul],
+  0x47: ['+', P.add], 0x48: ['<', P.rel], 0x49: ['==', P.eq], 0x54: ['instanceof', P.rel], 0x60: ['&', P.band], 0x61: ['|', P.bor],
+  0x62: ['^', P.bxor], 0x63: ['<<', P.shift], 0x64: ['>>', P.shift], 0x65: ['>>>', P.shift], 0x66: ['===', P.eq], 0x67: ['>', P.rel], 0x68: ['gt', P.rel],
+};
+const NEGATED = { '==': '!=', '!=': '==', '===': '!==', '!==': '===', '<': '>=', '>=': '<', '>': '<=', '<=': '>' };
+// one-operand actions written as a call, and statements with no operands
+const UNARY_CALL = { 0x14: 'length', 0x18: 'int', 0x30: 'random', 0x31: 'mblength', 0x32: 'ord', 0x33: 'chr', 0x36: 'mbord', 0x37: 'mbchr', 0x45: 'targetPath', 0x4a: 'Number', 0x4b: 'String' };
+const PLAIN = { 0x04: 'nextFrame', 0x05: 'prevFrame', 0x06: 'play', 0x07: 'stop', 0x08: 'toggleHighQuality', 0x09: 'stopAllSounds', 0x28: 'stopDrag' };
+// DefineFunction2 registers filled before the parameters, in register order from 1
+const PRELOADS = [[0x0100, 'this'], [0x0400, 'arguments'], [0x1000, 'super'], [0x4000, '_root'], [0x8000, '_parent'], [0x0001, '_global']];
+
+class Unstructured extends Error {}
+const fail = (why) => {
+  throw new Unstructured(why);
+};
+const wrap = (e, p) => (e.p < p ? `(${e.s})` : e.s);
+const node = (s, p = P.prim, extra) => ({ s, p, ...extra });
+const binary = (op, p, a, b) => ({ s: `${wrap(a, p)} ${op} ${wrap(b, p + 1)}`, p, op, a, b });
+function notOf(e) {
+  if (NEGATED[e.op]) return { ...binary(NEGATED[e.op], e.p, e.a, e.b), negOf: e };
+  return { s: `!${wrap(e, P.unary)}`, p: P.unary, not: e };
+}
+// the condition under which an If does not branch
+const negate = (c) => c.not ?? c.negOf ?? notOf(c);
+const strNode = (bin) => node(quote(bin), P.prim, { lit: true, str: binText(bin) });
+const numNode = (v) => node(Number.isNaN(v) ? 'NaN' : String(v), v < 0 ? P.unary : P.prim, { lit: true, num: v });
+const ITER = node('(for-in name)', P.prim, { iter: true });
+const ind = (stmts) => stmts.flat().map((l) => IND + l);
+const stmt = (lines, props) => Object.assign(lines.flatMap((l) => l.split('\n')), props);
+const member = (o, n) => (n.str != null && IDENT.test(n.str) ? `${wrap(o, P.call)}.${n.str}` : `${wrap(o, P.call)}[${n.s}]`);
+const varName = (n) => (n.str != null && PATH.test(n.str) ? n.str : null);
+
+/** Registers and declarations of one function body (or of the block's top level). */
+class Scope {
+  constructor(names, local) {
+    this.names = names;
+    this.local = local;
+    this.declared = new Set();
+    this.alias = new Map();
+    this.pending = [];
+  }
+  name(r) {
+    return this.names[r] ?? `_loc${r}_`;
+  }
+  read(r) {
+    if (this.alias.has(r)) return this.alias.get(r);
+    // a local register read before anything is stored in it is declared where it is first used
+    if (this.local && this.names[r] == null && !this.declared.has(r)) {
+      this.declared.add(r);
+      this.pending.push(`var ${this.name(r)};`);
+    }
+    return node(this.name(r), P.prim, { pure: true, reg: r });
+  }
+  write(r) {
+    this.alias.delete(r);
+    if (this.names[r] == null && !this.declared.has(r)) {
+      this.declared.add(r);
+      return `var ${this.name(r)}`;
+    }
+    return this.name(r);
+  }
+}
+
+/**
+ * ActionScript 2 for an action block, for reading: if/else, while, do-while, for-in, with, try, functions,
+ * conditional expressions and && / || are rebuilt from the branches; local registers read as _locN_ (or their
+ * parameter names). A body whose branches do not form those structures is shown as its p-code in comments instead.
+ */
+export function decompile(bytes) {
+  const d = disassemble(bytes);
+  const all = d.actions;
+  const at = new Map(all.map((a, i) => [a.offset, i]));
+  const poolOf = new Map();
+  let pool = null;
+  for (const a of all) {
+    if (a.code === 0x88 && !a.raw) pool = a.pool;
+    poolOf.set(a, pool);
+  }
+  const pcode = d.text.split('\n');
+
+  // the actions of the body [s, e); a nested body is the one action of its container
+  function listOf(s, e) {
+    const out = [];
+    let i = at.get(s) ?? all.length;
+    while (i < all.length && all[i].offset < e) {
+      const a = all[i++];
+      if (a.code !== 0 || a.line) out.push(a);
+      if (a.ends) {
+        const last = a.ends[a.ends.length - 1];
+        while (i < all.length && all[i].offset < last) i++;
+      }
+    }
+    return out;
+  }
+  function fallback(why, a) {
+    let lines = pcode;
+    if (a) {
+      lines = [];
+      for (let k = a.line, depth = 0; k < pcode.length; k++) {
+        const t = pcode[k].trim();
+        if (t === '}' && depth === 0) break;
+        if (t.endsWith('{')) depth++;
+        else if (t === '}') depth--;
+        lines.push(t);
+      }
+    }
+    return [`// not decompiled (${why}); its p-code:`, ...lines.filter((l) => l.trim()).map((l) => `// ${l.trim()}`)];
+  }
+  function fnLines(a) {
+    const names = [];
+    let params;
+    if (a.code === 0x8e) {
+      let r = 1;
+      for (const [bit, n] of PRELOADS) if (a.flags & bit) names[r++] = n;
+      params = a.params.map((p) => {
+        const n = binText(p.name);
+        if (p.register) names[p.register] = n;
+        return n;
+      });
+    } else params = a.params.map(binText);
+    const head = `function${a.fname ? ` ${binText(a.fname)}` : ''}(${params.join(', ')})`;
+    let lines;
+    try {
+      lines = body(new Scope(names, a.code === 0x8e), listOf(a.offset + a.size, a.ends[0]), [a.ends[0]]);
+    } catch (e) {
+      if (!(e instanceof Unstructured)) throw e;
+      lines = fallback(e.message, a);
+    }
+    return [head, '{', ...ind(lines), '}'];
+  }
+
+  function body(fn, list, endOffs) {
+    const stop = list.length;
+    const idx = new Map(list.map((a, i) => [a.offset, i]));
+    for (const e of endOffs) if (!idx.has(e)) idx.set(e, stop);
+    const tgt = (i) => {
+      const a = list[i];
+      const t = idx.get(a.offset + a.size + a.branch);
+      return t ?? fail(`a branch to ${a.offset + a.size + a.branch} lands outside its body`);
+    };
+    // for each loop head, the last backward branch to it
+    const backFrom = new Map();
+    list.forEach((a, i) => {
+      if ((a.code === 0x99 || a.code === 0x9d) && !a.raw) {
+        const t = tgt(i);
+        if (t <= i) backFrom.set(t, Math.max(backFrom.get(t) ?? -1, i));
+      }
+    });
+    // values left on the stack past `base` are shown as statements
+    const spill = (r, base) => {
+      for (const v of r.stack.splice(base)) if (!v.lit && !v.pure && !v.iter && !v.enumOf) r.stmts.push(stmt([`${v.s};`]));
+    };
+    const isPushNull = (a) => a?.code === 0x96 && !a.raw && a.values.length === 1 && a.values[0].t === 2;
+
+    // Statements for list[lo, hi). `join` is where control goes after hi; `skip` is a loop head already being built.
+    function run(lo, hi, stack, loop, skip, join) {
+      const out = [];
+      const flush = () => {
+        if (fn.pending.length) out.push(...fn.pending.splice(0).map((l) => [l]));
+      };
+      const emit = (lines, props) => {
+        flush();
+        out.push(stmt(lines, props));
+      };
+      const emitWith = (pre, lines, props) => {
+        out.push(...pre.map((l) => [l]));
+        emit(lines, props);
+      };
+      const pop = () => (stack.length ? stack.pop() : fail(`the stack is empty at ${list[i]?.name} ${list[i]?.offset}`));
+      const count = () => {
+        const c = pop();
+        return Number.isInteger(c.num) && c.num >= 0 ? c.num : fail('a count that is not a number');
+      };
+      // a function written as an argument ends its line, as FFDec writes it
+      const args = () => Array.from({ length: count() }, () => pop()).map((v) => (v.fn ? `${v.s}\n` : v.s)).join(',');
+      const after = (x) => (x === hi ? join : x);
+      const eff = (t) => (t > hi && t === join ? hi : t);
+      const isLoopJump = (t) => loop && (t === loop.cont || t === loop.back);
+
+      function loopAt(h, back) {
+        const brk = back + 1;
+        // Push null; Equals2; Not; If (itself): what a break or return out of a for-in leaves to clear the enumeration
+        if (back === h + 3 && isPushNull(list[h]) && list[h + 1].code === 0x49 && list[h + 2].code === 0x12) return brk;
+        const pre = fn.pending.splice(0);
+        if (list[back].code === 0x9d) {
+          const r = run(h, back, [...stack], { brk, cont: -1, back }, h, back);
+          if (r.stack.length !== stack.length + 1) fail('a do-while without its condition');
+          const c = r.stack.pop();
+          emitWith(pre, ['do', '{', ...ind(r.stmts), '}', `while(${c.s});`]);
+          return brk;
+        }
+        const top = stack[stack.length - 1];
+        if (top?.enumOf && list[h].code === 0x87 && !list[h].raw && list[h].args[0] === 0 && isPushNull(list[h + 1]) && list[h + 2]?.code === 0x49 && list[h + 3]?.code === 0x9d && tgt(h + 3) === brk) {
+          stack.pop();
+          fn.alias.set(0, ITER);
+          const r = run(h + 4, back, [], { brk, cont: h, back }, -1, back);
+          fn.alias.delete(0);
+          if (!r.stmts[0]?.forVar) fail('a for-in loop without its variable');
+          emitWith(pre, [`for(${r.stmts[0].forVar} in ${top.enumOf.s})`, '{', ...ind(r.stmts.slice(1)), '}']);
+          return brk;
+        }
+        let k = h;
+        while (k < back && !(list[k].code === 0x9d && tgt(k) === brk)) k++;
+        if (k < back) {
+          const saved = new Set(fn.declared);
+          const c = run(h, k, [...stack], null, h, k);
+          if (!c.stmts.length && c.stack.length === stack.length + 1) {
+            const cond = negate(c.stack.pop());
+            const r = run(k + 1, back, [...stack], { brk, cont: h, back }, -1, back);
+            emitWith(pre, [`while(${cond.s})`, '{', ...ind(r.stmts), '}']);
+            return brk;
+          }
+          fn.declared = saved;
+          fn.pending.length = 0;
+        }
+        const r = run(h, back, [...stack], { brk, cont: h, back }, h, back);
+        emitWith(pre, ['while(true)', '{', ...ind(r.stmts), '}']);
+        return brk;
+      }
+
+      // switch: subject; StoreRegister R; v1; StrictEquals; If case1; Push registerR, v2; StrictEquals; If case2; …;
+      // Jump default-or-end; case bodies in order (a break is a Jump to the end). Returns the index after it, or null.
+      function switchAt(s) {
+        const R = list[s].args[0];
+        const subj = stack[stack.length - 1];
+        const mark = node(subj.s, subj.p, { pure: true });
+        const cases = [];
+        let k = s + 1;
+        const saved = fn.alias.get(R);
+        try {
+          for (;;) {
+            let q = k;
+            while (q + 1 < hi && !(list[q].code === 0x66 && list[q + 1].code === 0x9d)) q++;
+            if (q + 1 >= hi) return null;
+            if (cases.length) fn.alias.set(R, mark);
+            const r = run(k, q, cases.length ? [] : [mark], null, -1, q);
+            if (r.stmts.length || r.stack.length !== 2 || r.stack[0] !== mark) return null;
+            cases.push({ v: r.stack[1], t: tgt(q + 1) });
+            k = q + 2;
+            if (list[k]?.code === 0x99) break;
+            const p = list[k];
+            if (!(p?.code === 0x96 && p.values[0]?.t === 4 && p.values[0].v === R)) return null;
+          }
+        } catch (e) {
+          if (e instanceof Unstructured) return null;
+          throw e;
+        } finally {
+          if (saved) fn.alias.set(R, saved);
+          else fn.alias.delete(R);
+        }
+        const D = eff(tgt(k));
+        if (D <= k || D > hi || cases.some((x, n) => x.t <= k || x.t > D || (n && x.t < cases[n - 1].t))) return null;
+        let end = D;
+        for (let x = k + 1; x < D; x++) {
+          if (list[x].code !== 0x99 || list[x].raw) continue;
+          const t = eff(tgt(x));
+          if (t > end && t <= hi) end = t;
+        }
+        stack.pop();
+        const sw = { brk: end, cont: loop?.cont ?? -1, back: loop?.back ?? -1 };
+        const part = (from, to) => ind(ind(run(from, to, [...stack], sw, -1, to).stmts));
+        const lines = [`switch(${subj.s})`, '{'];
+        for (let n = 0; n < cases.length; n++) {
+          lines.push(`${IND}case ${cases[n].v.s}:`);
+          const to = n + 1 < cases.length ? cases[n + 1].t : D;
+          if (to > cases[n].t) lines.push(...part(cases[n].t, to));
+        }
+        if (end > D) lines.push(`${IND}default:`, ...part(D, end));
+        lines.push('}');
+        emitWith(fn.pending.splice(0), lines);
+        return end;
+      }
+
+      let i = lo;
+      while (i < hi) {
+        const a = list[i];
+        if (a.raw) fail(`${a.name} at ${a.offset} could not be read`);
+        const back = i === skip ? undefined : backFrom.get(i);
+        if (back != null && back < hi) {
+          i = loopAt(i, back);
+          continue;
+        }
+        const next = list[i + 1] && i + 1 < hi ? list[i + 1] : null;
+        const c = a.code;
+        if (c === 0x9d) {
+          const t = eff(tgt(i));
+          const cond = pop();
+          if (t <= i) {
+            if (!isLoopJump(t)) fail('a backward If outside a loop');
+            emit([`if(${cond.s})`, '{', `${IND}continue;`, '}']);
+            i++;
+            continue;
+          }
+          // a && b, a || b: a; PushDuplicate; [Not;] If L; Pop; b; L:
+          const dup = i > lo && (list[i - 1].code === 0x4c || (list[i - 1].code === 0x12 && i - 1 > lo && list[i - 2].code === 0x4c));
+          if (dup && next?.code === 0x17 && t <= hi) {
+            const left = pop();
+            const and = cond.not === left || cond.negOf === left;
+            if (!and && cond !== left) fail('a short-circuit without its operand');
+            const r = run(i + 2, t, [...stack], loop, -1, after(t));
+            if (r.stmts.length || r.stack.length !== stack.length + 1) fail(`a short-circuit right side at ${a.offset}`);
+            stack.push(binary(and ? '&&' : '||', and ? P.and : P.or, left, r.stack.pop()));
+            i = t;
+            continue;
+          }
+          if (t > hi) {
+            const what = loop && t === loop.brk ? 'break' : isLoopJump(t) ? 'continue' : fail(`a branch out of its block at ${a.offset}`);
+            emit([`if(${cond.s})`, '{', `${IND}${what};`, '}']);
+            i++;
+            continue;
+          }
+          let thenEnd = t;
+          let elseEnd = -1;
+          const j = list[t - 1];
+          if (t - 1 > i && j.code === 0x99 && !j.raw) {
+            const e = eff(tgt(t - 1));
+            // a then-part that ends in a jump out of the loop or switch is a break, not an else
+            if (e > t && e <= hi && !(loop && tgt(t - 1) === loop.brk)) [thenEnd, elseEnd] = [t - 1, e];
+          }
+          const pre = fn.pending.splice(0);
+          const end = elseEnd >= 0 ? elseEnd : t;
+          const yes = run(i + 1, thenEnd, [...stack], loop, -1, after(end));
+          const no = elseEnd >= 0 ? run(t, elseEnd, [...stack], loop, -1, after(end)) : null;
+          const shown = negate(cond);
+          if (no && !yes.stmts.length && !no.stmts.length && yes.stack.length === stack.length + 1 && no.stack.length === stack.length + 1) {
+            fn.pending.unshift(...pre);
+            stack.push(node(`${wrap(shown, P.or)} ? ${wrap(yes.stack.pop(), P.assign)} : ${wrap(no.stack.pop(), P.assign)}`, P.cond));
+            i = end;
+            continue;
+          }
+          // values a branch leaves behind (the Flash compiler leaves the results of a class body's calls on the stack)
+          for (const r of no ? [yes, no] : [yes]) {
+            if (r.stack.length < stack.length) fail(`an if whose branch takes values from before it at ${a.offset}`);
+            spill(r, stack.length);
+          }
+          const lines = [`if(${shown.s})`, '{', ...ind(yes.stmts), '}'];
+          if (no && no.stmts.length === 1 && no.stmts[0].isIf) lines.push(`else ${no.stmts[0][0]}`, ...no.stmts[0].slice(1));
+          else if (no) lines.push('else', '{', ...ind(no.stmts), '}');
+          emitWith(pre, lines, { isIf: true });
+          i = end;
+          continue;
+        }
+        if (c === 0x99) {
+          const t = eff(tgt(i));
+          if (t === hi && i === hi - 1) {
+            i++;
+            continue;
+          }
+          if (loop && t === loop.brk) emit(['break;']);
+          else if (isLoopJump(t)) {
+            if (!(i === hi - 1 && after(hi) === loop.back)) emit(['continue;']);
+          } else fail('a jump that is not part of a structure');
+          i++;
+          continue;
+        }
+        if (c === 0x9b || c === 0x8e) {
+          const f = fnLines(a);
+          if (a.fname) emit(f);
+          else stack.push(node(f.join('\n'), P.prim, { fn: true }));
+          i++;
+          continue;
+        }
+        if (c === 0x94) {
+          const obj = pop();
+          emit([`with(${obj.s})`, '{', ...ind(body(fn, listOf(a.offset + a.size, a.ends[0]), [a.ends[0]])), '}']);
+          i++;
+          continue;
+        }
+        if (c === 0x8f) {
+          const ends = a.ends;
+          const part = (s, e) => ind(body(fn, listOf(s, e), ends));
+          const lines = ['try', '{', ...part(a.offset + a.size, ends[0]), '}'];
+          if (a.tflags & 1) lines.push(`catch(${a.tflags & 4 ? fn.name(a.catchRegister) : binText(a.catchName)})`, '{', ...part(ends[0], ends[1]), '}');
+          if (a.tflags & 2) lines.push('finally', '{', ...part(ends[1], ends[2]), '}');
+          emit(lines);
+          i++;
+          continue;
+        }
+        if (c === 0x87) {
+          const r = a.args[0];
+          const v = stack.length ? stack[stack.length - 1] : fail(`the stack is empty at ${a.name} ${a.offset}`);
+          const sw = next?.code === 0x17 ? null : switchAt(i);
+          if (sw != null) {
+            i = sw;
+            continue;
+          }
+          if (next?.code === 0x17) {
+            stack.pop();
+            const name = fn.write(r);
+            emit([`${name} = ${v.s};`], v.iter ? { forVar: name } : undefined);
+            i += 2;
+            continue;
+          }
+          fn.alias.delete(r);
+          if (v.pure || v.lit) fn.alias.set(r, v);
+          else {
+            stack.pop();
+            emit([`${fn.write(r)} = ${v.s};`]);
+            stack.push(fn.read(r));
+          }
+          i++;
+          continue;
+        }
+        step(a, next);
+        i += a.code === 0x81 || a.code === 0x8c ? (next?.code === 0x06 ? 2 : 1) : 1;
+      }
+      return { stmts: out, stack };
+
+      // x = x + 1 is x++; with the old value of x still on the stack it is that value's expression, x++
+      function postfix(target, op) {
+        const top = stack[stack.length - 1];
+        if (top && !top.lit && top.s === target) stack[stack.length - 1] = node(`${target}${op}`, P.post);
+        else emit([`${target}${op};`]);
+      }
+
+      // an action that is not a branch or a body
+      function step(a, next) {
+        const c = a.code;
+        if (c in BINARY) {
+          const b = pop();
+          const x = pop();
+          if (c === 0x0b && x.lit && x.num === 0 && x.s === '0') stack.push(node(`- ${wrap(b, P.unary)}`, P.unary));
+          else stack.push(binary(...BINARY[c], x, b));
+          return;
+        }
+        if (c in UNARY_CALL) return void stack.push(node(`${UNARY_CALL[c]}(${pop().s})`, P.call));
+        if (c in PLAIN) return void emit([`${PLAIN[c]}();`]);
+        switch (c) {
+          case 0x00:
+          case 0x88:
+          case 0x89:
+            return;
+          case 0x96:
+            for (const v of a.values) {
+              if (v.t === 0) stack.push(strNode(v.v));
+              else if (v.t === 1 || v.t === 6) {
+                if (v.t === 1) f64.setUint32(0, v.v);
+                else (f64.setUint32(0, v.hi), f64.setUint32(4, v.lo));
+                stack.push(numNode(v.t === 1 ? f64.getFloat32(0) : f64.getFloat64(0)));
+              } else if (v.t === 2) stack.push(node('null', P.prim, { lit: true }));
+              else if (v.t === 3) stack.push(node('undefined', P.prim, { lit: true, undef: true }));
+              else if (v.t === 4) stack.push(fn.read(v.v));
+              else if (v.t === 5) stack.push(node(v.v ? 'true' : 'false', P.prim, { lit: true, num: v.v ? 1 : 0 }));
+              else if (v.t === 7) stack.push(numNode(v.v));
+              else {
+                const s = poolOf.get(a)?.[v.v];
+                stack.push(s == null ? fail(`constant ${v.v} is past the pool`) : strNode(s));
+              }
+            }
+            return;
+          case 0x17: {
+            // the Flash compiler leaves a Pop of nothing after each class's package checks; the player pops undefined
+            if (!stack.length) return;
+            const v = pop();
+            if (!v.lit && !v.pure && !v.iter) emit([`${v.s};`]);
+            return;
+          }
+          case 0x4c: {
+            const v = pop();
+            stack.push(v, v);
+            return;
+          }
+          case 0x4d: {
+            const v = pop();
+            const w = pop();
+            stack.push(v, w);
+            return;
+          }
+          case 0x12:
+            return void stack.push(notOf(pop()));
+          case 0x50:
+          case 0x51: {
+            const x = pop();
+            return void stack.push({ ...binary(c === 0x50 ? '+' : '-', P.add, x, numNode(1)), inc: c === 0x50 ? '++' : '--', of: x });
+          }
+          case 0x44:
+            return void stack.push(node(`typeof ${wrap(pop(), P.unary)}`, P.unary));
+          case 0x1c: {
+            const n = pop();
+            const name = varName(n);
+            return void stack.push(name ? node(name, P.prim, { pure: true }) : node(`eval(${n.s})`, P.call));
+          }
+          case 0x1d: {
+            const v = pop();
+            const n = pop();
+            const name = varName(n);
+            if (!name) return void emit([`set(${n.s},${v.s});`]);
+            if (v.inc && v.of.s === name) return postfix(name, v.inc);
+            return void emit([`${name} = ${v.s};`], v.iter ? { forVar: name } : undefined);
+          }
+          case 0x3c: {
+            const v = pop();
+            const name = varName(pop()) ?? fail('a local with a name that is not a name');
+            return void emit([`var ${name} = ${v.s};`], v.iter ? { forVar: `var ${name}` } : undefined);
+          }
+          case 0x41:
+            return void emit([`var ${varName(pop()) ?? fail('a local with a name that is not a name')};`]);
+          case 0x4e: {
+            const n = pop();
+            return void stack.push(node(member(pop(), n), P.call));
+          }
+          case 0x4f: {
+            const v = pop();
+            const n = pop();
+            const target = member(pop(), n);
+            if (v.inc && v.of.s === target) return postfix(target, v.inc);
+            return void emit([`${target} = ${v.s};`], v.iter ? { forVar: target } : undefined);
+          }
+          case 0x3a: {
+            const n = pop();
+            return void stack.push(node(`delete ${member(pop(), n)}`, P.unary));
+          }
+          case 0x3b: {
+            const n = pop();
+            return void stack.push(node(`delete ${varName(n) ?? n.s}`, P.unary));
+          }
+          case 0x3d: {
+            const n = pop();
+            return void stack.push(node(`${varName(n) ?? `eval(${n.s})`}(${args()})`, P.call));
+          }
+          case 0x52:
+          case 0x53: {
+            const n = pop();
+            const o = pop();
+            const callee = n.undef || n.str === '' ? wrap(o, P.call) : member(o, n);
+            return void stack.push(node(`${c === 0x53 ? 'new ' : ''}${callee}(${args()})`, P.call));
+          }
+          case 0x40: {
+            const n = pop();
+            return void stack.push(node(`new ${varName(n) ?? `eval(${n.s})`}(${args()})`, P.call));
+          }
+          case 0x42:
+            return void stack.push(node(`[${args()}]`));
+          case 0x43: {
+            const n = count();
+            const pairs = [];
+            for (let k = 0; k < n; k++) {
+              const v = pop();
+              const name = pop();
+              pairs.unshift(`${name.str != null && IDENT.test(name.str) ? name.str : name.s}:${v.s}`);
+            }
+            return void stack.push(node(`{${pairs.join(',')}}`));
+          }
+          case 0x46:
+            return void stack.push(node('(enumeration)', P.prim, { enumOf: node(varName(pop()) ?? fail('an enumeration of a name that is not a name')) }));
+          case 0x55:
+            return void stack.push(node('(enumeration)', P.prim, { enumOf: pop() }));
+          case 0x15:
+          case 0x35: {
+            const n = pop();
+            const k = pop();
+            return void stack.push(node(`${c === 0x15 ? 'substring' : 'mbsubstring'}(${pop().s},${k.s},${n.s})`, P.call));
+          }
+          case 0x34:
+            return void stack.push(node('getTimer()', P.call));
+          case 0x22: {
+            const p = PROPS[pop().num] ?? fail('an unknown property');
+            // the property of this clip (an empty target) reads as the property's name
+            const t = pop();
+            return void stack.push(t.str === '' ? node(p, P.prim, { pure: true }) : node(`getProperty(${t.s},${p})`, P.call));
+          }
+          case 0x23: {
+            const v = pop();
+            const p = PROPS[pop().num] ?? fail('an unknown property');
+            const t = pop();
+            return void emit([t.str === '' ? `${p} = ${v.s};` : `setProperty(${t.s},${p},${v.s});`]);
+          }
+          case 0x24: {
+            const depth = pop();
+            const target = pop();
+            return void emit([`duplicateMovieClip(${pop().s},${target.s},${depth.s});`]);
+          }
+          case 0x25:
+            return void emit([`removeMovieClip(${pop().s});`]);
+          case 0x26:
+            return void emit([`trace(${pop().s});`]);
+          case 0x27: {
+            const target = pop();
+            const lock = pop();
+            const constrain = pop();
+            if (!constrain.num) return void emit([`startDrag(${target.s},${lock.s});`]);
+            const [y2, x2, y1, x1] = [pop(), pop(), pop(), pop()];
+            return void emit([`startDrag(${target.s},${lock.s},${x1.s},${y1.s},${x2.s},${y2.s});`]);
+          }
+          case 0x2a:
+            return void emit([`throw ${pop().s};`]);
+          case 0x3e:
+            return void emit([`return ${pop().s};`]);
+          case 0x2b: {
+            const o = pop();
+            return void stack.push(node(`${wrap(pop(), P.call)}(${o.s})`, P.call));
+          }
+          case 0x2c: {
+            const cls = pop();
+            return void emit([`${cls.s} implements ${args().split(',').join(', ')};`]);
+          }
+          case 0x69: {
+            const sup = pop();
+            return void emit([`${pop().s} extends ${sup.s};`]);
+          }
+          case 0x2d:
+            return void stack.push(node(`FSCommand2(${args()})`, P.call));
+          case 0x81:
+            return void emit([`${next?.code === 0x06 ? 'gotoAndPlay' : 'gotoAndStop'}(${a.args[0] + 1});`]);
+          case 0x8c:
+            return void emit([`${next?.code === 0x06 ? 'gotoAndPlay' : 'gotoAndStop'}(${quote(a.args[0])});`]);
+          case 0x9f: {
+            const f = pop();
+            const frame = a.gflags & 2 ? `${wrap(f, P.add)} + ${a.sceneBias}` : f.s;
+            return void emit([`${a.gflags & 1 ? 'gotoAndPlay' : 'gotoAndStop'}(${frame});`]);
+          }
+          case 0x83:
+            return void emit([`getURL(${quote(a.args[0])},${quote(a.args[1])});`]);
+          case 0x9a: {
+            const target = pop();
+            const url = pop();
+            const m = a.uflags & 3 ? `,"${SEND_VARS[a.uflags & 3]}"` : '';
+            const f = a.uflags & 0x80 ? (a.uflags & 0x40 ? 'loadVariables' : 'loadVariablesNum') : a.uflags & 0x40 ? 'loadMovie' : 'getURL';
+            return void emit([`${f}(${url.s},${target.s}${m});`]);
+          }
+          case 0x9e:
+            return void emit([`call(${pop().s});`]);
+          default:
+            fail(`${a.name} is not decompiled`);
+        }
+      }
+    }
+
+    const r = run(0, stop, [], null, -1, stop);
+    spill(r, 0);
+    if (fn.pending.length) r.stmts.push(...fn.pending.splice(0).map((l) => [l]));
+    return r.stmts.flat();
+  }
+
+  const top = new Scope([], false);
+  let lines;
+  try {
+    const last = all[all.length - 1];
+    lines = body(top, listOf(0, Infinity), [bytes.length, ...(last && !last.line ? [last.offset] : [])]);
+  } catch (e) {
+    if (!(e instanceof Unstructured)) throw e;
+    lines = fallback(e.message, null);
+  }
+  return lines.join('\n');
+}
