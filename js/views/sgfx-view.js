@@ -181,9 +181,12 @@ function editor(node, ctx, doc, view) {
     else if (c.t === 'splice') c.list.splice(c.index, c.inserted.length, ...c.removed);
     else [...c.cmds].reverse().forEach(unrun);
   };
+  const info = el('span', { class: 'sgfx-info' });
+  const drawInfo = () => { info.textContent = `${label} · ${movie.signature} (${movie.signature[0] === 'C' ? 'zlib' : 'uncompressed'}) · SWF ${movie.version} · ${(movie.rect.xMax - movie.rect.xMin) / 20} × ${(movie.rect.yMax - movie.rect.yMin) / 20} px · ${+(movie.frameRate / 256).toFixed(2)} fps · ${movie.frameCount} frame${movie.frameCount === 1 ? '' : 's'}`; };
   const changed = (keepPanel) => {
     ui.version++;
     defsCache = null;
+    drawInfo();
     doc.changed();
     ctx.changed();
     drawTree();
@@ -464,7 +467,7 @@ function editor(node, ctx, doc, view) {
       const uses = usesOf(movie, id, tag).filter((u) => definedId(u.tag) !== id || u.tag.code === 56);
       if (uses.length) {
         const list = uses.slice(0, 6).map((u) => `${tagName(u.tag.code)} in ${containerName(u.owner)} ${u.how}`).join('; ');
-        const ok = await confirmBox(`${uses.length} tag${uses.length === 1 ? '' : 's'} use character ${id}: ${list}${uses.length > 6 ? '; …' : ''}. Delete ${tagName(tag.code)} ${id} anyway? The movie may not play.`, 'Delete', true);
+        const ok = await confirmBox(`${uses.length} tag${uses.length === 1 ? ' uses' : 's use'} character ${id}: ${list}${uses.length > 6 ? '; …' : ''}. Delete ${tagName(tag.code)} ${id} anyway? The movie may not play.`, 'Delete', true);
         if (!ok) return;
       }
     }
@@ -866,11 +869,12 @@ function editor(node, ctx, doc, view) {
   });
 
   view.replaceChildren(
-    el('div', { class: 'meta-row' }, el('span', { class: 'sgfx-info' }, `${label} · ${movie.signature} (${movie.signature[0] === 'C' ? 'zlib' : 'uncompressed'}) · SWF ${movie.version} · ${(movie.rect.xMax - movie.rect.xMin) / 20} × ${(movie.rect.yMax - movie.rect.yMin) / 20} px · ${+(movie.frameRate / 256).toFixed(2)} fps · ${movie.frameCount} frame${movie.frameCount === 1 ? '' : 's'}`), el('span', { class: 'spacer' }), ...downloadButtons(node, doc)),
+    el('div', { class: 'meta-row' }, info, el('span', { class: 'spacer' }), ...downloadButtons(node, doc)),
     el('div', { class: 'toolbar sgfx-toolbar' }, menuBar(menus, 'Movie editor menu'), button('Undo', undo, { class: 'btn btn-sm', title: 'Undo (Ctrl+Z)' }), button('Redo', redo, { class: 'btn btn-sm', title: 'Redo (Ctrl+Y)' }), search, status),
     el('div', { class: 'sgfx-editor' }, tree, panel),
   );
   status.textContent = movie.trailing.length ? `${movie.trailing.length} bytes after the End tag are kept` : '';
+  drawInfo();
   drawTree();
   drawPanel();
 }
